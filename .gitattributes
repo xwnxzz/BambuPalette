@@ -1,0 +1,16 @@
+# Normalise line endings in the repository, whatever the local git config says.
+# The project targets Windows, but the sources are plain UTF-8 text.
+* text=auto eol=lf
+
+# Explicitly binary — never let git "normalise" these.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.3mf  binary
+*.icc  binary
+*.ico  binary
+*.exe  binary
+
+# Vendored upstream sources under tools/reference/ are verbatim copies; leave
+# them byte-for-byte identical to upstream (including their line endings).
+tools/reference/** -text

@@ -1,0 +1,9 @@
+# Runtime dependencies for BambuPalette.
+#
+# PySide6-Essentials only: the application uses QtCore/QtGui/QtWidgets and never
+# touches WebEngine, Multimedia, 3D or Charts.  Using the trimmed distribution
+# keeps the download at ~78 MB instead of ~245 MB and, more importantly, keeps
+# the PyInstaller bundle around 90 MB instead of 300 MB+.
+PySide6-Essentials>=6.8,<7
+numpy>=1.26
+Pillow>=10.2

@@ -1,0 +1,4 @@
+# Build-only dependencies (packaging the standalone .exe).
+# Install with:  uv pip install --python .venv\Scripts\python.exe -r requirements-build.txt
+-r requirements.txt
+pyinstaller>=6.10

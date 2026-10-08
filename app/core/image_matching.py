@@ -1,0 +1,309 @@
+"""Match an image's colours against the filament + mix palette.
+
+The workflow the user asked for is: import a picture, let the program find which
+of *their* spools (and which of the 81-ratio mixes) reproduce it, then print the
+picture flat.  A printer has a handful of extruders, so the picture first has to
+be reduced to a small set of printable colours and each of those colours has to
+be answered with a filament or a two-filament recipe.
+
+Everything here is deliberately deterministic: the same picture and the same
+library always produce the same palette and the same pixel assignments.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Callable, Sequence
+
+import numpy as np
+from PIL import Image
+
+from ..spectral import color as _color
+from .library import Filament, FilamentLibrary
+from .mixes import MixCatalog, MixRecipe
+
+ProgressFn = Callable[[str, float], None]
+
+#: How many candidates the cheap Lab-distance pass keeps before the exact
+#: CIEDE2000 pass runs.  Pure Lab distance is a good but not perfect proxy, and
+#: CIEDE2000 is far too slow to evaluate against a palette of tens of thousands.
+_SHORTLIST = 24
+
+
+def _report(progress: ProgressFn | None, message: str, fraction: float) -> None:
+    if progress is not None:
+        progress(message, fraction)
+
+
+# ---------------------------------------------------------------------------
+# Palette
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class PaletteEntry:
+    """One printable colour: a spool on its own, or a two-spool recipe."""
+
+    key: str
+    color_hex: str
+    rgb: tuple[int, int, int]
+    lab: np.ndarray
+    label: str
+    kind: str  # "filament" | "mix"
+    filament_ids: tuple[str, ...]
+    recipe: MixRecipe | None = None
+    filament: Filament | None = None
+
+    @property
+    def is_mix(self) -> bool:
+        return self.kind == "mix"
+
+    @property
+    def ratio_text(self) -> str:
+        return self.recipe.ratio_text if self.recipe is not None else ""
+
+    @property
+    def short_label(self) -> str:
+        if self.filament is not None:
+            return self.filament.display_name
+        if self.recipe is not None:
+            return f"{self.recipe.percent_a}% + {self.recipe.percent_b}%"
+        return self.color_hex
+
+
+def build_palette(
+    library: FilamentLibrary,
+    catalog: MixCatalog | None = None,
+    *,
+    include_mixes: bool = True,
+) -> list[PaletteEntry]:
+    """Every colour the user can print: each spool, then every two-spool mix.
+
+    Spools come first so that, when a mix lands exactly on a spool colour, the
+    cheaper answer (one spool) wins the tie.
+    """
+    entries: list[PaletteEntry] = []
+    for filament in library:
+        entries.append(
+            PaletteEntry(
+                key=f"filament:{filament.id}",
+                color_hex=filament.color_hex,
+                rgb=filament.rgb,
+                lab=_color.lab_from_rgb(filament.rgb),
+                label=filament.display_name,
+                kind="filament",
+                filament_ids=(filament.id,),
+                filament=filament,
+            )
+        )
+
+    if include_mixes and catalog is not None:
+        for recipe in catalog.recipes:
+            a = library.get(recipe.a_id)
+            b = library.get(recipe.b_id)
+            if a is None or b is None:
+                continue
+            entries.append(
+                PaletteEntry(
+                    key=f"mix:{recipe.key}",
+                    color_hex=recipe.color_hex,
+                    rgb=tuple(int(v) for v in recipe.rgb),
+                    lab=np.asarray(recipe.lab, dtype=np.float64),
+                    label=f"{a.display_name} {recipe.percent_a}% + {b.display_name} {recipe.percent_b}%",
+                    kind="mix",
+                    filament_ids=(recipe.a_id, recipe.b_id),
+                    recipe=recipe,
+                )
+            )
+    return entries
+
+
+# ---------------------------------------------------------------------------
+# Matching
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class MatchSettings:
+    """Knobs the user controls from the picture page."""
+
+    max_colours: int = 12
+    max_dimension: int = 512
+    alpha_threshold: int = 8
+    dither: bool = False
+
+    def clamped(self) -> "MatchSettings":
+        return replace(
+            self,
+            max_colours=max(2, min(48, int(self.max_colours))),
+            max_dimension=max(32, min(4096, int(self.max_dimension))),
+            alpha_threshold=max(0, min(255, int(self.alpha_threshold))),
+        )
+
+
+@dataclass
+class MatchResult:
+    """A picture reduced to printable colours."""
+
+    width: int
+    height: int
+    palette: list[PaletteEntry]
+    indices: np.ndarray  # (H, W) int16, -1 where transparent
+    counts: np.ndarray  # (len(palette),) pixel counts, largest first
+    settings: MatchSettings
+    source: str = ""
+
+    @property
+    def total_pixels(self) -> int:
+        return int(self.indices.size)
+
+    @property
+    def printed_pixels(self) -> int:
+        return int(self.counts.sum())
+
+    @property
+    def coverage(self) -> float:
+        if not self.total_pixels:
+            return 0.0
+        return self.printed_pixels / float(self.total_pixels)
+
+    def region(self, index: int) -> np.ndarray:
+        return self.indices == index
+
+    def shares(self) -> np.ndarray:
+        return self.counts / float(max(1, self.printed_pixels))
+
+
+def _nearest_entries(labs: np.ndarray, entries: Sequence[PaletteEntry]) -> np.ndarray:
+    """Index of the palette entry closest to each row of ``labs``.
+
+    A Euclidean pass in Lab narrows the field, then CIEDE2000 picks the winner so
+    the answer agrees with the ΔE the UI reports.
+    """
+    if not entries:
+        return np.zeros(len(labs), dtype=np.int64)
+    table = np.stack([entry.lab for entry in entries])
+    out = np.zeros(len(labs), dtype=np.int64)
+    for row, lab in enumerate(labs):
+        distances = np.linalg.norm(table - lab, axis=1)
+        if distances.size > _SHORTLIST:
+            candidates = np.argpartition(distances, _SHORTLIST)[:_SHORTLIST]
+        else:
+            candidates = np.arange(distances.size)
+        best_index = int(candidates[0])
+        best = float("inf")
+        for index in candidates:
+            value = _color.delta_e_2000(lab, table[index])
+            if value < best:
+                best = value
+                best_index = int(index)
+        out[row] = best_index
+    return out
+
+
+def _pack(rgb: np.ndarray) -> np.ndarray:
+    channels = rgb.astype(np.int64)
+    return (channels[..., 0] << 16) | (channels[..., 1] << 8) | channels[..., 2]
+
+
+def _unpack(key: int) -> tuple[int, int, int]:
+    return ((key >> 16) & 0xFF, (key >> 8) & 0xFF, key & 0xFF)
+
+
+def reduce_colours(
+    image: Image.Image, settings: MatchSettings
+) -> tuple[np.ndarray, np.ndarray]:
+    """Reduce a picture to at most ``max_colours`` classes.
+
+    Returns ``(colours, classes)`` where ``colours`` is ``(N, 3)`` int64 and
+    ``classes`` is the ``(H, W)`` int64 class map.  Both branches are fully
+    vectorised, so a 512×512 picture costs a few milliseconds.
+    """
+    rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    keys = _pack(rgb)
+    unique_keys, inverse = np.unique(keys.reshape(-1), return_inverse=True)
+    classes = inverse.reshape(rgb.shape[:2]).astype(np.int64)
+
+    if unique_keys.size <= settings.max_colours:
+        colours = np.array([_unpack(int(key)) for key in unique_keys], dtype=np.int64)
+        return colours, classes
+
+    quantized = image.convert("RGB").quantize(
+        colors=settings.max_colours,
+        method=Image.Quantize.MEDIANCUT,
+        dither=Image.Dither.FLOYDSTEINBERG if settings.dither else Image.Dither.NONE,
+    )
+    palette = quantized.getpalette() or []
+    classes = np.asarray(quantized, dtype=np.int64)
+    used = np.unique(classes)
+    colours = np.array(
+        [[palette[i * 3], palette[i * 3 + 1], palette[i * 3 + 2]] for i in used],
+        dtype=np.int64,
+    )
+    lookup = np.zeros(int(classes.max()) + 1, dtype=np.int64)
+    lookup[used] = np.arange(len(used))
+    return colours, lookup[classes]
+
+
+def load_image(source: str | Path | Image.Image) -> Image.Image:
+    if isinstance(source, Image.Image):
+        return source.copy()
+    with Image.open(source) as handle:
+        handle.load()
+        return handle.copy()
+
+
+def match_image(
+    source: str | Path | Image.Image,
+    palette: Sequence[PaletteEntry],
+    settings: MatchSettings | None = None,
+    *,
+    progress: ProgressFn | None = None,
+) -> MatchResult:
+    """Reduce ``source`` to printable colours drawn from ``palette``."""
+    if not palette:
+        raise ValueError("调色板是空的，请先添加耗材。")
+    config = (settings or MatchSettings()).clamped()
+    name = str(source) if isinstance(source, (str, Path)) else ""
+
+    _report(progress, "读取图片", 0.05)
+    image = load_image(source).convert("RGBA")
+
+    if max(image.size) > config.max_dimension:
+        _report(progress, "缩放图片", 0.15)
+        scale = config.max_dimension / float(max(image.size))
+        size = (max(1, round(image.width * scale)), max(1, round(image.height * scale)))
+        image = image.resize(size, Image.LANCZOS)
+
+    alpha = np.asarray(image.getchannel("A"), dtype=np.uint8)
+    mask = alpha > config.alpha_threshold
+    if not mask.any():
+        mask = np.ones(alpha.shape, dtype=bool)
+
+    _report(progress, "减少图片颜色数量", 0.30)
+    colours, classes = reduce_colours(image, config)
+
+    _report(progress, "在耗材与混色库里寻找最接近的颜色", 0.55)
+    labs = _color.lab_from_rgb(colours)
+    chosen = _nearest_entries(labs, palette)
+
+    _report(progress, "按像素分配颜色", 0.80)
+    indices = np.where(mask, chosen[classes], -1).astype(np.int16)
+
+    # Drop palette entries the picture never used, then renumber largest first.
+    used = sorted(int(value) for value in np.unique(indices) if value >= 0)
+    counts = np.array([int(np.count_nonzero(indices == value)) for value in used], dtype=np.int64)
+    order = np.argsort(-counts, kind="stable")
+    kept = [list(palette)[used[int(position)]] for position in order]
+    remap = np.full(len(palette), -1, dtype=np.int16)
+    for new_index, position in enumerate(order):
+        remap[used[int(position)]] = new_index
+    final = np.where(indices >= 0, remap[np.clip(indices, 0, None)], -1).astype(np.int16)
+
+    _report(progress, "完成", 1.0)
+    return MatchResult(
+        width=int(final.shape[1]),
+        height=int(final.shape[0]),
+        palette=kept,
+        indices=final,
+        counts=counts[order],
+        settings=config,
+        source=name,
+    )

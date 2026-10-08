@@ -1,0 +1,20 @@
+# Working files
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Build output (the spec and launcher are tracked, the artifacts are not)
+build/BambuPalette/
+dist/
+*.spec.bak
+
+# Portable-mode data written next to the executable
+data/
+
+# Self-check artefacts
+selftest-report.txt
+selftest-ui.png
+
+# Local scratch
+install.log
