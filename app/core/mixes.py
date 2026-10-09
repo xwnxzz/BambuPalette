@@ -184,6 +184,27 @@ def sorted_filaments(
     return sorted(items, key=lambda filament: filament_sort_key(key, filament, target_rgb))
 
 
+def sorted_cells(
+    cells: Sequence, key: str = SORT_RGB, *, label_of=None, target_rgb=None
+) -> list:
+    """Order ONE list that holds both raw spools and mixes.
+
+    「全部颜色」 puts a spool and a mix in the same grid, and the spools must obey
+    the current 排序 rather than being pinned above every mix — otherwise
+    「按 RGB 排列」 would stop being a colour order the moment the checkbox is
+    ticked. ``MixRecipe`` and :class:`app.ui.mix_grid.SpoolCell` both expose the
+    attributes :func:`recipe_sort_key` reads, so one call orders both kinds.
+
+    Under 「按母材组合」 a spool still leads, because it has ``pair_index == -1``
+    and belongs to no parent pair; that is the only key with a group structure
+    and there is no other place for it to go.
+    """
+    return sorted(
+        cells,
+        key=lambda cell: recipe_sort_key(key, cell, label_of, target_rgb),
+    )
+
+
 class MixCatalog:
     """All predicted blends for a filament library.
 

@@ -30,15 +30,36 @@ def border_colour(value) -> QColor:
     return QColor(theme.SWATCH_BORDER_LIGHT if luminance > 0.2 else theme.SWATCH_BORDER_DARK)
 
 
+def is_unset(value) -> bool:
+    """Is this slot still waiting for the user to pick a colour?
+
+    ``None`` and ``""`` both mean 「not chosen yet」.  They are kept distinct from
+    a real colour because a made-up default is a lie the user only discovers in
+    Bambu Studio, after the print.
+    """
+    return value is None or value == "" or value == Qt.GlobalColor.transparent
+
+
 def draw_swatch(painter: QPainter, rect: QRectF, value, radius: float = 3.0) -> None:
-    """Fill ``rect`` with the colour, plus an adaptive 1px outline."""
-    colour = qcolor(value)
+    """Fill ``rect`` with the colour, plus an adaptive 1px outline.
+
+    An unset ``value`` paints an empty dashed slot instead of a black square, so
+    「没有颜色」 is visibly different from 「黑色」.
+    """
     path = QPainterPath()
     if radius > 0:
         path.addRoundedRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), radius, radius)
     else:
         path.addRect(rect.adjusted(0.5, 0.5, -0.5, -0.5))
     painter.save()
+    if is_unset(value):
+        painter.fillPath(path, QColor(theme.PANEL_ALT))
+        painter.setPen(QPen(QColor(theme.BORDER_STRONG), 1, Qt.PenStyle.DashLine))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPath(path)
+        painter.restore()
+        return
+    colour = qcolor(value)
     painter.setPen(Qt.PenStyle.NoPen)
     painter.fillPath(path, colour)
     painter.setPen(QPen(border_colour(colour), 1))
@@ -64,24 +85,37 @@ def swatch_icon(value, width: int = 18, height: int | None = None) -> QIcon:
 
 
 class SwatchLabel(QWidget):
-    """A fixed-size preview card, optionally captioned with its hex value."""
+    """A fixed-size preview card, optionally captioned with its hex value.
 
-    def __init__(self, value="#FFFFFF", size: int = 84, caption: bool = True, parent=None):
+    ``value=None`` starts the card **empty**: it paints a dashed slot captioned
+    「未选择」 rather than pretending to be white.
+    """
+
+    def __init__(self, value=None, size: int = 84, caption: bool = True, parent=None):
         super().__init__(parent)
-        self._value = qcolor(value)
+        self._value = None if is_unset(value) else qcolor(value)
         self._caption = caption
         self._size = size
         self.setMinimumSize(size, size + (18 if caption else 0))
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
 
     def setValue(self, value) -> None:  # noqa: N802 - Qt naming
-        colour = qcolor(value)
+        colour = None if is_unset(value) else qcolor(value)
         if colour != self._value:
             self._value = colour
             self.update()
 
+    def isSet(self) -> bool:  # noqa: N802
+        return self._value is not None
+
+    def hex(self) -> str:
+        return "" if self._value is None else self._value.name().upper()
+
+    def clear(self) -> None:
+        self.setValue(None)
+
     def value(self) -> QColor:
-        return QColor(self._value)
+        return QColor() if self._value is None else QColor(self._value)
 
     def sizeHint(self) -> QSize:  # noqa: N802
         return QSize(self._size, self._size + (18 if self._caption else 0))
@@ -99,7 +133,7 @@ class SwatchLabel(QWidget):
             painter.drawText(
                 QRectF(0, self._size + 1, self._size, 17),
                 Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
-                self._value.name().upper(),
+                "未选择" if self._value is None else self._value.name().upper(),
             )
         painter.end()
 

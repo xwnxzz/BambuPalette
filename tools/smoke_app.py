@@ -356,8 +356,13 @@ def main() -> int:
         "a spool row shows the spool's own colour, not a mix",
     )
     check(
-        [cell.key for cell in window._recipes[: len(spools)]] == [cell.key for cell in spools],
-        "the spool rows lead the grid so they read as extra colours, not as stray mixes",
+        [cell.rgb for cell in window._recipes]
+        == sorted(cell.rgb for cell in window._recipes),
+        "「全部颜色」 keeps the WHOLE list in RGB order instead of pinning the spools on top",
+    )
+    check(
+        any(cell.key not in {s.key for s in spools} for cell in window._recipes[: len(spools)]),
+        "a spool takes its place in the colour order rather than being prepended",
     )
     check(
         [cell.rgb for cell in spools] == sorted(cell.rgb for cell in spools),
@@ -405,6 +410,53 @@ def main() -> int:
     app.processEvents()
     check(len(window._recipes) == 810, "un-ticking 全部颜色 restores the mixes-only grid")
     window._detail.clear()
+
+    # --- no preset colour, no delete prompt, Del deletes -----------------------
+    from PySide6.QtGui import QKeySequence  # noqa: E402
+    from PySide6.QtWidgets import QMessageBox  # noqa: E402
+
+    from app.ui.filament_dialog import FilamentDialog  # noqa: E402
+
+    add_dialog = FilamentDialog(None, [f.brand for f in library.filaments], [], window)
+    check(not add_dialog._color.isSet(), "添加耗材 starts with NO preset colour")
+    check(add_dialog.values()["color_hex"] == "", "an untouched dialog reports no colour")
+    check(not add_dialog._ok_button.isEnabled(), "确认 is disabled while no colour is chosen")
+    add_dialog._hex.setText("#C8342E")
+    add_dialog._on_hex_edited()
+    check(add_dialog._ok_button.isEnabled(), "确认 wakes up once the user types a colour")
+    check(add_dialog.values()["color_hex"] == "#C8342E", "the typed colour is what the spool gets")
+    add_dialog._hex.setText("nonsense")
+    add_dialog._on_hex_edited()
+    check(add_dialog.values()["color_hex"] == "#C8342E", "gibberish leaves the last good colour alone")
+    add_dialog.close()
+
+    check(
+        window._delete_shortcut.key() == QKeySequence(QKeySequence.StandardKey.Delete),
+        "Del is bound to the spool list",
+    )
+    # Deleting must not stop to ask. Make any question box an outright failure.
+    original_question = QMessageBox.question
+    QMessageBox.question = staticmethod(
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("删除耗材 asked for confirmation"))
+    )
+    try:
+        doomed = window.library.filaments[-1]
+        window._select_filament(doomed.id)
+        before = len(window.library.filaments)
+        snapshot = list(window.library.filaments)
+        window._delete_shortcut.activated.emit()
+        app.processEvents()
+        check(
+            len(window.library.filaments) == before - 1,
+            "pressing Del deletes the selected spool without asking",
+        )
+        check(window.library.get(doomed.id) is None, "the spool Del removed is really gone")
+    finally:
+        QMessageBox.question = original_question
+        window.library.replace_all(snapshot)
+        window._reload_library()
+        app.processEvents()
+    check(len(window.library.filaments) == before, "the library is restored after the Del test")
 
     # --- nearest match --------------------------------------------------------
     nearest = window.nearest_recipe("#982C29")

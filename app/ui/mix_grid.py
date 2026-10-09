@@ -10,10 +10,12 @@ from __future__ import annotations
 import bisect
 from dataclasses import dataclass
 
+import numpy as np
 from PySide6.QtCore import QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import QAbstractScrollArea, QToolTip
 
+from ..spectral import color as _spectral_color
 from . import theme
 
 #: Size of one grid cell in device-independent pixels.
@@ -29,10 +31,16 @@ class SpoolCell:
     """A raw filament shown beside the mixes when 「全部颜色」 is on.
 
     It borrows ``MixRecipe``'s read-only shape — ``key``, ``color_hex``, ``rgb``,
-    ``pair_index``, ``percent_a``/``percent_b`` — so ``MixGrid`` can paint it
-    without caring which kind of cell it is. ``pair_index`` is ``-1``, which is
-    never a real parent-pair number, so every spool lands in one leading group
-    of its own and the mixes follow unchanged.
+    ``lab``, ``lightness``/``hue``/``chroma``, ``pair_index``, ``a_id``/``b_id``,
+    ``percent_a``/``percent_b`` — so ``MixGrid`` can paint it, and
+    :func:`app.core.mixes.recipe_sort_key` can order it, without either caring
+    which kind of row it is.  That is what lets a spool sit at its proper place
+    in the current 排序 instead of being pinned above every mix.
+
+    ``pair_index`` is ``-1``, which is never a real parent-pair number, so under
+    「按母材组合」 the spools land in one leading group: they belong to no pair.
+    ``a_id`` and ``b_id`` are both the spool itself, so 「按名称」 reads its own
+    name twice and the ratio tie-break is a constant ``0``.
     """
 
     filament: object
@@ -40,6 +48,7 @@ class SpoolCell:
     rgb: tuple[int, int, int]
     label: str
     key: str
+    lab: tuple[float, float, float] = (0.0, 0.0, 0.0)
     pair_index: int = -1
     percent_a: int = 0
     percent_b: int = 0
@@ -47,6 +56,39 @@ class SpoolCell:
     @property
     def is_spool(self) -> bool:
         return True
+
+    @property
+    def a_id(self) -> str:
+        return self.filament.id
+
+    @property
+    def b_id(self) -> str:
+        return self.filament.id
+
+    @property
+    def pair_key(self) -> tuple[str, str]:
+        return (self.filament.id, self.filament.id)
+
+    @property
+    def lightness(self) -> float:
+        return self.lab[0]
+
+    @property
+    def hue(self) -> float:
+        """Hue angle in degrees, 0 for achromatic colours."""
+        _, a, b = self.lab
+        if abs(a) < 1e-9 and abs(b) < 1e-9:
+            return 0.0
+        return float(np.degrees(np.arctan2(b, a)) % 360.0)
+
+    @property
+    def chroma(self) -> float:
+        _, a, b = self.lab
+        return float(np.hypot(a, b))
+
+    @property
+    def ratio_text(self) -> str:
+        return "单色 100%"
 
 
 def spool_cell(filament) -> SpoolCell:
@@ -57,6 +99,7 @@ def spool_cell(filament) -> SpoolCell:
         rgb=filament.rgb,
         label=filament.display_name,
         key=f"spool|{filament.id}",
+        lab=_spectral_color.lab_from_rgb(filament.rgb),
     )
 
 

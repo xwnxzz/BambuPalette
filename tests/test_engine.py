@@ -46,6 +46,7 @@ from app.core.mixes import (  # noqa: E402
     SORT_CHOICES,
     MixCatalog,
     expected_recipe_count,
+    sorted_cells,
     sorted_filaments,
 )
 from app.spectral import color as C  # noqa: E402
@@ -796,6 +797,110 @@ class SortedFilamentTests(unittest.TestCase):
         before = [f.id for f in self.filaments]
         sorted_filaments(self.filaments, "hue")
         self.assertEqual([f.id for f in self.filaments], before)
+
+
+class SortedCellTests(unittest.TestCase):
+    """「全部颜色」 puts spools and mixes in ONE list, ordered by ONE control.
+
+    The user asked for the spools to stop being pinned on top: ticking the
+    checkbox must not break the colour order the 排序 combo just established.
+    """
+
+    def setUp(self) -> None:
+        from app.ui.mix_grid import spool_cell
+
+        self.filaments = [
+            Filament(name="白", brand="b", material_type="PLA", color_hex="#F2F0EB"),
+            Filament(name="黑", brand="b", material_type="PLA", color_hex="#17181C"),
+            Filament(name="金", brand="b", material_type="PLA", color_hex="#D9A441"),
+        ]
+        self.library = FilamentLibrary()
+        for filament in self.filaments:
+            self.library.add(filament)
+        self.catalog = MixCatalog(self.library).build()
+        self.spools = [spool_cell(f) for f in self.filaments]
+        self.label_of = lambda fid: (  # noqa: E731 - mirrors MainWindow._label_of
+            self.library.get(fid).display_name.casefold()
+            if self.library.get(fid) is not None
+            else fid
+        )
+
+    def _merged(self, key):
+        return sorted_cells(
+            self.spools + self.catalog.sorted_recipes(key),
+            key,
+            label_of=self.label_of,
+        )
+
+    def test_rgb_ascending_across_both_kinds(self):
+        cells = self._merged("rgb")
+        self.assertEqual([c.rgb for c in cells], sorted(c.rgb for c in cells))
+
+    def test_a_spool_is_not_pinned_to_the_top(self):
+        cells = self._merged("rgb")
+        spool_keys = {c.key for c in self.spools}
+        self.assertEqual(len(cells), len(self.spools) + self.catalog.recipe_count)
+        # Pinning would put every spool in rows 0..2. Under a real RGB order the
+        # dark spool does come early, but the pale #F2F0EB cannot: it belongs far
+        # down among the pale mixes, so at least one spool sits well past the old
+        # pinned block.
+        positions = [i for i, c in enumerate(cells) if c.key in spool_keys]
+        self.assertEqual(positions, sorted(positions))
+        self.assertGreater(max(positions), len(self.spools))
+
+    def test_lightness_descending_across_both_kinds(self):
+        cells = self._merged("lightness")
+        levels = [c.lightness for c in cells]
+        self.assertEqual(levels, sorted(levels, reverse=True))
+
+    def test_hue_ascending_across_both_kinds(self):
+        cells = self._merged("hue")
+        hues = [c.hue for c in cells]
+        self.assertEqual(hues, sorted(hues))
+
+    def test_label_sorts_spools_and_mixes_by_spool_name(self):
+        cells = self._merged("label")
+        heads = [self.label_of(c.a_id) for c in cells]
+        self.assertEqual(heads, sorted(heads))
+
+    def test_similarity_needs_a_target(self):
+        with self.assertRaises(ValueError):
+            sorted_cells(self.spools, "similarity")
+
+    def test_a_spool_cell_is_shaped_like_a_recipe(self):
+        spool = self.spools[0]
+        for attribute in (
+            "rgb",
+            "lab",
+            "lightness",
+            "hue",
+            "chroma",
+            "pair_index",
+            "percent_a",
+            "a_id",
+            "b_id",
+            "key",
+        ):
+            with self.subTest(attribute=attribute):
+                self.assertTrue(hasattr(spool, attribute))
+        self.assertEqual(spool.a_id, spool.filament.id)
+        self.assertEqual(spool.b_id, spool.filament.id)
+        self.assertLess(spool.pair_index, 0)
+        self.assertEqual(spool.ratio_text, "单色 100%")
+        self.assertTrue(np.allclose(np.asarray(spool.lab), np.asarray(C.lab_from_rgb(spool.rgb))))
+
+    def test_every_sort_key_keeps_every_cell(self):
+        for key, _ in SORT_CHOICES:
+            with self.subTest(sort=key):
+                self.assertEqual(
+                    len(self._merged(key)),
+                    len(self.spools) + self.catalog.recipe_count,
+                )
+
+    def test_the_input_is_not_mutated(self):
+        before = [c.key for c in self.spools]
+        self._merged("hue")
+        self.assertEqual([c.key for c in self.spools], before)
 
 
 class LibraryPersistenceTests(unittest.TestCase):

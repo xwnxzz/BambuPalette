@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
 from ..core.library import COMMON_BRANDS, COMMON_MATERIAL_TYPES, Filament
 from ..spectral import color as _color
 from . import theme
-from .swatch import ColorButton, SwatchLabel
+from .swatch import ColorButton, SwatchLabel, is_unset
 
 
 class FilamentDialog(QDialog):
@@ -45,8 +45,12 @@ class FilamentDialog(QDialog):
             self._type.addItem(value)
         self._type.setCurrentText("")
 
-        self._color = ColorButton("#FFFFFF", "选择耗材颜色", self)
-        self._hex = QLineEdit("#FFFFFF", self)
+        # No preset colour. A brand-new spool starts with NO colour at all: the
+        # dialog shows a dashed empty slot and refuses to be confirmed until the
+        # user has actually told it what their filament prints as.
+        self._color = ColorButton(None, "选择耗材颜色", self)
+        self._hex = QLineEdit("", self)
+        self._hex.setPlaceholderText("#RRGGBB")
         self._hex.setMaxLength(7)
         self._hex.setFixedWidth(96)
         self._hex.setProperty("role", "mono")
@@ -61,8 +65,8 @@ class FilamentDialog(QDialog):
         self._note = QLineEdit(self)
         self._note.setPlaceholderText("可选，例如「2026-07 批次 / 实测色卡」")
 
-        self._preview = SwatchLabel("#FFFFFF", size=64, caption=True)
-        self._hint = QLabel("", self)
+        self._preview = SwatchLabel(None, size=64, caption=True)
+        self._hint = QLabel("请先选择颜色。可以直接点左边的色块打开取色器，也可以在这里输入 #RRGGBB。", self)
         self._hint.setProperty("role", "hint")
         self._hint.setWordWrap(True)
 
@@ -90,6 +94,7 @@ class FilamentDialog(QDialog):
         buttons.button(QDialogButtonBox.StandardButton.Ok).setText("确认")
         buttons.button(QDialogButtonBox.StandardButton.Ok).setProperty("accent", True)
         buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        self._ok_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
 
@@ -111,10 +116,16 @@ class FilamentDialog(QDialog):
             self._note.setText(filament.note)
             self._apply_color(filament.color_hex)
         else:
-            self._apply_color("#FFFFFF")
+            self._apply_color(None)
 
     # -- colour plumbing ---------------------------------------------------------
     def _apply_color(self, value) -> None:
+        if is_unset(value):
+            self._color.clear()
+            self._hex.setText("")
+            self._preview.clear()
+            self._update_hint()
+            return
         try:
             normalised = _color.normalize_hex(value)
         except Exception:  # noqa: BLE001 - user typed nonsense; keep the old colour
@@ -125,22 +136,37 @@ class FilamentDialog(QDialog):
         self._update_hint()
 
     def _on_color_changed(self, value: str) -> None:
-        self._hex.setText(value)
-        self._preview.setValue(value)
+        if is_unset(value):
+            self._hex.setText("")
+            self._preview.clear()
+        else:
+            self._hex.setText(value)
+            self._preview.setValue(value)
         self._update_hint()
 
     def _on_hex_edited(self) -> None:
-        try:
-            normalised = _color.normalize_hex(self._hex.text())
-        except Exception:  # noqa: BLE001
-            self._hex.setText(self._color.hex())
+        text = self._hex.text().strip()
+        if not text:
+            self._apply_color(None)
             return
-        self._color.setValue(normalised)
-        self._hex.setText(normalised)
-        self._preview.setValue(normalised)
-        self._update_hint()
+        try:
+            normalised = _color.normalize_hex(text)
+        except Exception:  # noqa: BLE001
+            # Put back whatever is actually selected — which may be nothing.
+            self._hex.setText(self._color.hex())
+            self._preview.setValue(self._color.hex() or None)
+            self._update_hint()
+            return
+        self._apply_color(normalised)
 
     def _update_hint(self) -> None:
+        self._ok_button.setEnabled(self._color.isSet())
+        if not self._color.isSet():
+            self._hint.setText(
+                "请先选择颜色。可以直接点左边的色块打开取色器，"
+                "也可以在这里输入 #RRGGBB。"
+            )
+            return
         r, g, b = _color.hex_to_rgb(self._color.hex())
         lab = _color.lab_from_rgb((r, g, b))
         self._hint.setText(
@@ -160,6 +186,8 @@ class FilamentDialog(QDialog):
         }
 
     def build_filament(self) -> Filament:
+        if is_unset(self._color.hex()):
+            raise ValueError("请先选择颜色")
         if self._filament is None:
             return Filament(**self.values())
         return self._filament.copy(**self.values())

@@ -14,7 +14,7 @@ from pathlib import Path
 
 import numpy as np
 from PySide6.QtCore import QSize, Qt, QTimer
-from PySide6.QtGui import QAction, QColor, QKeySequence
+from PySide6.QtGui import QAction, QColor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -51,7 +51,7 @@ from ..core.mixes import (
     SORT_PAIR,
     SORT_RGB,
     MixCatalog,
-    sorted_filaments,
+    sorted_cells,
 )
 from ..spectral import color as _color
 from . import theme
@@ -299,6 +299,18 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._sample_button)
         layout.addLayout(row_one)
         layout.addLayout(row_two)
+
+        # Delete reaches the spool list from the keyboard too. The shortcut is
+        # scoped to the list (WidgetWithChildrenShortcut) rather than the window,
+        # so it cannot fire while the user is editing a hex field or typing a
+        # search query elsewhere on the page.
+        self._delete_shortcut = QShortcut(QKeySequence.StandardKey.Delete, self._list)
+        self._delete_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self._delete_shortcut.activated.connect(self._on_delete)
+        self._backspace_shortcut = QShortcut(QKeySequence.StandardKey.Backspace, self._list)
+        self._backspace_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self._backspace_shortcut.activated.connect(self._on_delete)
+
         return self._wrap(panel, "我的耗材")
 
     def _build_grid_panel(self) -> QWidget:
@@ -441,18 +453,22 @@ class MainWindow(QMainWindow):
         self._select_filament(filament.id)
 
     def _on_delete(self) -> None:
+        """Delete the selected spool immediately, with no confirmation.
+
+        The user asked for this explicitly: the recipe library is a scratchpad,
+        a spool is two keystrokes to re-add, and a Yes/No box whose buttons are
+        English in a Chinese window is worse than no box at all. The duplicate
+        warning in :meth:`_on_add` stays, because that one prevents a mistake
+        rather than confirming an intention.
+        """
         filament = self._selected_filament()
         if filament is None:
-            return
-        answer = QMessageBox.question(
-            self, "删除耗材", f"确定要删除 {filament.display_name}（{filament.color_hex}）吗？"
-        )
-        if answer != QMessageBox.StandardButton.Yes:
             return
         self.library.remove(filament.id)
         if self._pair_filter and filament.id in self._pair_filter:
             self._pair_filter = None
         self._detail.clear()
+        self._status.setText(f"已删除 {filament.display_name}（{filament.color_hex}）")
         self._reload_library()
 
     def _select_filament(self, filament_id: str) -> None:
@@ -552,6 +568,16 @@ class MainWindow(QMainWindow):
             pass  # a read-only data directory must not block a rebuild
         self._rebuild_catalog()
 
+    def _label_of(self, filament_id: str) -> str:
+        """Case-folded display name of a spool, for 「按名称」.
+
+        Shared by the mixes and the raw spool rows so that a single sorted list
+        compares like with like: an unknown id falls back to the id itself, which
+        keeps the sort total instead of raising.
+        """
+        filament = self.library.get(filament_id)
+        return filament.display_name.casefold() if filament is not None else filament_id
+
     def _matches(self, cell, query: str) -> bool:
         """Does one grid cell survive the search box?
 
@@ -603,12 +629,14 @@ class MainWindow(QMainWindow):
             recipes = self._catalog.sorted_recipes(sort_key)
             grouped = sort_key == SORT_PAIR
 
-        # 「全部颜色」 prepends the spools themselves, so a two-spool library
-        # offers 81 mixes + 2 raw colours = 83 entries in one list, in the same
-        # order the 排序 control just gave the mixes.
+        # 「全部颜色」 adds the spools themselves, so a two-spool library offers
+        # 81 mixes + 2 raw colours = 83 entries. The spools are NOT pinned on top:
+        # they are folded into the very same order the 排序 control just gave the
+        # mixes, because a colour list that breaks its own colour order the moment
+        # the checkbox is ticked is not sorted at all.
         spools = []
         if self._all_colours.isChecked():
-            spools = [spool_cell(f) for f in sorted_filaments(self.library.filaments, sort_key)]
+            spools = [spool_cell(f) for f in self.library.filaments]
 
         query = self._search.text().strip().lstrip("#").casefold()
         if query:
@@ -616,7 +644,10 @@ class MainWindow(QMainWindow):
             spools = [cell for cell in spools if self._matches(cell, query)]
             grouped = False
 
-        cells = spools + recipes
+        if spools:
+            cells = sorted_cells(spools + recipes, sort_key, label_of=self._label_of)
+        else:
+            cells = recipes
         self._recipes = cells
         self._grid.setRecipes(cells, grouped=grouped)
         self._show_all_button.setEnabled(self._pair_filter is not None or bool(query))

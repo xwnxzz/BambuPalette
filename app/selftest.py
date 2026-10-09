@@ -182,6 +182,11 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         all(row.color_hex == row.filament.color_hex for row in spool_rows),
         "a raw spool row shows the spool's own colour",
     )
+    check(
+        [cell.rgb for cell in window._recipes]
+        == sorted(cell.rgb for cell in window._recipes),
+        "the spools obey the 排序 control instead of being pinned on top",
+    )
     window._grid.selectRecipe(spool_rows[0])
     window._on_grid_selected(spool_rows[0])
     app.processEvents()
@@ -191,6 +196,55 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     app.processEvents()
     check(len(window._recipes) == 810, "un-ticking 「全部颜色」 restores the mixes-only grid")
     window._detail.clear()
+
+    # A new spool has no colour until the user picks one, and the dialog refuses
+    # to be confirmed until then — a made-up white default is a lie the user only
+    # discovers in Bambu Studio.
+    from PySide6.QtGui import QKeySequence
+
+    from .ui.filament_dialog import FilamentDialog
+
+    add_dialog = FilamentDialog(
+        None, [f.brand for f in window.library.filaments], [], window
+    )
+    check(not add_dialog._color.isSet(), "添加耗材 starts with NO preset colour")
+    check(add_dialog.values()["color_hex"] == "", "an unset dialog reports no colour")
+    check(not add_dialog._ok_button.isEnabled(), "确认 is disabled until a colour is chosen")
+    add_dialog._apply_color("#123456")
+    check(add_dialog._ok_button.isEnabled(), "确认 wakes up once a colour is chosen")
+    check(add_dialog.values()["color_hex"] == "#123456", "the chosen colour is reported")
+    check(
+        add_dialog.build_filament().color_hex == "#123456",
+        "a spool built from the dialog carries the chosen colour",
+    )
+    add_dialog.close()
+
+    # Deleting a spool asks nothing: it just goes.
+    check(
+        window._delete_shortcut.key() == QKeySequence(QKeySequence.StandardKey.Delete),
+        "Del is bound to the spool list",
+    )
+    doomed = window.library.filaments[-1]
+    window._select_filament(doomed.id)
+    before = len(window.library.filaments)
+    snapshot = list(window.library.filaments)
+    window._delete_shortcut.activated.emit()
+    app.processEvents()
+    check(
+        len(window.library.filaments) == before - 1,
+        "pressing Del deletes the selected spool with no confirmation",
+    )
+    check(
+        window.library.get(doomed.id) is None,
+        "the spool Del removed is really gone",
+    )
+    # Put the library back: the rest of this self-test counts the 810 mixes of a
+    # five-spool library, and the deletion above was only here to prove the key
+    # is wired up.
+    window.library.replace_all(snapshot)
+    window._reload_library()
+    app.processEvents()
+    check(len(window.library.filaments) == before, "the library can be restored after the Del test")
 
     check(
         window._picture_page is not None and window._tabs.count() == 2,
