@@ -17,6 +17,7 @@ from PySide6.QtCore import QSize, Qt, QTimer
 from PySide6.QtGui import QAction, QColor, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QFrame,
@@ -44,12 +45,19 @@ from ..core.library import (
     FilamentLibrary,
     LibraryError,
 )
-from ..core.mixes import MIX_RATIOS, SORT_CHOICES, SORT_PAIR, SORT_RGB, MixCatalog
+from ..core.mixes import (
+    MIX_RATIOS,
+    SORT_CHOICES,
+    SORT_PAIR,
+    SORT_RGB,
+    MixCatalog,
+    sorted_filaments,
+)
 from ..spectral import color as _color
 from . import theme
 from .filament_dialog import FilamentDialog
 from .mix_detail import MixDetail
-from .mix_grid import MixGrid
+from .mix_grid import MixGrid, spool_cell
 from .picture_page import PicturePage
 from .swatch import ColorButton, swatch_icon
 
@@ -220,7 +228,7 @@ class MainWindow(QMainWindow):
         self._status.setProperty("role", "hint")
         self.statusBar().addWidget(self._status)
 
-    def _wrap(self, widget: QWidget, title: str) -> QWidget:
+    def _wrap(self, widget: QWidget, title: str, header_extra: QWidget | None = None) -> QWidget:
         frame = QFrame()
         frame.setObjectName("panel")
         header = QLabel(title)
@@ -229,7 +237,14 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(10, 8, 10, 10)
         layout.setSpacing(8)
         if title:
-            layout.addWidget(header)
+            title_row = QHBoxLayout()
+            title_row.setContentsMargins(0, 0, 0, 0)
+            title_row.setSpacing(8)
+            title_row.addWidget(header)
+            title_row.addStretch(1)
+            if header_extra is not None:
+                title_row.addWidget(header_extra)
+            layout.addLayout(title_row)
         layout.addWidget(widget, 1)
         return frame
 
@@ -289,10 +304,22 @@ class MainWindow(QMainWindow):
     def _build_grid_panel(self) -> QWidget:
         self._grid = MixGrid()
         self._grid.recipeSelected.connect(self._on_grid_selected)
-        self._grid.recipeActivated.connect(lambda recipe: self._show_pair(recipe.a_id, recipe.b_id))
+        self._grid.recipeActivated.connect(self._on_grid_activated)
         self._grid.selectionCleared.connect(self._on_grid_cleared)
         self._grid_info = QLabel("")
         self._grid_info.setProperty("role", "hint")
+
+        # The spool colours are a separate, optional half of the same list: in
+        # Bambu Studio a mixed filament and the plain spool it is made from sit
+        # side by side in the same picker, so a user choosing what to load needs
+        # to see both. Off by default keeps the page about the mixes.
+        self._all_colours = QCheckBox("全部颜色")
+        self._all_colours.setToolTip(
+            "把每种耗材丝本身的颜色也列进来。\n"
+            "两种耗材时：81 个混色 + 2 个耗材本色 = 83 个颜色。\n"
+            "列表顺序与左边的「排序」一致。"
+        )
+        self._all_colours.toggled.connect(lambda *_: self._refresh_grid())
 
         panel = QWidget()
         layout = QVBoxLayout(panel)
@@ -300,7 +327,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(6)
         layout.addWidget(self._grid, 1)
         layout.addWidget(self._grid_info)
-        return self._wrap(panel, "全部混色")
+        return self._wrap(panel, "全部混色", header_extra=self._all_colours)
 
     def _build_menus(self) -> None:
         file_menu = self.menuBar().addMenu("文件(&F)")
@@ -525,10 +552,29 @@ class MainWindow(QMainWindow):
             pass  # a read-only data directory must not block a rebuild
         self._rebuild_catalog()
 
-    def _matches(self, recipe, query: str) -> bool:
+    def _matches(self, cell, query: str) -> bool:
+        """Does one grid cell survive the search box?
+
+        A spool cell is matched on its own name/brand/type/note; a mix cell also
+        on both of its parents, so searching a spool name still finds every mix
+        made from it.
+        """
+        if getattr(cell, "pair_index", 0) < 0:
+            filament = cell.filament
+            haystack = " ".join(
+                (
+                    filament.display_name,
+                    filament.brand,
+                    filament.material_type,
+                    filament.note,
+                )
+            ).casefold()
+            if _HEX_QUERY.match(query):
+                return query.lower() in filament.color_hex[1:].lower()
+            return query in haystack
         if _HEX_QUERY.match(query):
-            return query.lower() in recipe.color_hex[1:].lower()
-        for filament_id in (recipe.a_id, recipe.b_id):
+            return query.lower() in cell.color_hex[1:].lower()
+        for filament_id in (cell.a_id, cell.b_id):
             filament = self.library.get(filament_id)
             if filament is None:
                 continue
@@ -549,28 +595,36 @@ class MainWindow(QMainWindow):
             self._update_status()
             return
 
+        sort_key = self._sort_combo.currentData() or SORT_RGB
         if self._pair_filter is not None:
             recipes = self._catalog.pair_recipes(*self._pair_filter)
             grouped = False
         else:
-            sort_key = self._sort_combo.currentData() or SORT_RGB
             recipes = self._catalog.sorted_recipes(sort_key)
             grouped = sort_key == SORT_PAIR
+
+        # 「全部颜色」 prepends the spools themselves, so a two-spool library
+        # offers 81 mixes + 2 raw colours = 83 entries in one list, in the same
+        # order the 排序 control just gave the mixes.
+        spools = []
+        if self._all_colours.isChecked():
+            spools = [spool_cell(f) for f in sorted_filaments(self.library.filaments, sort_key)]
 
         query = self._search.text().strip().lstrip("#").casefold()
         if query:
             recipes = [recipe for recipe in recipes if self._matches(recipe, query)]
+            spools = [cell for cell in spools if self._matches(cell, query)]
             grouped = False
 
-        self._recipes = recipes
-        self._grid.setRecipes(recipes, grouped=grouped)
+        cells = spools + recipes
+        self._recipes = cells
+        self._grid.setRecipes(cells, grouped=grouped)
         self._show_all_button.setEnabled(self._pair_filter is not None or bool(query))
-        selected = self._detail.recipe()
-        if selected is not None:
-            for index, recipe in enumerate(recipes):
-                if recipe.key == selected.key:
-                    self._grid.setSelectedIndex(index, scroll=False)
-                    break
+        selected = self._detail.selectionKey()
+        if selected:
+            index = self._grid.indexOfKey(selected)
+            if index >= 0:
+                self._grid.setSelectedIndex(index, scroll=False)
         self._update_status()
 
     def _update_status(self) -> None:
@@ -579,13 +633,20 @@ class MainWindow(QMainWindow):
         shown = len(self._recipes)
         total = pairs * len(MIX_RATIOS)
         parts = [f"耗材 {count} 种", f"母材组合 {pairs} 对", f"混色 {total} 个"]
-        if shown != total:
+        if self._all_colours.isChecked():
+            parts.append(f"加耗材本色后 {total + count} 个")
+        if shown != total + (count if self._all_colours.isChecked() else 0):
             parts.append(f"当前显示 {shown} 个")
         if self._build_seconds:
             parts.append(f"计算用时 {self._build_seconds * 1000:.0f} ms")
         self._status.setText(" · ".join(parts))
         self._grid_info.setText(
             f"每两种耗材 81 个配比（10%–90%）"
+            + (
+                f" · 含 {count} 种耗材本色，共 {total + count} 个颜色"
+                if self._all_colours.isChecked()
+                else ""
+            )
             + (f" · 当前只显示 1 对耗材的混色" if self._pair_filter else "")
             + (f" · 已按「{self._sort_combo.currentText()}」排列" if self._pair_filter is None else "")
         )
@@ -608,15 +669,30 @@ class MainWindow(QMainWindow):
             )
 
     # -- selection ---------------------------------------------------------------
-    def _on_grid_selected(self, recipe) -> None:
-        self._detail.showRecipe(recipe)
-        filament_a = self.library.get(recipe.a_id)
-        filament_b = self.library.get(recipe.b_id)
+    def _on_grid_selected(self, cell) -> None:
+        # A spool cell is not a mix, so it has no pair to explain: it gets the
+        # single-colour view instead of a fabricated 100% : 0% recipe.
+        if getattr(cell, "pair_index", 0) < 0:
+            self._detail.showFilament(cell.filament)
+            self._status.setText(
+                f"{cell.color_hex}  =  {cell.filament.display_name}（耗材本色，不是混色）"
+            )
+            return
+        self._detail.showRecipe(cell)
+        filament_a = self.library.get(cell.a_id)
+        filament_b = self.library.get(cell.b_id)
         if filament_a and filament_b:
             self._status.setText(
-                f"{recipe.color_hex}  =  {filament_a.display_name}（{filament_a.color_hex}）{recipe.percent_a}%"
-                f"  +  {filament_b.display_name}（{filament_b.color_hex}）{recipe.percent_b}%"
+                f"{cell.color_hex}  =  {filament_a.display_name}（{filament_a.color_hex}）{cell.percent_a}%"
+                f"  +  {filament_b.display_name}（{filament_b.color_hex}）{cell.percent_b}%"
             )
+
+    def _on_grid_activated(self, cell) -> None:
+        """Double-click: a mix jumps to its parent pair, a spool has no pair."""
+        if getattr(cell, "pair_index", 0) < 0:
+            self._detail.showFilament(cell.filament)
+            return
+        self._show_pair(cell.a_id, cell.b_id)
 
     def _on_grid_cleared(self) -> None:
         """The user clicked blank space (or pressed Esc): drop the recipe."""
@@ -628,14 +704,19 @@ class MainWindow(QMainWindow):
         """The catalogue entry whose predicted colour is closest to ``target_hex``."""
         if self._catalog is None or not self._recipes:
             return None
+        # Spool cells carry no predicted Lab (they have no ratio), so they are
+        # skipped: this button answers "which mix should I dial in".
+        mixes = [cell for cell in self._recipes if getattr(cell, "pair_index", 0) >= 0]
+        if not mixes:
+            return None
         target = _color.lab_from_rgb(_color.hex_to_rgb(target_hex))
-        labs = np.array([recipe.lab for recipe in self._recipes], dtype=np.float64)
+        labs = np.array([recipe.lab for recipe in mixes], dtype=np.float64)
         rough = np.linalg.norm(labs - target, axis=1)
         shortlist = np.argsort(rough)[:64]
         best = None
         best_distance = float("inf")
         for index in shortlist:
-            recipe = self._recipes[int(index)]
+            recipe = mixes[int(index)]
             distance = _color.delta_e_2000(recipe.lab, tuple(target))
             if distance < best_distance:
                 best_distance = distance

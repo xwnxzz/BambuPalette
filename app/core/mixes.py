@@ -51,6 +51,12 @@ SORT_CHOICES: tuple[tuple[str, str], ...] = (
     (SORT_LABEL, "按名称"),
 )
 
+# Not part of SORT_CHOICES: this one needs a target colour, so only the picture
+# page — which always has one — offers it.
+SORT_SIMILARITY = "similarity"
+SIMILARITY_CHOICE: tuple[str, str] = (SORT_SIMILARITY, "按跟图片目标颜色最相似")
+SORT_CHOICES_WITH_SIMILARITY: tuple[tuple[str, str], ...] = SORT_CHOICES + (SIMILARITY_CHOICE,)
+
 
 @dataclass(frozen=True)
 class MixRecipe:
@@ -94,6 +100,88 @@ class MixRecipe:
     @property
     def ratio_text(self) -> str:
         return f"{self.percent_a}% + {self.percent_b}%"
+
+
+def _filament_lab(filament) -> tuple[float, float, float]:
+    return _color.lab_from_rgb(filament.rgb)
+
+
+def _filament_hue(filament) -> float:
+    _, a, b = _filament_lab(filament)
+    if abs(a) < 1e-9 and abs(b) < 1e-9:
+        return 0.0
+    return float(np.degrees(np.arctan2(b, a)) % 360.0)
+
+
+def _similarity(lab, target_rgb) -> float:
+    """CIEDE2000 distance from ``lab`` to ``target_rgb`` (lower is closer)."""
+    if target_rgb is None:
+        raise ValueError(
+            f"sort key {SORT_SIMILARITY!r} needs a target colour; pass target_rgb="
+        )
+    return float(_color.delta_e_2000(lab, _color.lab_from_rgb(tuple(target_rgb))))
+
+
+def filament_sort_key(key: str, filament, target_rgb=None):
+    """The sort key for a raw spool, shared by the grid and the picture page."""
+    if key == SORT_RGB:
+        return filament.rgb
+    if key == SORT_LIGHTNESS:
+        return (-_filament_lab(filament)[0], _filament_hue(filament))
+    if key == SORT_HUE:
+        return (
+            _filament_hue(filament),
+            -float(np.hypot(*_filament_lab(filament)[1:])),
+            -_filament_lab(filament)[0],
+        )
+    if key == SORT_LABEL:
+        return filament.display_name.casefold()
+    if key == SORT_SIMILARITY:
+        return _similarity(_filament_lab(filament), target_rgb)
+    if key == SORT_PAIR:
+        # A single spool is not a parent pair, so this key has nothing to say;
+        # every spool shares one key and the sort stays stable.
+        return 0
+    raise ValueError(f"unknown sort key {key!r}")
+
+
+def recipe_sort_key(key: str, recipe: MixRecipe, label_of=None, target_rgb=None):
+    """The sort key for a mix, shared by :class:`MixCatalog` and the picture page.
+
+    ``label_of`` maps a filament id to its case-folded display name; the catalogue
+    passes its own lookup so 「按名称」 can sort by spool name.
+    """
+    if key == SORT_RGB:
+        return recipe.rgb
+    if key == SORT_LIGHTNESS:
+        return (-recipe.lightness, recipe.hue)
+    if key == SORT_HUE:
+        return (recipe.hue, -recipe.chroma, -recipe.lightness)
+    if key == SORT_PAIR:
+        return (recipe.pair_index, recipe.percent_a)
+    if key == SORT_LABEL:
+        resolve = label_of or (lambda filament_id: str(filament_id))
+        return (resolve(recipe.a_id), resolve(recipe.b_id), recipe.percent_a)
+    if key == SORT_SIMILARITY:
+        return _similarity(recipe.lab, target_rgb)
+    raise ValueError(f"unknown sort key {key!r}")
+
+
+def sorted_filaments(
+    filaments: Sequence, key: str = SORT_RGB, *, target_rgb=None
+) -> list:
+    """Raw spools ordered by the same keys :meth:`MixCatalog.sorted_recipes` uses.
+
+    「全部颜色」 shows a spool next to the mixes, so both halves of the grid have
+    to answer to the one 排序 control — otherwise changing the sort would leave
+    the spool rows in a different order from everything under them. The keys
+    mirror ``sorted_recipes`` exactly: RGB ascending, then lightness descending
+    with hue as the tie-break, then hue/chroma/lightness, then name.
+
+    ``target_rgb`` is only needed for :data:`SORT_SIMILARITY`.
+    """
+    items = list(filaments)
+    return sorted(items, key=lambda filament: filament_sort_key(key, filament, target_rgb))
 
 
 class MixCatalog:
@@ -242,21 +330,18 @@ class MixCatalog:
                 return recipe
         return None
 
-    def sorted_recipes(self, key: str = SORT_RGB) -> list[MixRecipe]:
-        """Recipes ordered by ``key``; see :data:`SORT_CHOICES`."""
+    def sorted_recipes(self, key: str = SORT_RGB, *, target_rgb=None) -> list[MixRecipe]:
+        """Recipes ordered by ``key``; see :data:`SORT_CHOICES`.
+
+        ``target_rgb`` is only needed for :data:`SORT_SIMILARITY`, which orders
+        the mixes by how close they land to that colour.
+        """
         self._ensure_built()
         recipes = self._recipes
-        if key == SORT_RGB:
-            return sorted(recipes, key=lambda m: m.rgb)
-        if key == SORT_LIGHTNESS:
-            return sorted(recipes, key=lambda m: (-m.lightness, m.hue))
-        if key == SORT_HUE:
-            return sorted(recipes, key=lambda m: (m.hue, -m.chroma, -m.lightness))
-        if key == SORT_PAIR:
-            return sorted(recipes, key=lambda m: (m.pair_index, m.percent_a))
-        if key == SORT_LABEL:
-            return sorted(recipes, key=lambda m: (self._label(m.a_id), self._label(m.b_id), m.percent_a))
-        raise ValueError(f"unknown sort key {key!r}")
+        return sorted(
+            recipes,
+            key=lambda m: recipe_sort_key(key, m, self._label, target_rgb),
+        )
 
     def _label(self, filament_id: str):
         filament = self._by_id.get(filament_id)

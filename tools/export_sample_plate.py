@@ -30,7 +30,7 @@ from app.core.image_matching import MatchSettings, build_palette, match_image  #
 from app.core.library import Filament, FilamentLibrary  # noqa: E402
 from app.mesh.objfile import write_obj  # noqa: E402
 from app.mesh.plate import PlateSettings, build_plate  # noqa: E402
-from app.mesh.threemf import write_3mf  # noqa: E402
+from app.mesh.threemf import slots_from_palette, write_3mf  # noqa: E402
 
 SPOOLS = (
     ("大简 PETG HF 白", "#F2F0EB"),
@@ -75,7 +75,12 @@ def main() -> int:
     for note in plate.notes:
         print("note:", note)
 
-    three_mf = write_3mf(plate, OUT / "sample-plate.3mf", object_name="混色底板示例")
+    three_mf = write_3mf(
+        plate,
+        OUT / "sample-plate.3mf",
+        object_name="混色底板示例",
+        filaments=slots_from_palette(result.palette, library),
+    )
     obj = write_obj(plate, OUT / "sample-plate.obj")
     print("wrote", three_mf, f"{three_mf.stat().st_size} B")
     print("wrote", obj, f"{obj.stat().st_size} B")

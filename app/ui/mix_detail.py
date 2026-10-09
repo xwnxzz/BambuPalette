@@ -81,6 +81,7 @@ class MixDetail(QWidget):
         self._library = None
         self._engine = None
         self._recipe = None
+        self._filament = None
 
         self.setMinimumWidth(320)
         self.setAutoFillBackground(True)
@@ -220,13 +221,27 @@ class MixDetail(QWidget):
         self._engine = engine
         if self._recipe is not None:
             self.showRecipe(self._recipe)
+        elif self._filament is not None:
+            self.showFilament(self._library.get(self._filament.id) or self._filament)
 
     def recipe(self):
         return self._recipe
 
+    def filament(self):
+        return self._filament
+
+    def selectionKey(self) -> str:
+        """Whatever is currently shown, as one comparable key."""
+        if self._recipe is not None:
+            return self._recipe.key
+        if self._filament is not None:
+            return f"spool|{self._filament.id}"
+        return ""
+
     # -- content -----------------------------------------------------------------
     def clear(self) -> None:
         self._recipe = None
+        self._filament = None
         self._copy.setEnabled(False)
         self._empty.setVisible(True)
         for key in ("_hex", "_ratio", "_engine_label"):
@@ -243,6 +258,7 @@ class MixDetail(QWidget):
             self.clear()
             return
         self._recipe = recipe
+        self._filament = None
         self._empty.setVisible(False)
         filament_a = self._library.get(recipe.a_id)
         filament_b = self._library.get(recipe.b_id)
@@ -295,6 +311,62 @@ class MixDetail(QWidget):
         )
         self._copy.setEnabled(True)
 
+    def showFilament(self, filament) -> None:
+        """Show a raw spool colour — the extra cells 「全部颜色」 adds to the grid.
+
+        A spool is not a mix, so the pair bar and the second parent row are
+        hidden rather than filled with a fake 100% : 0% recipe. What is shown is
+        exactly what the user needs when they pick this cell: the colour, the
+        RGB, and the fact that using it means loading that one spool.
+        """
+        if filament is None:
+            self.clear()
+            return
+        self._recipe = None
+        self._filament = filament
+        self._empty.setVisible(False)
+
+        self._preview.setValue(filament.color_hex)
+        self._preview.setVisible(True)
+        self._hex.setText(
+            f"耗材本色 {filament.color_hex}   "
+            f"RGB {filament.rgb[0]}, {filament.rgb[1]}, {filament.rgb[2]}"
+        )
+        self._hex.setVisible(True)
+        self._ratio.setText("单色 · 100%")
+        self._ratio.setVisible(True)
+        self._engine_label.setText(
+            "这是耗材丝本身的颜色，不是混色；「全部颜色」把每种耗材丝也当成一个可选项，"
+            "所以两种耗材时会看到 81 个混色 + 2 个本色 = 83 个颜色。"
+        )
+        self._engine_label.setVisible(True)
+
+        row = self._rows[0]
+        row["frame"].setVisible(True)
+        row["swatch"].setValue(filament.color_hex)
+        detail = " · ".join(p for p in (filament.brand, filament.material_type) if p)
+        row["name"].setText(filament.display_name)
+        row["detail"].setText(detail if detail and detail != filament.display_name else "")
+        row["percent"].setText(f"100%\n{filament.color_hex}")
+        row["frame"].setToolTip(
+            f"{filament.display_name}\n{filament.color_hex}"
+            + (f"\n备注：{filament.note}" if filament.note else "")
+        )
+        self._rows[1]["frame"].setVisible(False)
+
+        # No pair, so no ratio bar and no "只看这一对耗材" jump.
+        self._bar.setVisible(False)
+        self._pair_button.setVisible(False)
+
+        self._steps.setVisible(True)
+        self._steps.setText(
+            "在 Bambu Studio 里这样用：\n"
+            f"  1. 把 {_short(filament)} 装进 AMS\n"
+            f"  2. 颜色选 {filament.color_hex}\n"
+            "单色耗材不需要配置混色比例。"
+        )
+        self._copy.setEnabled(True)
+
     # -- actions -----------------------------------------------------------------
     def _on_pair(self) -> None:
         if self._recipe is not None:
@@ -302,14 +374,22 @@ class MixDetail(QWidget):
 
     def _on_copy(self) -> None:
         recipe = self._recipe
-        if recipe is None or self._library is None:
+        if recipe is None:
+            if self._filament is not None:
+                self._flash_copy(
+                    f"{_short(self._filament)} 100%  →  {self._filament.color_hex}"
+                )
+            return
+        if self._library is None:
             return
         filament_a = self._library.get(recipe.a_id)
         filament_b = self._library.get(recipe.b_id)
-        text = (
+        self._flash_copy(
             f"{_short(filament_a)} {recipe.percent_a}%  +  "
             f"{_short(filament_b)} {recipe.percent_b}%  →  {recipe.color_hex}"
         )
+
+    def _flash_copy(self, text: str) -> None:
         QApplication.clipboard().setText(text)
         self._copy.setText("已复制")
         from PySide6.QtCore import QTimer

@@ -12,6 +12,7 @@ Run with::
 
 from __future__ import annotations
 
+import json
 import sys
 import unittest
 import xml.etree.ElementTree as ET
@@ -112,7 +113,7 @@ class ThreeMfTests(ExportTestCase):
         )
         self.assertNotIn("requiredextensions", root.attrib)
         meshes = [item for item in root.iter() if _local(item.tag) == "mesh"]
-        self.assertEqual(len(meshes), len(self.plate.parts))
+        self.assertEqual(len(meshes), 1, "the plate is one object, not one per colour")
 
     def test_content_types_declare_the_model_extension(self):
         with zipfile.ZipFile(self._write()) as archive:
@@ -127,89 +128,158 @@ class ThreeMfTests(ExportTestCase):
         self.assertIn("/3D/3dmodel.model", targets)
 
     def test_every_xml_part_is_well_formed(self):
+        # Metadata/project_settings.config is JSON despite the .config suffix —
+        # Bambu Studio's own naming quirk, not ours, so it is parsed as JSON.
         with zipfile.ZipFile(self._write()) as archive:
             for name in archive.namelist():
-                if name.endswith(".model") or name.endswith(".config") or name.endswith(".xml"):
+                if name.endswith(".model") or name.endswith(".xml"):
                     ET.fromstring(archive.read(name))
+                elif name == "Metadata/model_settings.config":
+                    ET.fromstring(archive.read(name))
+                elif name == "Metadata/project_settings.config":
+                    json.loads(archive.read(name))
 
     def _model(self):
         with zipfile.ZipFile(self._write()) as archive:
             return ET.fromstring(archive.read("3D/3dmodel.model"))
 
-    def test_the_assembly_pulls_in_one_component_per_part(self):
+    def _by_extruder(self) -> dict[int, str]:
+        """The colour each extruder slot is painted with, from the parts."""
+        mapping: dict[int, str] = {}
+        for part in self.plate.parts:
+            mapping[part.extruder] = part.color_hex
+        return mapping
+
+    def test_the_plate_is_a_single_painted_object(self):
+        """The user's requirement: ONE plate with colours painted on it.
+
+        Every colour region used to be its own ``<part>``, which Bambu Studio
+        showed as a stack of child objects under 混色底板 rather than a plate.
+        Now there is one object, one mesh, and the colours live on the triangles.
+        """
         root = self._model()
         objects = [item for item in root.iter() if _local(item.tag) == "object"]
-        self.assertEqual(len(objects), len(self.plate.parts) + 1)
-        assembly = objects[-1]
-        self.assertEqual(assembly.get("id"), str(len(self.plate.parts) + 1))
-        components = [item for item in assembly.iter() if _local(item.tag) == "component"]
-        self.assertEqual(len(components), len(self.plate.parts))
-        for index, component in enumerate(components, start=1):
-            self.assertEqual(component.get("objectid"), str(index))
-            self.assertIsNone(component.get("p:path"))
+        self.assertEqual(len(objects), 1)
+        self.assertEqual(objects[0].get("id"), "1")
+        self.assertFalse(
+            [item for item in root.iter() if _local(item.tag) == "component"],
+            "one inline mesh replaces the per-colour component list",
+        )
         build = next(item for item in root.iter() if _local(item.tag) == "build")
         items = [item for item in build if _local(item.tag) == "item"]
         self.assertEqual(len(items), 1)
-        self.assertEqual(items[0].get("objectid"), assembly.get("id"))
+        self.assertEqual(items[0].get("objectid"), "1")
 
-    def test_every_component_resolves_to_an_inline_object(self):
-        """The invariant Bambu Studio actually choked on: ids must resolve."""
+    def test_every_triangle_names_its_filament(self):
+        """pid/p1 and Bambu Studio's own paint_color must agree, triangle by triangle."""
+        from app.mesh.threemf import BASEMATERIALS_ID, paint_code
+
         root = self._model()
-        objects = [item for item in root.iter() if _local(item.tag) == "object"]
-        mesh_objects = {
-            item.get("id"): item
-            for item in objects
-            if any(_local(child.tag) == "mesh" for child in item)
-        }
-        self.assertEqual(len(mesh_objects), len(self.plate.parts))
-        assembly = objects[-1]
-        for component in (item for item in assembly.iter() if _local(item.tag) == "component"):
-            self.assertIn(component.get("objectid"), mesh_objects)
+        triangles = [item for item in root.iter() if _local(item.tag) == "triangle"]
+        self.assertEqual(len(triangles), self.plate.triangle_count)
+
+        expected: dict[str, int] = {}
+        for part in self.plate.parts:
+            code = paint_code(part.extruder)
+            expected[code] = expected.get(code, 0) + part.triangle_count
+
+        seen: dict[str, int] = {}
+        for triangle in triangles:
+            self.assertEqual(triangle.get("pid"), str(BASEMATERIALS_ID))
+            self.assertIsNotNone(triangle.get("p1"))
+            code = triangle.get("paint_color")
+            self.assertIn(code, expected)
+            seen[code] = seen.get(code, 0) + 1
+        self.assertEqual(seen, expected)
+
+    def test_the_basematerials_table_lists_one_entry_per_filament(self):
+        root = self._model()
+        tables = [item for item in root.iter() if _local(item.tag) == "basematerials"]
+        self.assertEqual(len(tables), 1)
+        bases = [item for item in tables[0] if _local(item.tag) == "base"]
+        by_extruder = self._by_extruder()
+        self.assertEqual(len(bases), len(by_extruder))
+        self.assertEqual(sorted(by_extruder), list(range(1, len(by_extruder) + 1)))
+        for index, base in enumerate(bases, start=1):
+            self.assertEqual(base.get("displaycolor"), f"{by_extruder[index].upper()}FF")
 
     def test_geometry_round_trips_vertex_for_vertex(self):
         root = self._model()
-        objects = [item for item in root.iter() if _local(item.tag) == "object"]
-        mesh_objects = [item for item in objects if any(_local(c.tag) == "mesh" for c in item)]
-        self.assertEqual(len(mesh_objects), len(self.plate.parts))
-        for index, (element, part) in enumerate(zip(mesh_objects, self.plate.parts), start=1):
-            with self.subTest(part=part.name):
-                self.assertEqual(element.get("id"), str(index))
-                vertices = [item for item in element.iter() if _local(item.tag) == "vertex"]
-                triangles = [item for item in element.iter() if _local(item.tag) == "triangle"]
-                self.assertEqual(len(vertices), len(part.vertices))
-                self.assertEqual(len(triangles), part.triangle_count)
-                for triangle in triangles:
-                    for key in ("v1", "v2", "v3"):
-                        self.assertLess(int(triangle.get(key)), len(vertices))
+        mesh = next(item for item in root.iter() if _local(item.tag) == "mesh")
+        vertices = [item for item in mesh.iter() if _local(item.tag) == "vertex"]
+        triangles = [item for item in mesh.iter() if _local(item.tag) == "triangle"]
+        self.assertEqual(len(vertices), sum(len(part.vertices) for part in self.plate.parts))
+        self.assertEqual(len(triangles), self.plate.triangle_count)
+        for triangle in triangles:
+            for key in ("v1", "v2", "v3"):
+                self.assertLess(int(triangle.get(key)), len(vertices))
+
+    def test_the_merged_vertices_keep_each_part_contiguous(self):
+        """Concatenation must offset indices, not renumber them across parts."""
+        root = self._model()
+        mesh = next(item for item in root.iter() if _local(item.tag) == "mesh")
+        triangles = [item for item in mesh.iter() if _local(item.tag) == "triangle"]
+        cursor = 0
+        offset = 0
+        for part in self.plate.parts:
+            window = triangles[cursor : cursor + part.triangle_count]
+            self.assertEqual(len(window), part.triangle_count)
+            for triangle in window:
+                for key in ("v1", "v2", "v3"):
+                    index = int(triangle.get(key))
+                    self.assertGreaterEqual(index, offset)
+                    self.assertLess(index, offset + len(part.vertices))
+            cursor += part.triangle_count
+            offset += len(part.vertices)
 
     def test_the_last_written_vertex_is_the_model_vertex_on_the_bed(self):
         root = self._model()
-        objects = [item for item in root.iter() if _local(item.tag) == "object"]
-        first = next(item for item in objects if item.get("id") == "1")
-        vertices = [item for item in first.iter() if _local(item.tag) == "vertex"]
+        mesh = next(item for item in root.iter() if _local(item.tag) == "mesh")
+        vertices = [item for item in mesh.iter() if _local(item.tag) == "vertex"]
         last = vertices[-1]
-        expected = self.plate.parts[0].vertices[-1]
+        expected = self.plate.parts[-1].vertices[-1]
         self.assertAlmostEqual(float(last.get("x")) - expected[0], (256.0 - self.plate.width_mm) / 2.0, places=4)
         self.assertAlmostEqual(float(last.get("y")) - expected[1], (256.0 - self.plate.depth_mm) / 2.0, places=4)
         self.assertAlmostEqual(float(last.get("z")) - expected[2], 0.0, places=6)
 
-    def test_every_part_gets_its_own_extruder_slot(self):
+    def test_the_settings_file_describes_one_object_with_one_part(self):
         with zipfile.ZipFile(self._write()) as archive:
             root = ET.fromstring(archive.read("Metadata/model_settings.config"))
-        parts = [item for item in root.iter() if _local(item.tag) == "part"]
-        self.assertEqual(len(parts), len(self.plate.parts))
-        for index, element in enumerate(parts, start=1):
-            self.assertEqual(element.get("id"), str(index))
-            self.assertEqual(element.get("subtype"), "normal_part")
-            metadata = {
-                item.get("key"): item.get("value")
-                for item in element
-                if _local(item.tag) == "metadata"
-            }
-            self.assertEqual(metadata["extruder"], str(self.plate.parts[index - 1].extruder))
-            self.assertEqual(metadata["name"], self.plate.parts[index - 1].name)
+        objects = [item for item in root.iter() if _local(item.tag) == "object"]
+        self.assertEqual(len(objects), 1)
+        self.assertEqual(objects[0].get("id"), "1")
+        parts = [item for item in objects[0].iter() if _local(item.tag) == "part"]
+        self.assertEqual(len(parts), 1)
+        self.assertEqual(parts[0].get("subtype"), "normal_part")
+        metadata = {
+            item.get("key"): item.get("value")
+            for item in objects[0]
+            if _local(item.tag) == "metadata"
+        }
+        self.assertEqual(metadata["extruder"], str(self.plate.parts[0].extruder))
+        # Bambu writes the face count as a KEYLESS metadata attribute rather
+        # than a key/value pair; a real project file carries it the same way.
+        face_counts = [
+            item.get("face_count")
+            for item in objects[0]
+            if _local(item.tag) == "metadata" and item.get("key") is None
+        ]
+        self.assertEqual(face_counts, [str(self.plate.triangle_count)])
 
-    def test_the_plate_records_one_instance_of_the_assembly(self):
+    def test_the_project_file_carries_one_filament_per_colour(self):
+        with zipfile.ZipFile(self._write()) as archive:
+            settings = json.loads(archive.read("Metadata/project_settings.config"))
+        count = self.plate.extruder_count
+        self.assertEqual(len(settings["filament_colour"]), count)
+        self.assertEqual(len(settings["filament_multi_colour"]), count)
+        for part in self.plate.parts:
+            self.assertEqual(settings["filament_colour"][part.extruder - 1], part.color_hex)
+        # Bambu's own key is the SINGULAR filament_map.  filament_maps is a
+        # model_settings.config plate key and must not be repeated here.
+        self.assertEqual(len(settings["filament_map"]), count)
+        self.assertNotIn("filament_maps", settings)
+
+    def test_the_plate_records_one_instance_of_the_object(self):
         with zipfile.ZipFile(self._write()) as archive:
             root = ET.fromstring(archive.read("Metadata/model_settings.config"))
         plate = next(item for item in root.iter() if _local(item.tag) == "plate")
@@ -222,12 +292,10 @@ class ThreeMfTests(ExportTestCase):
         instance = {
             item.get("key"): item.get("value") for item in instances[0] if _local(item.tag) == "metadata"
         }
-        self.assertEqual(instance["object_id"], str(len(self.plate.parts) + 1))
+        self.assertEqual(instance["object_id"], "1")
 
     def test_object_names_are_xml_escaped(self):
-        plate = build_plate(self.result, PlateSettings(target_width_mm=100.0))
-        plate.parts[0].name = 'a & b <c> "d"'
-        path = write_3mf(plate, self.tmp / "escaped")
+        path = write_3mf(self.plate, self.tmp / "escaped", object_name='a & b <c> "d"')
         with zipfile.ZipFile(path) as archive:
             root = ET.fromstring(archive.read("Metadata/model_settings.config"))
         names = [

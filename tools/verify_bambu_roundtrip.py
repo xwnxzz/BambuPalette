@@ -24,6 +24,7 @@ Exit code 0 means Bambu Studio loaded and reproduced the geometry.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -44,7 +45,7 @@ paths.data_dir = lambda: TEMP  # type: ignore[assignment]
 from app.core.image_matching import MatchSettings, build_palette, match_image  # noqa: E402
 from app.core.library import Filament, FilamentLibrary  # noqa: E402
 from app.mesh.plate import PlateSettings, build_plate  # noqa: E402
-from app.mesh.threemf import write_3mf  # noqa: E402
+from app.mesh.threemf import slots_from_palette, write_3mf  # noqa: E402
 
 BAMBU_CANDIDATES = (
     Path(r"C:\Program Files\Bambu Studio\bambu-studio.exe"),
@@ -90,12 +91,26 @@ def build_sample() -> Path:
     palette = build_palette(library, None, include_mixes=False)
     result = match_image(picture, palette, MatchSettings(max_colours=8))
     plate = build_plate(result, PlateSettings(target_width_mm=120.0))
-    return write_3mf(plate, TEMP / "source.3mf", object_name="往返验证底板")
+    return write_3mf(
+        plate,
+        TEMP / "source.3mf",
+        object_name="往返验证底板",
+        filaments=slots_from_palette(result.palette, library),
+    )
 
 
 def count_geometry(path: Path) -> dict:
-    """Vertices, triangles and per-part extruders of a 3MF, however it is laid out."""
-    report = {"vertices": 0, "triangles": 0, "objects": 0, "parts": [], "meshes": 0}
+    """Everything we care about in a 3MF, however Bambu Studio chose to lay it out."""
+    report = {
+        "vertices": 0,
+        "triangles": 0,
+        "objects": 0,
+        "parts": [],
+        "meshes": 0,
+        "paints": {},  # paint_color string -> triangle count
+        "unpainted": 0,
+        "filaments": [],
+    }
     with zipfile.ZipFile(path) as archive:
         names = archive.namelist()
         for name in names:
@@ -104,7 +119,15 @@ def count_geometry(path: Path) -> dict:
             root = ET.fromstring(archive.read(name))
             report["meshes"] += sum(1 for item in root.iter() if _local(item.tag) == "mesh")
             report["vertices"] += sum(1 for item in root.iter() if _local(item.tag) == "vertex")
-            report["triangles"] += sum(1 for item in root.iter() if _local(item.tag) == "triangle")
+            for item in root.iter():
+                if _local(item.tag) != "triangle":
+                    continue
+                report["triangles"] += 1
+                code = item.get("paint_color")
+                if code:
+                    report["paints"][code] = report["paints"].get(code, 0) + 1
+                else:
+                    report["unpainted"] += 1
             report["objects"] += sum(1 for item in root.iter() if _local(item.tag) == "object")
         if "Metadata/model_settings.config" in names:
             root = ET.fromstring(archive.read("Metadata/model_settings.config"))
@@ -117,6 +140,14 @@ def count_geometry(path: Path) -> dict:
                     if _local(item.tag) == "metadata"
                 }
                 report["parts"].append((element.get("id"), metadata.get("extruder"), metadata.get("name")))
+        if "Metadata/project_settings.config" in names:
+            try:
+                settings = json.loads(archive.read("Metadata/project_settings.config"))
+            except (ValueError, UnicodeDecodeError):
+                settings = {}
+            colours = settings.get("filament_colour")
+            if isinstance(colours, list):
+                report["filaments"] = [str(item) for item in colours]
     return report
 
 
@@ -140,10 +171,15 @@ def main() -> int:
     print(
         f"source      : {source.stat().st_size:>8,} B  "
         f"{source_report['vertices']:,} vertices  {source_report['triangles']:,} triangles  "
-        f"{len(source_report['parts'])} parts"
+        f"{len(source_report['parts'])} parts  {len(source_report['paints'])} paint codes"
     )
     for part_id, extruder, name in source_report["parts"]:
         print(f"              part {part_id}: extruder {extruder}  {name}")
+    print(f"              filaments: {' '.join(source_report['filaments']) or '(none)'}")
+    print(
+        "              paints: "
+        + "  ".join(f"{code}×{count:,}" for code, count in sorted(source_report["paints"].items()))
+    )
 
     exported = TEMP / "bambu-roundtrip.3mf"
     if exported.exists():
@@ -171,8 +207,14 @@ def main() -> int:
     )
     for part_id, extruder, name in returned["parts"]:
         print(f"              part {part_id}: extruder {extruder}  {name}")
+    print(f"              filaments: {' '.join(returned['filaments']) or '(none)'}")
+    print(
+        "              paints: "
+        + "  ".join(f"{code}×{count:,}" for code, count in sorted(returned["paints"].items()))
+    )
 
     failures: list[str] = []
+    warnings: list[str] = []
     if returned["triangles"] == 0:
         failures.append("Bambu Studio returned no triangles — the geometry did not survive the import")
     if returned["vertices"] == 0:
@@ -182,9 +224,37 @@ def main() -> int:
             f"only {returned['triangles']} of {source_report['triangles']} triangles came back"
         )
     if not returned["parts"]:
-        failures.append("Bambu Studio kept no <part> entries, so no extruder assignment survived")
+        failures.append("Bambu Studio kept no <part> entries, so the object did not survive")
+    if source_report["paints"] and not returned["paints"]:
+        failures.append(
+            "every paint_color was lost, so the plate came back unpainted — the colours "
+            "would have to be assigned by hand again"
+        )
+    missing = set(source_report["paints"]) - set(returned["paints"])
+    if missing:
+        failures.append(f"paint codes {sorted(missing)} did not survive the round trip")
+    if source_report["filaments"] and returned["filaments"] != source_report["filaments"]:
+        # NOT a failure.  Bambu Studio only reads ``filament_colour`` out of
+        # ``project_settings.config`` for files whose Application metadata starts
+        # with ``BambuStudio``; a file imported from another program is read as a
+        # plain 3MF and gets the slicer's own default spool.  The colours that do
+        # travel are the ``<basematerials>`` table and the ``paint_color`` codes
+        # on the triangles, and those are checked above.  Renaming the
+        # Application to ``BambuStudio-…`` does make this file's filament list
+        # round trip, but it also makes Bambu Studio abort with an
+        # out-of-memory crash, so it is deliberately not done.
+        warnings.append(
+            f"the filament list is not carried by a foreign-project import "
+            f"({source_report['filaments']} -> {returned['filaments']}); "
+            f"the plate keeps its colours through basematerials/paint_color instead"
+        )
 
     print()
+    if warnings:
+        print("WARNINGS")
+        for item in warnings:
+            print("  !", item)
+        print()
     if failures:
         print("FAILED")
         for item in failures:

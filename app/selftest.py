@@ -81,7 +81,7 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     from .core.mixes import expected_recipe_count
     from .mesh.objfile import write_obj
     from .mesh.plate import PlateSettings, build_plate
-    from .mesh.threemf import write_3mf
+    from .mesh.threemf import slots_from_palette, write_3mf
     from .ui.main_window import MainWindow
 
     lines.append(f"engines     {', '.join(sorted(ENGINES))}")
@@ -162,6 +162,36 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     window._refresh_grid()
     app.processEvents()
     check(len(window._recipes) == 810, "the full catalogue comes back after clearing")
+
+    # 「全部颜色」 — the raw spools join the grid so two inputs give 83 colours.
+    from .core.mixes import expected_recipe_count
+    from .ui import mix_grid
+
+    check(expected_recipe_count(2) + 2 == 83, "81 mixes + 2 raw spools = 83 colours")
+    check(not window._all_colours.isChecked(), "「全部颜色」 starts unticked")
+    spool_count = len(window.library.filaments)
+    window._all_colours.setChecked(True)
+    app.processEvents()
+    check(
+        len(window._recipes) == 810 + spool_count,
+        f"ticking 「全部颜色」 adds one row per spool, got {len(window._recipes)}",
+    )
+    spool_rows = [c for c in window._recipes if getattr(c, "pair_index", 0) < 0]
+    check(len(spool_rows) == spool_count, "one raw spool row per spool")
+    check(
+        all(row.color_hex == row.filament.color_hex for row in spool_rows),
+        "a raw spool row shows the spool's own colour",
+    )
+    window._grid.selectRecipe(spool_rows[0])
+    window._on_grid_selected(spool_rows[0])
+    app.processEvents()
+    check(window._detail.recipe() is None, "a raw spool is not presented as a mix")
+    check(window._detail.filament() is not None, "the detail panel shows the raw spool itself")
+    window._all_colours.setChecked(False)
+    app.processEvents()
+    check(len(window._recipes) == 810, "un-ticking 「全部颜色」 restores the mixes-only grid")
+    window._detail.clear()
+
     check(
         window._picture_page is not None and window._tabs.count() == 2,
         "both pages are present",
@@ -200,7 +230,77 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         check(plate.width_mm > 0 and plate.depth_mm > 0, f"the plate is {plate.width_mm} × {plate.depth_mm} mm")
         check(plate.triangle_count > 0, f"the plate has {plate.triangle_count} triangles")
 
-        three_mf = write_3mf(plate, scratch / "selftest.3mf", object_name="自检底板")
+        # 「选中的颜色」: both colours, the recipe, and manual replacement with undo.
+        from .core.mixes import SORT_SIMILARITY
+        from .spectral import color as _selftest_color
+        from .ui.colour_picker import ColourDetail, ColourPickerDialog
+
+        check(isinstance(page._detail, ColourDetail), "the picture page shows the selected colour")
+        check(
+            page._auto_palette == list(page.result.palette) and page._overrides == {},
+            "a fresh match keeps the automatic palette and no replacements",
+        )
+        check(MatchSettings().merge_delta_e == 2.0, "near-identical matches merge by default")
+
+        page._select(0)
+        auto = page.result.palette[0]
+        check(
+            page._detail.image_hex() == _selftest_color.rgb_to_hex(page.result.region_colour(0)),
+            "the panel shows the picture region's own colour",
+        )
+        check(
+            page._detail.match_hex() == auto.color_hex.upper(),
+            f"the panel shows the matched colour ({page._detail.match_hex()})",
+        )
+        check(
+            "配方" in page._detail.recipe_text() or "耗材本色" in page._detail.recipe_text(),
+            "the matched colour carries its recipe",
+        )
+        check(page._detail.can_replace(), "the colour can be replaced by hand")
+        check(not page._detail.can_restore(), "nothing to undo before a replacement")
+
+        menu = build_palette(page.library, page._catalog, include_mixes=True)
+        picker = ColourPickerDialog(
+            menu,
+            page.result.region_colour(0),
+            library=page.library,
+            current_key=auto.key,
+        )
+        check(
+            picker._sort.currentData() == SORT_SIMILARITY,
+            "the replacement menu opens sorted by similarity to the picture colour",
+        )
+        ordered = picker.ordered()
+        check(len(ordered) == len(menu), f"the replacement menu lists all {len(menu)} colours")
+        check(
+            ordered[0].color_hex.upper() == auto.color_hex.upper(),
+            "the automatic match leads the similarity sort",
+        )
+        picker.close()
+
+        replacement = next(entry for entry in ordered if entry.key != auto.key)
+        page._overrides[0] = replacement
+        page._apply_overrides()
+        app.processEvents()
+        check(
+            page.result.palette[0].key == replacement.key,
+            "the replacement is the colour the plate will print",
+        )
+        check(page._detail.can_restore(), "a replaced colour can be undone")
+        page._on_restore()
+        app.processEvents()
+        check(
+            page.result.palette[0].key == auto.key and page._overrides == {},
+            "undoing the replacement puts the automatic match back",
+        )
+        check(not page._detail.can_restore(), "there is nothing left to undo")
+
+        three_mf = write_3mf(
+            plate,
+            scratch / "selftest.3mf",
+            object_name="自检底板",
+            filaments=slots_from_palette(page.result.palette, page.library),
+        )
         obj = write_obj(plate, scratch / "selftest.obj")
         check(three_mf.is_file() and three_mf.stat().st_size > 0, f"3MF written ({three_mf.stat().st_size} B)")
         check(obj.is_file() and obj.stat().st_size > 0, f"OBJ written ({obj.stat().st_size} B)")

@@ -369,6 +369,21 @@ QLabel[role="mono"] {{
 QCheckBox {{
     spacing: 6px;
     font-size: 12px;
+    min-height: 18px;
+}}
+/* Windows 11's style paints a filled accent square for the checked state and
+   then clips the tick into whatever room is left. At the 12px label size the
+   auto-sized indicator collapses to ~16px, the tick vanishes, and a ticked box
+   becomes indistinguishable from a colour chip. Pinning the indicator restores
+   an unmistakable tick without giving up the small label. */
+QCheckBox::indicator {{
+    width: 15px;
+    height: 15px;
+}}
+QCheckBox::indicator:disabled {{
+    background: {PANEL_ALT};
+    border: 1px solid {BORDER};
+    border-radius: 3px;
 }}
 """
 

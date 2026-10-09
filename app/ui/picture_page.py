@@ -13,6 +13,8 @@ choose; all Qt file dialogs default to the app's own exports directory.
 
 from __future__ import annotations
 
+from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -22,6 +24,7 @@ from PySide6.QtGui import QColor, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDialog,
     QDoubleSpinBox,
     QFileDialog,
     QFrame,
@@ -31,6 +34,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QSplitter,
     QVBoxLayout,
@@ -49,8 +53,15 @@ from ..core.library import FilamentLibrary
 from ..core.mixes import MixCatalog
 from ..mesh.objfile import write_obj
 from ..mesh.plate import PlateModel, PlateSettings, build_plate
-from ..mesh.threemf import write_3mf
+from ..mesh.threemf import MAX_PAINTED_FILAMENTS, slots_from_palette, write_3mf
 from . import theme
+from .colour_picker import (
+    ColourDetail,
+    ColourPickerDialog,
+    compare_pixmap,
+    entry_recipe_text,
+    hex_of,
+)
 from .swatch import swatch_pixmap
 
 __all__ = ["PicturePage", "PictureView", "ColourList"]
@@ -211,7 +222,12 @@ class PictureView(QWidget):
 
 
 class ColourList(QWidget):
-    """The colours this print needs, with the clicked one pinned to the top."""
+    """The colours this print needs, with the clicked one pinned to the top.
+
+    Each row compares the picture's own colour for that region with the spool or
+    mix we matched it to, and names the recipe underneath, so the user can see at
+    a glance which regions are a good match and which need a manual replacement.
+    """
 
     colourSelected = Signal(int)
     colourActivated = Signal(int)
@@ -222,13 +238,15 @@ class ColourList(QWidget):
         self._order: list[int] = []
         self._pinned = -1
         self._suppress = False
+        self._library: FilamentLibrary | None = None
 
         self._list = QListWidget()
-        self._list.setIconSize(swatch_pixmap("#FFFFFF").size())
-        self._list.setUniformItemSizes(True)
+        self._list.setIconSize(compare_pixmap("#FFFFFF", "#000000").size())
+        self._list.setUniformItemSizes(False)
         self._list.setAlternatingRowColors(False)
         self._list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._list.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self._list.setWordWrap(False)
         self._list.currentRowChanged.connect(self._on_row_changed)
         self._list.itemDoubleClicked.connect(self._on_row_double_clicked)
 
@@ -246,8 +264,17 @@ class ColourList(QWidget):
         self._result = result
         self._pinned = -1
         self._order = list(range(len(result.palette))) if result is not None else []
+        self.refresh()
+
+    def refresh(self) -> None:
+        """Rebuild the rows, keeping the pinned selection and the order."""
         self._refresh()
         self._update_summary()
+
+    def setLibrary(self, library: FilamentLibrary | None) -> None:
+        """The recipe text names the parent spools, so the list needs the library."""
+        self._library = library
+        self.refresh()
 
     def current(self) -> int:
         return self._pinned
@@ -276,13 +303,20 @@ class ColourList(QWidget):
             for index in self._order:
                 entry = result.palette[index]
                 count = int(result.counts[index])
-                item = QListWidgetItem(
-                    swatch_pixmap(entry.color_hex),
-                    f"{entry.color_hex}   {count} 像素 · {count / total * 100:.1f}%",
+                image_hex = hex_of(result.region_colour(index))
+                share = count / total * 100.0
+                row = QListWidgetItem(
+                    compare_pixmap(image_hex, entry.color_hex, 44, 20),
+                    f"{image_hex} → {entry.color_hex}    {share:.1f}%\n"
+                    f"{entry_recipe_text(entry, self._library, compact=True)}",
                 )
-                item.setData(Qt.ItemDataRole.UserRole, int(index))
-                item.setToolTip(f"{entry.label}\n{entry.color_hex}")
-                self._list.addItem(item)
+                row.setData(Qt.ItemDataRole.UserRole, int(index))
+                row.setToolTip(
+                    f"图片里的颜色：{image_hex}（{count} 像素 · {share:.1f}%）\n"
+                    f"匹配到的颜色：{entry.color_hex}\n"
+                    f"{entry_recipe_text(entry, self._library)}"
+                )
+                self._list.addItem(row)
             if self._pinned >= 0 and self._list.count():
                 self._list.setCurrentRow(0)
         self._suppress = False
@@ -318,9 +352,15 @@ class PicturePage(QWidget):
         self._library: FilamentLibrary | None = None
         self._catalog: MixCatalog | None = None
         self._image: Image.Image | None = None
+        self._image_name: str = "混色底板"
         self._source_qimage: QImage | None = None
         self._result: MatchResult | None = None
         self._plate: PlateModel | None = None
+        # What the matcher decided, and what the USER decided on top of it. The
+        # two are kept apart so 「恢复自动匹配」 can undo a replacement without
+        # re-running the match, and so the export follows the user's choice.
+        self._auto_palette: list[PaletteEntry] = []
+        self._overrides: dict[int, PaletteEntry] = {}
         self._build_ui()
         self._set_controls_enabled(False)
 
@@ -338,9 +378,11 @@ class PicturePage(QWidget):
         self._include_mixes.setToolTip("勾选后，候选颜色包含全部两两混色的 81 个配比")
 
         self._colour_count = QSpinBox()
-        self._colour_count.setRange(2, 48)
+        self._colour_count.setRange(2, MAX_PAINTED_FILAMENTS)
         self._colour_count.setValue(12)
-        self._colour_count.setToolTip("图片最多用多少种颜色；越少越省换料")
+        self._colour_count.setToolTip(
+            f"图片最多用多少种颜色；越少越省换料。Bambu Studio 最多认 {MAX_PAINTED_FILAMENTS} 种"
+        )
 
         self._max_dimension = QSpinBox()
         self._max_dimension.setRange(32, 4096)
@@ -417,9 +459,35 @@ class PicturePage(QWidget):
         self._list.colourSelected.connect(self._on_colour_selected)
         self._list.colourActivated.connect(self._on_colour_activated)
 
+        self._detail = ColourDetail()
+        self._detail.replaceRequested.connect(self._on_replace)
+        self._detail.restoreRequested.connect(self._on_restore)
+
+        # The list tells the user which colours the print needs; the detail
+        # panel explains the one they clicked. Stacked, because both matter and
+        # the right column is narrow.
+        #
+        # The detail panel is taller than its share of a short window (two
+        # cards, a recipe, a hint and two buttons), and a 「更换颜色…」 button
+        # that is off the bottom of the screen is the same as no button, so it
+        # gets a scroll area of its own.
+        detail_scroll = QScrollArea()
+        detail_scroll.setWidgetResizable(True)
+        detail_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        detail_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        detail_scroll.setWidget(self._detail)
+
+        right = QSplitter(Qt.Orientation.Vertical)
+        right.addWidget(self._wrap(self._list, "这个模型需要的颜色"))
+        right.addWidget(self._wrap(detail_scroll, "选中的颜色"))
+        right.setStretchFactor(0, 3)
+        right.setStretchFactor(1, 2)
+        right.setCollapsible(1, False)
+        right.setSizes([420, 340])
+
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self._wrap(self._view, "图片"))
-        splitter.addWidget(self._wrap(self._list, "这个模型需要的颜色"))
+        splitter.addWidget(right)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([760, 320])
@@ -477,10 +545,23 @@ class PicturePage(QWidget):
     def plate(self) -> PlateModel | None:
         return self._plate
 
+    @property
+    def library(self) -> FilamentLibrary | None:
+        return self._library
+
+    @property
+    def image_name(self) -> str:
+        """The imported picture's file name, used for the exported model."""
+        return self._image_name
+
     # -- matching ---------------------------------------------------------
     def loadImage(self, source) -> None:
         """Load ``source`` (path or PIL image) and match it straight away."""
-        image = Image.open(source) if isinstance(source, (str, Path)) else source
+        if isinstance(source, (str, Path)):
+            self._image_name = Path(source).stem or "混色底板"
+            image = Image.open(source)
+        else:
+            image = source
         self._image = image.convert("RGBA")
         self._source_qimage = _to_qimage(self._image)
         self._on_rematch()
@@ -521,33 +602,144 @@ class PicturePage(QWidget):
             return
         self._result = result
         self._plate = None
+        self._auto_palette = list(result.palette)
+        self._overrides = {}
+        self._list.setLibrary(self._library)
         self._view.setResult(result, self._source_qimage)
         self._list.setResult(result)
-        self._base_combo.blockSignals(True)
-        self._base_combo.clear()
-        for index, entry in enumerate(result.palette):
-            count = int(result.counts[index])
-            self._base_combo.addItem(f"{entry.color_hex}  {entry.short_label}", index)
-        self._base_combo.blockSignals(False)
+        self._refresh_base_combo()
+        self._detail.clear()
         self._set_controls_enabled(True)
         self._status.setText(
             "匹配完成：{0}×{1} 像素，{2} 种颜色。点击右侧颜色看图片高光，"
-            "点击图片看它属于哪种颜色。".format(result.width, result.height, len(result.palette))
+            "点击图片看它属于哪种颜色；点「更换颜色…」可以手动换掉不合适的颜色。".format(
+                result.width, result.height, len(result.palette)
+            )
         )
+
+    def _refresh_base_combo(self) -> None:
+        result = self._result
+        if result is None:
+            return
+        previous = self._base_combo.currentData()
+        self._base_combo.blockSignals(True)
+        self._base_combo.clear()
+        for index, entry in enumerate(result.palette):
+            self._base_combo.addItem(f"{entry.color_hex}  {entry.short_label}", index)
+        if isinstance(previous, int) and 0 <= previous < self._base_combo.count():
+            self._base_combo.setCurrentIndex(previous)
+        self._base_combo.blockSignals(False)
 
     def _on_show_matched(self, checked: bool) -> None:
         self._view.setShowMatched(bool(checked))
 
     # -- two-way selection ------------------------------------------------
-    def _on_colour_selected(self, index: int) -> None:
+    def _select(self, index: int) -> None:
+        """Show one colour everywhere it appears: picture, list and detail."""
         self._view.setSelected(index)
         self._list.pin(index)
+        if self._result is None:
+            return
+        if not 0 <= index < len(self._result.palette):
+            return
+        original = self._auto_palette[index] if index < len(self._auto_palette) else None
+        self._detail.setSelection(
+            self._result,
+            index,
+            library=self._library,
+            changed=index in self._overrides,
+            original=original,
+        )
+
+    def _on_colour_selected(self, index: int) -> None:
+        self._select(index)
 
     def _on_region_clicked(self, index: int) -> None:
-        self._list.pin(index)
+        self._select(index)
 
     def _on_colour_activated(self, index: int) -> None:
-        self._list.pin(index)
+        self._select(index)
+
+    # -- manual replacement ------------------------------------------------
+    def _current_index(self) -> int:
+        index = self._list.current()
+        if index < 0:
+            return -1
+        if self._result is None or not 0 <= index < len(self._result.palette):
+            return -1
+        return index
+
+    def _apply_overrides(self) -> None:
+        """Fold the user's replacements into the palette the print uses.
+
+        Always rebuilt from ``_auto_palette`` rather than from the live palette:
+        the live one already carries the previous replacements, so folding a
+        removal into it would leave the removed colour stuck in place.
+        """
+        if self._result is None:
+            return
+        palette = list(self._auto_palette) if self._auto_palette else list(self._result.palette)
+        for index, entry in self._overrides.items():
+            if 0 <= index < len(palette):
+                palette[index] = entry
+        self._result = replace(self._result, palette=palette)
+        self._plate = None
+        self._view.setResult(self._result, self._source_qimage)
+        self._list.refresh()
+        self._refresh_base_combo()
+        index = self._current_index()
+        if index >= 0:
+            self._select(index)
+        self._announce_overrides()
+
+    def _announce_overrides(self) -> None:
+        if not self._overrides:
+            self._status.setText(
+                "匹配完成：{0}×{1} 像素，{2} 种颜色。点击右侧颜色看图片高光，"
+                "点击图片看它属于哪种颜色；点「更换颜色…」可以手动换掉不合适的颜色。".format(
+                    self._result.width, self._result.height, len(self._result.palette)
+                )
+                if self._result is not None
+                else ""
+            )
+            return
+        self._status.setText(
+            f"已手动更换 {len(self._overrides)} 种颜色，导出的 3MF / OBJ 会用你选的颜色。"
+        )
+
+    def _on_replace(self) -> None:
+        index = self._current_index()
+        if index < 0 or self._result is None or self._library is None:
+            return
+        entries = build_palette(
+            self._library,
+            self._catalog,
+            include_mixes=bool(self._include_mixes.isChecked()),
+        )
+        if not entries:
+            self._status.setText("调色板是空的，请先添加耗材。")
+            return
+        dialog = ColourPickerDialog(
+            entries,
+            self._result.region_colour(index),
+            library=self._library,
+            current_key=self._result.palette[index].key,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        chosen = dialog.chosen()
+        if chosen is None:
+            return
+        self._overrides[index] = chosen
+        self._apply_overrides()
+
+    def _on_restore(self) -> None:
+        index = self._current_index()
+        if index < 0 or index not in self._overrides:
+            return
+        self._overrides.pop(index, None)
+        self._apply_overrides()
 
     def _on_actions_changed(self) -> None:
         if self._result is not None:
@@ -579,14 +771,24 @@ class PicturePage(QWidget):
             return
         suffix = ".3mf" if kind == "3mf" else ".obj"
         label = "3MF 模型" if kind == "3mf" else "OBJ 模型"
-        start = str(paths.exports_dir() / f"混色底板{suffix}")
+        suggested = f"{self._image_name}_{datetime.now():%Y%m%d-%H%M%S}{suffix}"
+        start = str(paths.exports_dir() / suggested)
         name, _ = QFileDialog.getSaveFileName(self, f"保存{label}", start, f"{label} (*{suffix})")
         if not name:
             return
         target = Path(name)
         try:
             if kind == "3mf":
-                written = write_3mf(plate, target)
+                # The filament list travels inside the project so Bambu Studio
+                # opens it with *our* colours instead of whatever is in the AMS.
+                filaments = (
+                    slots_from_palette(self._result.palette, self._library)
+                    if self._result is not None
+                    else None
+                )
+                written = write_3mf(
+                    plate, target, object_name=self._image_name, filaments=filaments
+                )
             else:
                 written = write_obj(plate, target)
         except Exception as error:
@@ -601,7 +803,7 @@ class PicturePage(QWidget):
             f"已生成 {written.name}",
             f"{stats['width_mm']} × {stats['depth_mm']} mm，总厚度 {stats['thickness_mm']} mm，"
             f"像素 {stats['pixel_mm']} mm",
-            f"{stats['parts']} 个部件 / {stats['extruders']} 种耗材 / {stats['triangles']} 个三角面",
+            f"整板 1 个对象 / {stats['extruders']} 种耗材 / {stats['triangles']} 个三角面",
         ]
         lines.extend(plate.notes)
         return "  ·  ".join(lines)
@@ -611,21 +813,32 @@ class PicturePage(QWidget):
         box = QMessageBox(self)
         box.setWindowTitle("已生成模型")
         box.setIcon(QMessageBox.Icon.Information)
+        filaments = (
+            slots_from_palette(self._result.palette, self._library)
+            if self._result is not None
+            else None
+        )
         rows = [
             f"文件：{written}",
             f"尺寸：{stats['width_mm']} × {stats['depth_mm']} mm，"
             f"底板 {plate.base_thickness_mm:g} mm + 颜色层 {plate.colour_thickness_mm:g} mm",
-            f"部件：{stats['parts']} 个，共 {stats['extruders']} 种耗材",
+            f"整块底板是一个对象，{stats['extruders']} 种颜色涂在不同的三角面上。",
             "",
-            "在 Bambu Studio 里：",
-            "1. 新建项目，把下面列出的耗材按顺序放进 AMS 的 1、2、3… 号槽；",
-            "2. 打开这个文件，各颜色区域已经分别指定了挤出机；",
+            "在 Bambu Studio 里直接打开这个文件就行：",
+            "1. 耗材清单（颜色 / 种类 / 品牌）已经写进 3MF，打开时会自动带进来，",
+            "   不再取决于你 AMS 里插的是什么颜色的料；",
+            "2. 整块底板是一个对象，不用再拼零件；",
             "3. 切片前确认「耗材映射」与你的 AMS 槽位一致。",
             "",
-            "需要的耗材：",
+            "这个模型需要的耗材：",
         ]
-        for part in plate.parts:
-            rows.append(f"  挤出机 {part.extruder}  {part.color_hex}  {part.name}")
+        for index in range(1, plate.extruder_count + 1):
+            slot = filaments[index - 1] if filaments and index <= len(filaments) else None
+            colour = slot.color_hex if slot is not None else "?"
+            kind = slot.material_type if slot is not None else ""
+            vendor = slot.vendor if slot is not None else ""
+            who = " ".join(part for part in (vendor, kind) if part)
+            rows.append(f"  {index}. {colour}  {who}".rstrip())
         if plate.notes:
             rows.append("")
             rows.extend(f"提示：{note}" for note in plate.notes)

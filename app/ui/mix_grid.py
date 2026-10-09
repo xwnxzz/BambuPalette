@@ -8,6 +8,7 @@ and paints only the cells currently inside the viewport.
 from __future__ import annotations
 
 import bisect
+from dataclasses import dataclass
 
 from PySide6.QtCore import QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPen
@@ -21,6 +22,42 @@ CELL = 34
 INSET = 4.0
 #: Extra vertical space inserted between two parent-pair groups.
 GROUP_GAP = 10
+
+
+@dataclass(frozen=True)
+class SpoolCell:
+    """A raw filament shown beside the mixes when 「全部颜色」 is on.
+
+    It borrows ``MixRecipe``'s read-only shape — ``key``, ``color_hex``, ``rgb``,
+    ``pair_index``, ``percent_a``/``percent_b`` — so ``MixGrid`` can paint it
+    without caring which kind of cell it is. ``pair_index`` is ``-1``, which is
+    never a real parent-pair number, so every spool lands in one leading group
+    of its own and the mixes follow unchanged.
+    """
+
+    filament: object
+    color_hex: str
+    rgb: tuple[int, int, int]
+    label: str
+    key: str
+    pair_index: int = -1
+    percent_a: int = 0
+    percent_b: int = 0
+
+    @property
+    def is_spool(self) -> bool:
+        return True
+
+
+def spool_cell(filament) -> SpoolCell:
+    """Wrap a ``Filament`` as a grid cell."""
+    return SpoolCell(
+        filament=filament,
+        color_hex=filament.color_hex,
+        rgb=filament.rgb,
+        label=filament.display_name,
+        key=f"spool|{filament.id}",
+    )
 
 
 class MixGrid(QAbstractScrollArea):
@@ -286,6 +323,12 @@ class MixGrid(QAbstractScrollArea):
 
     # -- helpers -----------------------------------------------------------------
     def _tooltip(self, recipe) -> str:
+        if getattr(recipe, "pair_index", 0) < 0:
+            return (
+                f"{recipe.label}\n"
+                f"{recipe.color_hex}\n"
+                "这是耗材丝本身的颜色（不是混色）"
+            )
         return (
             f"{recipe.color_hex}\n"
             f"{recipe.percent_a}% + {recipe.percent_b}%\n"

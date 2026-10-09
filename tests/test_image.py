@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -25,12 +26,21 @@ if str(PROJECT_ROOT) not in sys.path:
 from app.core.engines import ENGINE_BAMBU  # noqa: E402
 from app.core.image_matching import (  # noqa: E402
     MatchSettings,
+    _merge_indistinguishable,
+    _merge_similar_colours,
     build_palette,
     match_image,
     reduce_colours,
+    sort_palette,
 )
 from app.core.library import Filament, FilamentLibrary  # noqa: E402
-from app.core.mixes import MixCatalog  # noqa: E402
+from app.core.mixes import (  # noqa: E402
+    SORT_CHOICES,
+    SORT_CHOICES_WITH_SIMILARITY,
+    SORT_SIMILARITY,
+    MixCatalog,
+)
+from app.spectral import color as _color  # noqa: E402
 
 SPOOLS = (
     ("耗材白", "#F2F0EB"),
@@ -201,6 +211,203 @@ class MatchTests(unittest.TestCase):
     def test_an_empty_palette_is_refused(self):
         with self.assertRaises(ValueError):
             match_image(_quadrant_image(8), [])
+
+
+class RegionColourTests(unittest.TestCase):
+    """The UI shows 「图片里的颜色 → 匹配到的颜色」, so the region mean must be real."""
+
+    def setUp(self) -> None:
+        library = _library()
+        self.palette = build_palette(library, MixCatalog(library.filaments).build())
+
+    def test_the_mean_is_the_picture_colour_not_the_palette_colour(self):
+        # One flat region of a colour that is nobody's spool: the region mean has
+        # to report the PICTURE's colour, which is the whole point of showing it
+        # next to the match.
+        image = Image.new("RGBA", (16, 16), (250, 212, 181, 255))
+        result = match_image(image, self.palette, MatchSettings(max_colours=4))
+        self.assertEqual(len(result.palette), 1)
+        self.assertEqual(result.region_colour(0), (250, 212, 181))
+        self.assertNotEqual(result.region_colour(0), result.palette[0].rgb)
+
+    def test_every_region_has_a_mean(self):
+        result = match_image(_quadrant_image(40), self.palette, MatchSettings(max_colours=8))
+        self.assertIsNotNone(result.means)
+        self.assertEqual(result.means.shape, (len(result.palette), 3))
+        for index in range(len(result.palette)):
+            self.assertIsInstance(result.region_colour(index), tuple)
+            self.assertEqual(len(result.region_colour(index)), 3)
+
+    def test_without_means_it_falls_back_to_the_menu_colour(self):
+        # ``means`` is optional: a result built without it (an older file, a
+        # hand-made one) still has to answer, using the matched colour.
+        result = match_image(_quadrant_image(16), self.palette, MatchSettings(max_colours=8))
+        bare = replace(result, means=None)
+        self.assertEqual(bare.region_colour(0), bare.palette[0].rgb)
+
+
+class SortPaletteTests(unittest.TestCase):
+    """「全部颜色」 in the replacement dialog, ordered like the 混色配方 grid."""
+
+    def setUp(self) -> None:
+        library = _library()
+        self.catalog = MixCatalog(library.filaments, engine=ENGINE_BAMBU).build()
+        self.entries = build_palette(library, self.catalog, include_mixes=True)
+        self.target = (250, 212, 181)
+
+    def test_similarity_leads_with_the_closest_colour(self):
+        ordered = sort_palette(self.entries, SORT_SIMILARITY, target_rgb=self.target)
+        differences = [
+            float(_color.delta_e_2000(entry.lab, _color.lab_from_rgb(self.target)))
+            for entry in ordered
+        ]
+        self.assertEqual(differences, sorted(differences))
+        self.assertEqual(len(ordered), len(self.entries))
+
+    def test_similarity_needs_a_target_colour(self):
+        with self.assertRaises(ValueError):
+            sort_palette(self.entries, SORT_SIMILARITY)
+
+    def test_the_dialog_list_is_the_grid_list_plus_similarity(self):
+        self.assertEqual(
+            [key for key, _ in SORT_CHOICES_WITH_SIMILARITY],
+            [key for key, _ in SORT_CHOICES] + [SORT_SIMILARITY],
+        )
+        # The 混色配方 page keeps its five keys: similarity is meaningless there.
+        self.assertNotIn(SORT_SIMILARITY, [key for key, _ in SORT_CHOICES])
+
+    def test_every_key_keeps_every_entry(self):
+        for key, _ in SORT_CHOICES_WITH_SIMILARITY:
+            with self.subTest(sort=key):
+                ordered = sort_palette(self.entries, key, target_rgb=self.target)
+                self.assertEqual(len(ordered), len(self.entries))
+                self.assertEqual({e.key for e in ordered}, {e.key for e in self.entries})
+
+    def test_spools_and_mixes_are_grouped_not_interleaved_by_label(self):
+        ordered = sort_palette(self.entries, "label", target_rgb=self.target)
+        kinds = [entry.is_mix for entry in ordered]
+        self.assertEqual(kinds, sorted(kinds), "spools come first under 按名称")
+
+
+class IndistinguishableColourTests(unittest.TestCase):
+    """Two colours a hair apart must not both claim part of one flat region.
+
+    The picture's own noise decides which of two near-equal palette entries wins
+    each pixel, so without a merge a flat region comes out speckled and the
+    highlight turns to stripes. Measured on a real illustration: 107 index
+    changes along one 512-pixel row before the merge, 7 after.
+    """
+
+    def setUp(self) -> None:
+        library = _library()
+        self.palette = build_palette(library, MixCatalog(library.filaments).build())
+
+    def _noisy_flat(self, size: int = 64, sigma: float = 1.6) -> Image.Image:
+        rng = np.random.default_rng(7)
+        base = np.array([250, 212, 181], dtype=np.float64)
+        pixels = np.clip(np.rint(base + rng.normal(0.0, sigma, (size, size, 3))), 0, 255)
+        return Image.fromarray(pixels.astype(np.uint8), "RGB").convert("RGBA")
+
+    def test_fine_source_noise_does_not_speckle_a_flat_region(self):
+        result = match_image(self._noisy_flat(), self.palette, MatchSettings(max_colours=12))
+        transitions = int(np.count_nonzero(result.indices[32][1:] != result.indices[32][:-1]))
+        self.assertLessEqual(transitions, 2, f"the region is speckled: {transitions} changes")
+
+    def test_switching_the_merge_off_brings_the_speckle_back(self):
+        # Proves the merge is what fixes it, rather than the picture being easy.
+        settings = MatchSettings(max_colours=12, merge_delta_e=0.0)
+        result = match_image(self._noisy_flat(), self.palette, settings)
+        transitions = int(np.count_nonzero(result.indices[32][1:] != result.indices[32][:-1]))
+        self.assertGreater(transitions, 2)
+
+    def test_source_clusters_closer_than_the_threshold_are_folded(self):
+        colours = np.array([[250, 212, 181], [250, 212, 183], [10, 10, 10]], dtype=np.uint8)
+        classes = np.zeros((2, 6), dtype=np.int32)
+        classes[1, 0] = 1  # the second shade owns one pixel
+        classes[1, 1:] = 2
+        merged, remapped = _merge_similar_colours(colours, classes, 2.0)
+        self.assertEqual(len(merged), 2, "the two near-identical shades collapse")
+        # The shade covering the most pixels survives, so the odd pixel moves.
+        self.assertEqual(tuple(merged[0]), (250, 212, 181))
+        self.assertEqual(int(remapped[1, 0]), 0)
+
+    def test_a_threshold_of_zero_changes_nothing(self):
+        colours = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.uint8)
+        classes = np.zeros((2, 2), dtype=np.int32)
+        kept, remapped = _merge_similar_colours(colours, classes, 0.0)
+        self.assertTrue(np.array_equal(kept, colours))
+        self.assertTrue(np.array_equal(remapped, classes))
+
+    def test_matched_colours_closer_than_the_threshold_are_folded(self):
+        library = _library()
+        palette = build_palette(library, MixCatalog(library.filaments).build())
+        # Two entries that are genuinely indistinguishable, plus one that is not.
+        pale = palette[0]
+        near = pale.__class__(**{**pale.__dict__, "key": pale.key + "|twin", "color_hex": "#F2F0EC"})
+        kept = [pale, near]
+        counts = np.array([10, 3], dtype=np.int64)
+        indices = np.zeros((2, 8), dtype=np.int16)
+        indices[1, :3] = 1
+        merged, new_counts, new_indices = _merge_indistinguishable(kept, counts, indices, 2.0)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(int(new_counts[0]), 16)
+        self.assertEqual(int(np.count_nonzero(new_indices != 0)), 0)
+
+    def test_the_merge_threshold_is_clamped(self):
+        self.assertEqual(MatchSettings(merge_delta_e=-5.0).clamped().merge_delta_e, 0.0)
+        self.assertEqual(MatchSettings(merge_delta_e=99.0).clamped().merge_delta_e, 10.0)
+        self.assertEqual(MatchSettings(merge_delta_e=1.5).clamped().merge_delta_e, 1.5)
+
+
+class RecipeTextTests(unittest.TestCase):
+    """The colour list has to show the whole recipe, percentages included.
+
+    Measured in the real window: the full form
+    「配方：Bambu Lab PLA Basic (#FCF4F0) 71%  +  Sunlu PLA Silk (#E8A0A8) 29%」
+    is about 70 characters wide and QListWidget elided it, clipping the second
+    percentage off. The compact form keeps both percentages; the full one stays
+    in the tooltip and in the 「选中的颜色」 panel.
+    """
+
+    def setUp(self) -> None:
+        library = _library()
+        self.library = library
+        self.catalog = MixCatalog(library.filaments, engine=ENGINE_BAMBU).build()
+        self.entries = build_palette(library, self.catalog, include_mixes=True)
+
+    def test_compact_keeps_both_percentages_and_the_full_form_keeps_the_hex(self):
+        from app.ui.colour_picker import entry_recipe_text
+
+        mix = next(entry for entry in self.entries if entry.is_mix)
+        full = entry_recipe_text(mix, self.library)
+        compact = entry_recipe_text(mix, self.library, compact=True)
+        self.assertIn("配方", full)
+        self.assertIn("(#", full, "the full form spells out the parent colours")
+        self.assertIn("配方", compact)
+        self.assertNotIn("(#", compact, "the compact form drops the hex to make room")
+        for text in (full, compact):
+            self.assertIn(f"{mix.recipe.percent_a}%", text)
+            self.assertIn(f"{mix.recipe.percent_b}%", text)
+        self.assertLess(len(compact), len(full))
+
+    def test_a_raw_spool_is_never_called_a_recipe(self):
+        from app.ui.colour_picker import entry_recipe_text
+
+        spool = next(entry for entry in self.entries if not entry.is_mix)
+        for text in (
+            entry_recipe_text(spool, self.library),
+            entry_recipe_text(spool, self.library, compact=True),
+        ):
+            self.assertIn("耗材本色", text)
+            self.assertNotIn("配方", text)
+
+    def test_a_missing_library_still_renders(self):
+        from app.ui.colour_picker import entry_recipe_text
+
+        mix = next(entry for entry in self.entries if entry.is_mix)
+        text = entry_recipe_text(mix, None)
+        self.assertIn("配方", text)
+        self.assertIn("%", text)
 
 
 if __name__ == "__main__":

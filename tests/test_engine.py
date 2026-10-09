@@ -46,6 +46,7 @@ from app.core.mixes import (  # noqa: E402
     SORT_CHOICES,
     MixCatalog,
     expected_recipe_count,
+    sorted_filaments,
 )
 from app.spectral import color as C  # noqa: E402
 from app.spectral import filament_mixer as FM  # noqa: E402
@@ -726,6 +727,75 @@ class CatalogTests(unittest.TestCase):
         catalog = MixCatalog(self._library(4)).build()
         self.assertEqual(catalog.stats(),
                          {"filaments": 4, "pairs": 6, "recipes": 486, "ratios": 81})
+
+
+class SortedFilamentTests(unittest.TestCase):
+    """「全部颜色」 lists raw spools beside the mixes, under the same 排序 control.
+
+    So the spool ordering has to answer to the same keys as
+    :meth:`MixCatalog.sorted_recipes`, with the same directions; otherwise
+    flipping the sort would leave the spool rows out of step with everything
+    below them.
+    """
+
+    def setUp(self) -> None:
+        self.filaments = [
+            Filament(name="白", brand="b", material_type="PLA", color_hex="#F2F0EB"),
+            Filament(name="黑", brand="b", material_type="PLA", color_hex="#17181C"),
+            Filament(name="金", brand="b", material_type="PLA", color_hex="#D9A441"),
+            Filament(name="红", brand="b", material_type="PLA", color_hex="#C8342E"),
+            Filament(name="灰", brand="b", material_type="PLA", color_hex="#808080"),
+        ]
+
+    def test_rgb_ascending(self):
+        ordered = sorted_filaments(self.filaments, "rgb")
+        self.assertEqual([f.rgb for f in ordered], sorted(f.rgb for f in self.filaments))
+
+    def test_lightness_descending_like_the_catalogue(self):
+        """The catalogue sorts mixes by ``-lightness``; the spools must match."""
+        ordered = sorted_filaments(self.filaments, "lightness")
+        levels = [C.lab_from_rgb(f.rgb)[0] for f in ordered]
+        self.assertEqual(levels, sorted(levels, reverse=True))
+
+    def test_hue_ascending_like_the_catalogue(self):
+        ordered = sorted_filaments(self.filaments, "hue")
+        hues = []
+        for filament in ordered:
+            _, a, b = C.lab_from_rgb(filament.rgb)
+            hues.append(0.0 if abs(a) < 1e-9 and abs(b) < 1e-9 else float(np.degrees(np.arctan2(b, a)) % 360.0))
+        self.assertEqual(hues, sorted(hues))
+
+    def test_label_is_case_insensitive_by_name(self):
+        filaments = [
+            Filament(name="Zeta", material_type="PLA", color_hex="#111111"),
+            Filament(name="alpha", material_type="PLA", color_hex="#222222"),
+            Filament(name="Beta", material_type="PLA", color_hex="#333333"),
+        ]
+        self.assertEqual(
+            [f.name for f in sorted_filaments(filaments, "label")], ["alpha", "Beta", "Zeta"]
+        )
+
+    def test_pair_sort_is_a_no_op_for_a_lone_spool(self):
+        """A spool is not a parent pair, so 按母材组合 leaves the order alone."""
+        self.assertIs(sorted_filaments(self.filaments, "pair")[0], self.filaments[0])
+        self.assertEqual(
+            [f.id for f in sorted_filaments(self.filaments, "pair")],
+            [f.id for f in self.filaments],
+        )
+
+    def test_every_sort_key_is_accepted(self):
+        for key, _ in SORT_CHOICES:
+            with self.subTest(sort=key):
+                self.assertEqual(len(sorted_filaments(self.filaments, key)), len(self.filaments))
+
+    def test_an_unknown_key_is_refused(self):
+        with self.assertRaises(ValueError):
+            sorted_filaments(self.filaments, "nonsense")
+
+    def test_the_input_is_not_mutated(self):
+        before = [f.id for f in self.filaments]
+        sorted_filaments(self.filaments, "hue")
+        self.assertEqual([f.id for f in self.filaments], before)
 
 
 class LibraryPersistenceTests(unittest.TestCase):

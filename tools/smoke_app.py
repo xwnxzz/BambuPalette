@@ -317,6 +317,95 @@ def main() -> int:
     app.processEvents()
     check(len(window._recipes) == 810, "restoring the full catalogue after the blank click")
 
+    # --- 全部颜色: raw spools beside the mixes --------------------------------
+    # The request was "输入两个颜色，全部颜色就是83个颜色" -> 81 mixes + 2 raw spools.
+    from PySide6.QtWidgets import QCheckBox, QLabel  # noqa: E402
+
+    check(hasattr(window, "_all_colours"), "the 全部混色 panel has a 全部颜色 control")
+    check(isinstance(window._all_colours, QCheckBox), "it is a checkbox, as requested")
+    check(window._all_colours.text() == "全部颜色", "the checkbox is labelled 全部颜色")
+    check(not window._all_colours.isChecked(), "the checkbox starts unchecked (mixes only)")
+    panel = window._all_colours.parentWidget()
+    check(panel is not None and panel.objectName() == "panel",
+          "the checkbox lives on the 全部混色 panel")
+    headings = [w for w in panel.findChildren(QLabel) if w.text() == "全部混色"]
+    check(len(headings) == 1, "the panel still carries its 全部混色 heading")
+    if headings:
+        app.processEvents()
+        check(
+            window._all_colours.x() > headings[0].x() + headings[0].width(),
+            "the checkbox sits to the RIGHT of the 全部混色 heading (top right, as asked)",
+        )
+    check(expected_recipe_count(2) == 81, "two spools make 81 mixes")
+    check(expected_recipe_count(2) + 2 == 83, "81 mixes + the 2 raw spools = the 83 colours asked for")
+
+    check(len(window._recipes) == 810, "with the box off the grid is mixes only")
+    window._all_colours.setChecked(True)
+    app.processEvents()
+    check(
+        len(window._recipes) == 810 + len(library),
+        f"ticking it adds one row per spool, got {len(window._recipes)} for {len(library)} spools",
+    )
+    spools = [cell for cell in window._recipes if getattr(cell, "pair_index", 0) < 0]
+    mixes = [cell for cell in window._recipes if getattr(cell, "pair_index", 0) >= 0]
+    check(len(spools) == len(library), f"one spool row per spool, got {len(spools)}")
+    check(len(mixes) == 810, f"the 810 mixes are untouched, got {len(mixes)}")
+    check(all(cell.is_spool for cell in spools), "every spool row reports itself as a spool")
+    check(
+        all(cell.color_hex == cell.filament.color_hex for cell in spools),
+        "a spool row shows the spool's own colour, not a mix",
+    )
+    check(
+        [cell.key for cell in window._recipes[: len(spools)]] == [cell.key for cell in spools],
+        "the spool rows lead the grid so they read as extra colours, not as stray mixes",
+    )
+    check(
+        [cell.rgb for cell in spools] == sorted(cell.rgb for cell in spools),
+        "spool rows follow the 排序 control (RGB ascending here)",
+    )
+    # The same control must order both halves, so an explicit colour sort has to
+    # move the spools too rather than leaving them frozen at the top.
+    from app.spectral import color as spectral_color  # noqa: E402
+
+    window._sort_combo.setCurrentIndex(
+        [key for key, _ in SORT_CHOICES].index("lightness")
+    )
+    app.processEvents()
+    light_spools = [c for c in window._recipes if getattr(c, "pair_index", 0) < 0]
+    levels = [spectral_color.lab_from_rgb(c.rgb)[0] for c in light_spools]
+    check(levels == sorted(levels, reverse=True), "排序 by lightness reorders the spool rows too")
+    window._sort_combo.setCurrentIndex([key for key, _ in SORT_CHOICES].index("rgb"))
+    app.processEvents()
+
+    # Selecting a raw spool must explain itself rather than pretend to be a mix.
+    window._grid.selectRecipe(spools[0])
+    window._on_grid_selected(spools[0])
+    app.processEvents()
+    check(window._detail.recipe() is None, "a raw spool is not shown as a mix recipe")
+    shown_spool = window._detail.filament()
+    check(
+        shown_spool is not None and shown_spool.id == spools[0].filament.id,
+        "the detail panel shows the spool itself",
+    )
+    check(
+        window._detail.selectionKey() == f"spool|{spools[0].filament.id}",
+        "the detail panel keys a spool selection distinctly from a mix",
+    )
+    check(window.nearest_recipe("#982C29") is not None, "找最接近的 still works with spools listed")
+
+    window._search.setText("大简")
+    app.processEvents()
+    check(
+        len(window._recipes) == 810 + len(library),
+        "a brand search keeps every spool row too",
+    )
+    window._search.clear()
+    app.processEvents()
+    window._all_colours.setChecked(False)
+    app.processEvents()
+    check(len(window._recipes) == 810, "un-ticking 全部颜色 restores the mixes-only grid")
+    window._detail.clear()
+
     # --- nearest match --------------------------------------------------------
     nearest = window.nearest_recipe("#982C29")
     check(nearest is not None, "nearest_recipe returns something for #982C29")
@@ -424,6 +513,121 @@ def main() -> int:
             check(
                 all(part.z_bottom_mm == plate.base_thickness_mm for part in plate.parts[1:]),
                 "every colour prism sits on top of the base plate",
+            )
+
+            # --- 选中的颜色: both RGBs, the recipe, and manual replacement -------
+            from app.core.image_matching import MatchSettings, sort_palette
+            from app.core.mixes import (
+                SORT_CHOICES_WITH_SIMILARITY,
+                SORT_SIMILARITY,
+            )
+            from app.spectral import color as _spectral_color
+            from app.ui.colour_picker import ColourDetail, ColourPickerDialog
+
+            check(isinstance(page._detail, ColourDetail), "the picture page has a 选中的颜色 panel")
+            check(
+                page._auto_palette == list(result.palette) and page._overrides == {},
+                "a fresh match starts with the automatic palette and no replacements",
+            )
+            check(MatchSettings().merge_delta_e == 2.0, "near-identical matches merge by default")
+
+            page._select(0)
+            app.processEvents()
+            entry = page._result.palette[0]
+            check(
+                page._detail.image_hex() == _spectral_color.rgb_to_hex(page._result.region_colour(0)),
+                "the panel shows the PICTURE's colour, not only the match",
+            )
+            check(
+                page._detail.match_hex() == entry.color_hex.upper(),
+                f"the panel shows the matched colour, got {page._detail.match_hex()}",
+            )
+            check(len(page._detail.image_hex()) == 7, "the picture colour is a real hex")
+            check(
+                page._detail.image_hex() == page._detail.image_hex().upper(),
+                "the picture colour is shown as an uppercase hex",
+            )
+            recipe = page._detail.recipe_text()
+            check(
+                "配方" in recipe or "耗材本色" in recipe,
+                f"the match is labelled with its recipe, got {recipe!r}",
+            )
+            if entry.is_mix:
+                check("%" in recipe, "a mix recipe carries its percentages")
+            check(page._detail.can_replace(), "the selected colour can be replaced")
+            check(not page._detail.can_restore(), "there is nothing to restore before a change")
+
+            # The replacement menu is 「全部颜色」, ordered like the 混色配方 grid.
+            entries = build_palette(library, window._catalog, include_mixes=True)
+            picker = ColourPickerDialog(
+                entries,
+                page._result.region_colour(0),
+                library=library,
+                current_key=entry.key,
+            )
+            app.processEvents()
+            check(
+                picker._sort.currentData() == SORT_SIMILARITY,
+                "the replacement menu opens sorted by similarity to the picture colour",
+            )
+            ordered = picker.ordered()
+            check(len(ordered) == len(entries), "the replacement menu lists 全部颜色 in full")
+            differences = [
+                float(
+                    _spectral_color.delta_e_2000(
+                        candidate.lab,
+                        _spectral_color.lab_from_rgb(page._result.region_colour(0)),
+                    )
+                )
+                for candidate in ordered
+            ]
+            check(differences == sorted(differences), "similarity sort really is nearest first")
+            check(
+                ordered[0].color_hex.upper() == entry.color_hex.upper(),
+                "the automatic match leads the similarity sort",
+            )
+            for key, _ in SORT_CHOICES_WITH_SIMILARITY:
+                with_key = sort_palette(entries, key, target_rgb=page._result.region_colour(0))
+                check(
+                    {e.key for e in with_key} == {e.key for e in entries},
+                    f"replacement sort {key!r} keeps every candidate",
+                )
+            picker.close()
+
+            replacement = next(
+                candidate for candidate in ordered if candidate.key != entry.key
+            )
+            page._overrides[0] = replacement
+            page._apply_overrides()
+            app.processEvents()
+            check(
+                page._result.palette[0].key == replacement.key,
+                "the replacement lands in the palette the print uses",
+            )
+            check(page._detail.can_restore(), "a replaced colour can be restored")
+            check(
+                replacement.color_hex.upper() in page._status.text()
+                or "已手动更换" in page._status.text(),
+                "the status line reports the manual replacement",
+            )
+            check(
+                replacement.color_hex.upper()
+                in {part.color_hex.upper() for part in page.buildPlate().parts},
+                "the plate really uses the replacement colour",
+            )
+
+            page._on_restore()
+            app.processEvents()
+            check(
+                page._result.palette[0].key == entry.key,
+                "restoring puts the automatic match back",
+            )
+            check(page._overrides == {}, "restoring forgets the replacement")
+            check(not page._detail.can_restore(), "nothing left to restore")
+            check(
+                entry.color_hex.upper()
+                in {part.color_hex.upper() for part in page.buildPlate().parts},
+                "the plate goes back to the automatic colour",
             )
 
             # Exercise the two export buttons, with the file chooser stubbed out.
