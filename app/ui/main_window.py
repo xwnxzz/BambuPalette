@@ -59,7 +59,7 @@ from .filament_dialog import FilamentDialog
 from .mix_detail import MixDetail
 from .mix_grid import MixGrid, spool_cell
 from .picture_page import PicturePage
-from .swatch import ColorButton, swatch_icon
+from .swatch import ColorField, swatch_icon
 
 _HEX_QUERY = re.compile(r"^[0-9a-fA-F]{1,6}$")
 
@@ -150,9 +150,12 @@ class MainWindow(QMainWindow):
         self._show_all_button.setEnabled(False)
 
         # Deliberately UNSET: the target is whatever the user wants to print, so
-        # showing a made-up colour here would be a lie until they pick one.
-        self._target_color = ColorButton()
-        self._target_color.setToolTip("想打印出来的目标颜色；点击后选择，程序会找出最接近的混色配方")
+        # showing a made-up colour here would be a lie until they fill one in.
+        self._target_color = ColorField()
+        self._target_color.setToolTip(
+            "想打印出来的目标颜色：直接输入 #RRGGBB，或者填 R / G / B 三个数字，"
+            "程序会找出最接近的混色配方"
+        )
         self._target_color.colorChanged.connect(self._on_target_color_changed)
         self._find_button = QPushButton("找最接近的混色")
         self._find_button.setToolTip("先选一个目标颜色；再按 CIEDE2000 在当前显示的全部混色里找最接近的配方")
@@ -287,8 +290,14 @@ class MainWindow(QMainWindow):
         self._library_hint.setProperty("role", "hint")
         self._library_hint.setWordWrap(True)
 
-        self._sample_button = QPushButton("载入示例耗材")
-        self._sample_button.clicked.connect(self._on_sample)
+        # Fill a spool's colour in right here, without opening anything.
+        self._library_colour = ColorField(None, stacked=True)
+        self._library_colour.setToolTip(
+            "选中左边的一种耗材后，在这里直接改它的颜色：输入 #RRGGBB，或者填 R / G / B 三个数字"
+        )
+        self._library_colour.colorChanged.connect(self._on_library_colour_changed)
+        self._apply_colour_button = QPushButton("应用颜色")
+        self._apply_colour_button.clicked.connect(self._on_apply_library_colour)
 
         panel = QWidget()
         layout = QVBoxLayout(panel)
@@ -296,7 +305,8 @@ class MainWindow(QMainWindow):
         layout.setSpacing(6)
         layout.addWidget(self._list, 1)
         layout.addWidget(self._library_hint)
-        layout.addWidget(self._sample_button)
+        layout.addWidget(self._library_colour)
+        layout.addWidget(self._apply_colour_button)
         layout.addLayout(row_one)
         layout.addLayout(row_two)
 
@@ -372,6 +382,12 @@ class MainWindow(QMainWindow):
 
     # -- library -----------------------------------------------------------------
     def _reload_library(self) -> None:
+        # Remember which spool was selected: rebuilding the list drops it, and
+        # losing the selection right after the user changed that spool's colour
+        # is disorienting.
+        selected = self._selected_filament()
+        selected_id = selected.id if selected is not None else None
+
         self._suppress_list_signal = True
         self._list.clear()
         for filament in self.library:
@@ -403,10 +419,49 @@ class MainWindow(QMainWindow):
 
         has_any = len(self.library) > 0
         self._library_hint.setVisible(not has_any)
-        self._sample_button.setVisible(not has_any)
         self._list.setVisible(has_any)
+        if selected_id is not None and self.library.get(selected_id) is not None:
+            self._select_filament(selected_id)
+        self._sync_library_colour()
         self._rebuild_catalog()
         self._save_library()
+
+    # -- inline colour entry on the 我的耗材 panel ---------------------------------
+    def _sync_library_colour(self) -> None:
+        """Point the inline colour field at whatever spool is selected."""
+        filament = self._selected_filament()
+        if filament is None:
+            self._library_colour.setValue(None)
+            self._library_colour.setEnabled(False)
+            self._library_colour.setToolTip("先在左边选中一种耗材")
+            self._apply_colour_button.setEnabled(False)
+            self._apply_colour_button.setToolTip("先在左边选中一种耗材")
+            return
+        self._library_colour.setEnabled(True)
+        self._library_colour.setToolTip("改完点「应用颜色」写回这种耗材")
+        self._library_colour.setValue(filament.color_hex)
+        self._apply_colour_button.setEnabled(True)
+        self._apply_colour_button.setToolTip("把上面的颜色写给选中的耗材")
+
+    def _on_library_colour_changed(self, _value: str) -> None:
+        # Nothing is written until 「应用颜色」 is pressed: typing the three digits
+        # of a hex code should not rewrite the spool three times on the way.
+        self._apply_colour_button.setEnabled(
+            self._selected_filament() is not None and self._library_colour.isSet()
+        )
+
+    def _on_apply_library_colour(self) -> None:
+        filament = self._selected_filament()
+        if filament is None or not self._library_colour.isSet():
+            return
+        new_hex = self._library_colour.hex()
+        try:
+            self.library.update(filament.id, color_hex=new_hex)
+        except (LibraryError, ValueError) as exc:
+            self._status.setText(f"改色失败：{exc}")
+            return
+        self._reload_library()
+        self._status.setText(f"{filament.display_name} 的颜色已改成 {new_hex}")
 
     def _save_library(self) -> None:
         try:
@@ -489,11 +544,13 @@ class MainWindow(QMainWindow):
 
     def _on_list_selection(self, current, previous) -> None:
         if self._suppress_list_signal or current is None:
+            self._sync_library_colour()
             return
         filament = self.library.get(current.data(Qt.ItemDataRole.UserRole))
         if filament is not None:
             self._status.setText(f"{filament.display_name} · {filament.color_hex} · "
                                  f"{filament.brand or '—'} · {filament.material_type or '—'}")
+        self._sync_library_colour()
 
     def _on_list_menu(self, position) -> None:
         from PySide6.QtWidgets import QMenu
@@ -513,17 +570,6 @@ class MainWindow(QMainWindow):
         self.library.add(copy)
         self._reload_library()
         self._select_filament(copy.id)
-
-    def _on_sample(self) -> None:
-        for name, brand, material, hex_value in (
-            ("示例白", "示例", "PLA Basic", "#FFFFFF"),
-            ("示例黑", "示例", "PLA Basic", "#16161A"),
-            ("示例红", "示例", "PLA Basic", "#D8342C"),
-            ("示例蓝", "示例", "PLA Basic", "#1D64C8"),
-        ):
-            if self.library.find_duplicate(hex_value, material, brand) is None:
-                self.library.add(Filament(name=name, brand=brand, material_type=material, color_hex=hex_value))
-        self._reload_library()
 
     def _on_import(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "导入耗材档案", str(paths.default_start_dir()), "JSON 文件 (*.json)")

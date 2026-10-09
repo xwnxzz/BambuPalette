@@ -4,33 +4,17 @@ from __future__ import annotations
 
 from PySide6.QtCore import QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap
-from PySide6.QtWidgets import QColorDialog, QPushButton, QSizePolicy, QWidget
+from PySide6.QtWidgets import (
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QSizePolicy,
+    QSpinBox,
+    QVBoxLayout,
+    QWidget,
+)
 
 from . import theme
-
-
-_LAST_PICKED: QColor | None = None
-
-#: Where a colour dialog opens when the caller has not chosen a colour yet and
-#: nothing has been picked this session.  Deliberately a neutral grey rather than
-#: white: white is a real filament colour, so a dialog that opens on it invites
-#: the user to confirm a spool they never described.  Grey reads as "you have not
-#: told me yet".
-_PICKER_FALLBACK = "#808080"
-
-
-def picker_start(current=None) -> QColor:
-    """Colour a :class:`QColorDialog` should open on, in order of preference.
-
-    The caller's own value wins; then whatever the user picked most recently in
-    this session; then a neutral grey.  White is never used as an implicit
-    default.
-    """
-    if not is_unset(current):
-        return qcolor(current)
-    if _LAST_PICKED is not None:
-        return QColor(_LAST_PICKED)
-    return QColor(_PICKER_FALLBACK)
 
 
 def qcolor(value) -> QColor:
@@ -162,69 +146,166 @@ class SwatchLabel(QWidget):
         painter.end()
 
 
-class ColorButton(QPushButton):
-    """A button showing the current colour that opens the system colour picker.
+class ColorField(QWidget):
+    """Type a colour in directly: swatch + ``#RRGGBB`` + R / G / B spin boxes.
 
-    ``value=None`` starts the button **unset**: it paints an empty dashed slot
-    instead of a colour, so a picker that is meant to be filled in by the user
-    never shows a made-up default.  :meth:`isSet` tells the caller whether a
-    colour has actually been chosen; :meth:`hex` returns ``""`` until then.
+    This replaces the system colour-picker dialog.  The user asked for it by
+    name: the pop-up palette they were shown (「选择耗材颜色」) is a full HSV
+    wheel with a screen dropper, which is the wrong tool for "my filament prints
+    as 0, 0, 255" — they want to *type the numbers*.
+
+    ``value=None`` starts unset (an empty dashed swatch, blank hex, zeroed spin
+    boxes) so nothing pretends a colour has been chosen.  Every edit path funnels
+    through :meth:`_set`, and a re-entrancy guard keeps the hex box and the three
+    spin boxes from bouncing signals off each other.
     """
 
     colorChanged = Signal(str)
 
-    def __init__(self, value=None, title: str = "选择颜色", parent=None):
+    def __init__(self, value=None, parent=None, *, spin_width: int = 78, stacked: bool = False):
         super().__init__(parent)
-        self._value = None if value is None or value == "" else qcolor(value)
-        self._title = title
-        self.setFixedSize(56, 30)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.clicked.connect(self._choose)
+        self._value: QColor | None = None
+        self._busy = False
 
-    def _choose(self) -> None:
-        global _LAST_PICKED
-        chosen = QColorDialog.getColor(picker_start(self._value), self, self._title)
-        if chosen.isValid():
-            _LAST_PICKED = QColor(chosen)
-            self.setValue(chosen.name().upper())
+        self._swatch = SwatchLabel(None, size=26, caption=False, parent=self)
+        self._swatch.setFixedSize(30, 26)
 
-    def setValue(self, value) -> None:  # noqa: N802
-        colour = qcolor(value)
-        if colour == self._value:
-            return
-        self._value = colour
-        self.update()
-        self.colorChanged.emit(colour.name().upper())
+        self._hex = QLineEdit(self)
+        self._hex.setPlaceholderText("#RRGGBB")
+        self._hex.setMaxLength(7)
+        self._hex.setMinimumWidth(76)
+        self._hex.setMaximumWidth(110)
+        self._hex.setProperty("role", "mono")
 
-    def clear(self) -> None:
-        """Return the button to its unset state."""
-        if self._value is None:
-            return
-        self._value = None
-        self.update()
-        self.colorChanged.emit("")
+        self._spins: list[QSpinBox] = []
+        self._spin_labels: list[QLabel] = []
+        # 78 is MEASURED, not guessed.  Under QWindows11Style the up/down buttons
+        # take 21 px and the frame another ~25 px, so a 62 px box leaves a 16 px
+        # edit field — less than two digits, which is why the panel used to show
+        # "R 2" for 200.  74 px (28 px of text) still clipped the third digit;
+        # 78 px gives a 32 px edit field and "255" needs 21 px, so everything fits.
+        for name in ("R", "G", "B"):
+            label = QLabel(name, self)
+            label.setProperty("role", "hint")
+            spin = QSpinBox(self)
+            spin.setRange(0, 255)
+            spin.setMinimumWidth(spin_width)
+            spin.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            spin.valueChanged.connect(self._on_spin)
+            self._spin_labels.append(label)
+            self._spins.append(spin)
 
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(4)
+
+        # ``stacked`` exists because the same widget has to survive inside a
+        # narrow side panel: one row of [swatch][hex][R][G][B] needs ~380 px and
+        # the 我的耗材 panel is only ~300 px of usable width, which squeezed the
+        # spin boxes down to a single visible digit.
+        first = QHBoxLayout()
+        first.setContentsMargins(0, 0, 0, 0)
+        first.setSpacing(6)
+        first.addWidget(self._swatch)
+        first.addWidget(self._hex, 1)
+        if not stacked:
+            for label, spin in zip(self._spin_labels, self._spins):
+                first.addWidget(label)
+                first.addWidget(spin)
+        first.addStretch(0 if stacked else 1)
+        outer.addLayout(first)
+
+        if stacked:
+            # Tight spacing on the numbers row: 5 gaps at 6 px each cost 30 px
+            # the three spin boxes need more than the panel has.
+            second = QHBoxLayout()
+            second.setContentsMargins(0, 0, 0, 0)
+            second.setSpacing(2)
+            for label, spin in zip(self._spin_labels, self._spins):
+                second.addWidget(label)
+                second.addWidget(spin, 1)
+            second.addStretch(0)
+            outer.addLayout(second)
+
+        self._hex.editingFinished.connect(self._on_hex_edited)
+        self.setValue(value)
+
+    # -- reading -----------------------------------------------------------------
     def isSet(self) -> bool:  # noqa: N802
         return self._value is not None
-
-    def value(self) -> QColor:
-        return QColor() if self._value is None else QColor(self._value)
 
     def hex(self) -> str:
         return "" if self._value is None else self._value.name().upper()
 
-    def paintEvent(self, event) -> None:  # noqa: N802
-        super().paintEvent(event)
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        rect = QRectF(5, 4, self.width() - 10, self.height() - 8)
+    def value(self) -> QColor:
+        return QColor() if self._value is None else QColor(self._value)
+
+    def rgb(self) -> tuple[int, int, int]:
         if self._value is None:
-            painter.setPen(QPen(QColor(theme.BORDER_STRONG), 1.0, Qt.PenStyle.DashLine))
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRoundedRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), 4.0, 4.0)
-        else:
-            draw_swatch(painter, rect, self._value, 4.0)
-        painter.end()
+            return (0, 0, 0)
+        return (self._value.red(), self._value.green(), self._value.blue())
+
+    # -- writing -----------------------------------------------------------------
+    def setValue(self, value) -> None:  # noqa: N802
+        self._set(value, announce=True)
+
+    def clear(self) -> None:
+        self._set(None, announce=True)
+
+    def _set(self, value, *, announce: bool) -> None:
+        """The single funnel every edit goes through."""
+        colour = None if is_unset(value) else qcolor(value)
+        if colour is not None and not colour.isValid():
+            return
+        self._busy = True
+        try:
+            self._value = colour
+            if colour is None:
+                self._hex.clear()
+                for spin in self._spins:
+                    spin.setValue(0)
+            else:
+                self._hex.setText(colour.name().upper())
+                for spin, channel in zip(self._spins, (colour.red(), colour.green(), colour.blue())):
+                    spin.setValue(channel)
+            self._swatch.setValue(None if colour is None else colour)
+        finally:
+            self._busy = False
+        if announce:
+            self.colorChanged.emit(self.hex())
+
+    # -- edits -------------------------------------------------------------------
+    def _on_hex_edited(self) -> None:
+        if self._busy:
+            return
+        text = self._hex.text().strip()
+        if not text:
+            self._set(None, announce=True)
+            return
+        try:
+            normalised = _normalise_hex(text)
+        except ValueError:
+            # Put back whatever is actually set — possibly nothing at all.
+            self._set(self._value, announce=False)
+            self._hex.setText(self.hex())
+            return
+        self._set(normalised, announce=True)
+
+    def _on_spin(self, *_) -> None:
+        if self._busy:
+            return
+        r, g, b = (spin.value() for spin in self._spins)
+        self._set(QColor(r, g, b), announce=True)
+
+
+def _normalise_hex(text: str) -> str:
+    """``#abc`` / ``abc`` / ``#AABBCC`` → ``#AABBCC``; anything else raises."""
+    cleaned = text.strip().lstrip("#")
+    if len(cleaned) == 3 and all(c in "0123456789abcdefABCDEF" for c in cleaned):
+        cleaned = "".join(c * 2 for c in cleaned)
+    if len(cleaned) != 6 or any(c not in "0123456789abcdefABCDEF" for c in cleaned):
+        raise ValueError(f"not a hex colour: {text!r}")
+    return "#" + cleaned.upper()
 
 
 class GradientBar(QWidget):

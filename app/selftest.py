@@ -210,14 +210,27 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     check(not add_dialog._color.isSet(), "添加耗材 starts with NO preset colour")
     check(add_dialog.values()["color_hex"] == "", "an unset dialog reports no colour")
     check(not add_dialog._ok_button.isEnabled(), "确认 is disabled until a colour is chosen")
-    add_dialog._apply_color("#123456")
-    check(add_dialog._ok_button.isEnabled(), "确认 wakes up once a colour is chosen")
-    check(add_dialog.values()["color_hex"] == "#123456", "the chosen colour is reported")
+    add_dialog._color.setValue("#123456")
+    check(add_dialog._ok_button.isEnabled(), "确认 wakes up once a colour is entered")
+    check(add_dialog.values()["color_hex"] == "#123456", "the entered colour is reported")
     check(
         add_dialog.build_filament().color_hex == "#123456",
-        "a spool built from the dialog carries the chosen colour",
+        "a spool built from the dialog carries the entered colour",
     )
     add_dialog.close()
+
+    # The colour is typed on the panel itself; nothing opens a colour dialog.
+    from .ui import swatch as swatch_module
+
+    check(not hasattr(swatch_module, "ColorButton"), "the pop-up colour picker is gone")
+    field = swatch_module.ColorField(None)
+    check(not field.isSet() and field.hex() == "", "a colour field starts empty")
+    field._spins[0].setValue(200)
+    field._on_spin()
+    check(field.hex() == "#C80000", f"the R spin box drives the colour, got {field.hex()!r}")
+    field._hex.setText("nonsense")
+    field._on_hex_edited()
+    check(field.hex() == "#C80000", "gibberish leaves the last good colour alone")
 
     # Deleting a spool asks nothing: it just goes.
     check(
@@ -248,7 +261,6 @@ def run_selftest(*, report_path: Path | None = None) -> int:
 
     # One spool makes no mixes, but its own colour still has to reach the grid.
     from .core.library import Filament as _SelftestFilament
-    from .ui.swatch import picker_start
 
     lone_window = MainWindow(
         library=FilamentLibrary([_SelftestFilament(material_type="PLA", color_hex="#0000FF")])
@@ -275,7 +287,30 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     check("RGB 0, 0, 0" in row, "the duplicate hex is replaced by the RGB numbers")
     unnamed_window.close()
 
-    check(picker_start(None).name().upper() != "#FFFFFF", "the colour picker does not open on white")
+    # The colour can be filled in on the 我的耗材 panel itself, no dialog.
+    first = window.library.filaments[0]
+    original_hex = first.color_hex
+    window._select_filament(first.id)
+    app.processEvents()
+    check(window._library_colour.isSet(), "selecting a spool fills the inline colour field")
+    check(
+        window._library_colour.hex() == original_hex,
+        "the inline colour field shows the spool's own colour",
+    )
+    window._library_colour.setValue("#123456")
+    window._on_apply_library_colour()
+    app.processEvents()
+    check(
+        window.library.require(first.id).color_hex == "#123456",
+        "applying the colour on the panel rewrites the spool",
+    )
+    window._library_colour.setValue(original_hex)
+    window._on_apply_library_colour()
+    app.processEvents()
+    check(
+        window.library.require(first.id).color_hex == original_hex,
+        "the panel colour change can be undone",
+    )
 
     check(
         window._picture_page is not None and window._tabs.count() == 2,

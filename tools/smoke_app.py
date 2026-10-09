@@ -418,7 +418,7 @@ def main() -> int:
 
     # --- no preset colour, no delete prompt, Del deletes -----------------------
     from PySide6.QtGui import QKeySequence  # noqa: E402
-    from PySide6.QtWidgets import QMessageBox  # noqa: E402
+    from PySide6.QtWidgets import QMessageBox, QSpinBox  # noqa: E402
 
     from app.ui.filament_dialog import FilamentDialog  # noqa: E402
 
@@ -426,13 +426,14 @@ def main() -> int:
     check(not add_dialog._color.isSet(), "添加耗材 starts with NO preset colour")
     check(add_dialog.values()["color_hex"] == "", "an untouched dialog reports no colour")
     check(not add_dialog._ok_button.isEnabled(), "确认 is disabled while no colour is chosen")
-    add_dialog._hex.setText("#C8342E")
-    add_dialog._on_hex_edited()
-    check(add_dialog._ok_button.isEnabled(), "确认 wakes up once the user types a colour")
+    add_dialog._color.setValue("#C8342E")
+    check(add_dialog._ok_button.isEnabled(), "确认 wakes up once the user enters a colour")
     check(add_dialog.values()["color_hex"] == "#C8342E", "the typed colour is what the spool gets")
-    add_dialog._hex.setText("nonsense")
-    add_dialog._on_hex_edited()
-    check(add_dialog.values()["color_hex"] == "#C8342E", "gibberish leaves the last good colour alone")
+    # The colour is entered on the panel itself — there is no colour-picker dialog.
+    check(
+        add_dialog._color.findChild(QSpinBox) is not None,
+        "the colour field offers R / G / B spin boxes",
+    )
     add_dialog.close()
 
     check(
@@ -507,17 +508,25 @@ def main() -> int:
     )
     unnamed_window.close()
 
-    # --- no implicit white anywhere in the picker -------------------------------
-    from app.ui.swatch import picker_start  # noqa: E402
+    # --- the colour is typed in, never picked from a dialog ---------------------
+    from app.ui import swatch as swatch_module  # noqa: E402
+    from app.ui.swatch import ColorField  # noqa: E402
 
-    check(
-        picker_start(None).name().upper() != "#FFFFFF",
-        "an unset colour picker does not open on white",
-    )
-    check(
-        picker_start("#C8342E").name().upper() == "#C8342E",
-        "a set colour picker opens on the colour it is editing",
-    )
+    check(not hasattr(swatch_module, "ColorButton"), "the old colour-picker button is gone")
+    check(not hasattr(swatch_module, "picker_start"), "the old picker helper is gone")
+    check(not hasattr(swatch_module, "QColorDialog"), "no colour dialog is imported any more")
+    blank = ColorField(None)
+    check(not blank.isSet() and blank.hex() == "", "a colour field starts empty")
+    check(blank.rgb() == (0, 0, 0), "an empty colour field reads as no colour, not white")
+    blank._hex.setText("#c8342e")
+    blank._on_hex_edited()
+    check(blank.hex() == "#C8342E", f"a lower-case hex is uppercased, got {blank.hex()!r}")
+    blank._hex.setText("nonsense")
+    blank._on_hex_edited()
+    check(blank.hex() == "#C8342E", "gibberish leaves the last good colour alone")
+    blank._spins[2].setValue(255)
+    blank._on_spin()
+    check(blank.hex() == "#C834FF", f"the B spin box drives the colour, got {blank.hex()!r}")
 
     # --- nearest match --------------------------------------------------------
     nearest = window.nearest_recipe("#982C29")
@@ -526,11 +535,11 @@ def main() -> int:
         check(len(nearest.color_hex) == 7, f"nearest recipe has a hex, got {nearest.color_hex!r}")
     # The target colour must start UNSET: a pre-filled colour would claim the user
     # already aimed at something they never chose.
-    check(window._target_color.hex() == "", "the 目标颜色 picker starts with no preset colour")
-    check(not window._target_color.isSet(), "the picker reports itself unset")
-    check(not window._find_button.isEnabled(), "找最接近的混色 is disabled until a colour is chosen")
+    check(window._target_color.hex() == "", "the 目标颜色 field starts with no preset colour")
+    check(not window._target_color.isSet(), "the target colour reports itself unset")
+    check(not window._find_button.isEnabled(), "找最接近的混色 is disabled until a colour is entered")
     window._target_color.setValue("#808080")
-    check(window._find_button.isEnabled(), "choosing a colour enables 找最接近的混色")
+    check(window._find_button.isEnabled(), "entering a colour enables 找最接近的混色")
     window._on_find_nearest()
     app.processEvents()
     check(window._detail.recipe() is not None, "找最接近的混色 selects a recipe")
@@ -543,8 +552,7 @@ def main() -> int:
     dialog._name.setText("测试耗材")
     dialog._brand.setCurrentText("大简")
     dialog._type.setCurrentText("PETG HF")
-    dialog._hex.setText("#1234AB")
-    dialog._on_hex_edited()
+    dialog._color.setValue("#1234AB")
     app.processEvents()
     built = dialog.build_filament()
     check(built.name == "测试耗材", "the dialog carries the name through")
