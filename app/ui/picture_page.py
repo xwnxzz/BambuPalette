@@ -439,10 +439,6 @@ class PicturePage(QWidget):
     def _wrap(self, widget: QWidget, title: str) -> QWidget:
         frame = QFrame()
         frame.setObjectName("panel")
-        frame.setStyleSheet(
-            f"QFrame#panel {{ background: {theme.PANEL};"
-            f" border: 1px solid {theme.BORDER}; border-radius: 8px; }}"
-        )
         header = QLabel(title)
         header.setProperty("role", "sectionTitle")
         box = QVBoxLayout(frame)

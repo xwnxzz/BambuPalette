@@ -1,4 +1,4 @@
-"""Render the main window off-screen so the layout can be reviewed as a PNG.
+"""Render the main window to a PNG so the layout can be reviewed.
 
 Usage::
 
@@ -7,6 +7,10 @@ Usage::
 Writes ``samples/ui-main.png`` (browse mode) and ``samples/ui-pair.png``
 (one pair filtered to its 81 ratios).  Nothing touches the user's real library:
 the storage paths are redirected to a temporary folder.
+
+The real platform is used on Windows so the Chinese labels actually render: the
+``offscreen`` plugin ships no font directory and draws every CJK glyph as a tofu
+box.  Set ``QT_QPA_PLATFORM=offscreen`` explicitly for a headless run.
 """
 
 from __future__ import annotations
@@ -18,7 +22,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+os.environ.setdefault("QT_QPA_PLATFORM", "windows" if os.name == "nt" else "offscreen")
 
 from app.core import paths  # noqa: E402
 

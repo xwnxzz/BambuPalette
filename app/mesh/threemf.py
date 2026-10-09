@@ -229,6 +229,9 @@ def write_3mf(
             '<?xml version="1.0" encoding="UTF-8"?>\n'
             "<config><header>"
             f'<header_item key="X-BBL-Client-Type" value="{_attr(THREEMF_APPLICATION)}" />'
+            # A Bambu Studio compatibility marker (the client version its own
+            # parser expects), NOT BambuPalette's version — that lives in
+            # app/__init__.py and is reported by --selftest.
             '<header_item key="X-BBL-Client-Version" value="1.0.0" />'
             "</header></config>\n",
         )

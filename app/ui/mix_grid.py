@@ -28,6 +28,7 @@ class MixGrid(QAbstractScrollArea):
 
     recipeSelected = Signal(object)
     recipeActivated = Signal(object)
+    selectionCleared = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -38,7 +39,6 @@ class MixGrid(QAbstractScrollArea):
         self._columns = 1
         self._selected = -1
         self._grouped = True
-        self._focus_pair: int | None = None
         self._hover = -1
 
         self.setFrameShape(QAbstractScrollArea.Shape.NoFrame)
@@ -57,24 +57,24 @@ class MixGrid(QAbstractScrollArea):
         self._grouped = grouped
         self._selected = -1
         self._hover = -1
-        self._focus_pair = None
         self._relayout()
         self.viewport().update()
 
     def recipes(self) -> list:
         return list(self._recipes)
 
-    def setFocusPair(self, pair_index: int | None) -> None:
-        """Dim every cell that does not belong to ``pair_index``."""
-        if self._focus_pair == pair_index:
-            return
-        self._focus_pair = pair_index
-        self.viewport().update()
-
     def selectedRecipe(self):
         if 0 <= self._selected < len(self._recipes):
             return self._recipes[self._selected]
         return None
+
+    def clearSelection(self) -> None:
+        """Drop the selection — clicking empty space in the grid does this."""
+        if self._selected == -1:
+            return
+        self._selected = -1
+        self.viewport().update()
+        self.selectionCleared.emit()
 
     def setSelectedIndex(self, index: int, scroll: bool = True) -> None:
         if not self._recipes:
@@ -178,23 +178,22 @@ class MixGrid(QAbstractScrollArea):
                 continue
             for column, item_index in enumerate(self._rows[row_index]):
                 recipe = self._recipes[item_index]
-                rect = QRectF(column * CELL + INSET, y - offset + INSET,
+                left = column * CELL
+                cell_top = y - offset
+                rect = QRectF(left + INSET, cell_top + INSET,
                               CELL - 2 * INSET, CELL - 2 * INSET)
-                dim = self._focus_pair is not None and recipe.pair_index != self._focus_pair
-                painter.setOpacity(0.22 if dim else 1.0)
+                # Nothing is ever dimmed. A selected mix is marked by a ring in its
+                # OWN colour (drawn in the cell's margin, around the swatch), so the
+                # neighbouring mixes keep showing the colour they really mix to.
                 painter.fillRect(rect, QColor(*recipe.rgb))
-                if not dim:
-                    painter.setPen(QPen(_outline(recipe.rgb), 1))
-                    painter.drawRect(rect.adjusted(0.5, 0.5, -0.5, -0.5))
+                painter.setPen(QPen(_outline(recipe.rgb), 1))
+                painter.drawRect(rect.adjusted(0.5, 0.5, -0.5, -0.5))
                 if item_index == self._selected:
-                    painter.setOpacity(1.0)
-                    painter.setPen(QPen(QColor(theme.SELECTION_BORDER), 2))
-                    painter.drawRect(rect.adjusted(1.0, 1.0, -1.0, -1.0))
+                    painter.setPen(QPen(_selection_colour(recipe.rgb), 2))
+                    painter.drawRect(QRectF(left + 2.0, cell_top + 2.0, CELL - 4.0, CELL - 4.0))
                 elif item_index == self._hover:
-                    painter.setOpacity(1.0)
                     painter.setPen(QPen(QColor(theme.BORDER_STRONG), 1))
-                    painter.drawRect(rect.adjusted(-1.0, -1.0, 1.0, 1.0))
-        painter.setOpacity(1.0)
+                    painter.drawRect(QRectF(left + 1.5, cell_top + 1.5, CELL - 3.0, CELL - 3.0))
         painter.end()
 
     # -- interaction -------------------------------------------------------------
@@ -212,8 +211,12 @@ class MixGrid(QAbstractScrollArea):
         return -1
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
         index = self._indexAt(event.position().toPoint())
         if index < 0:
+            # Blank space (a group gap, the area past the last cell, the empty
+            # strip under the last row) clears the selection.
+            self.clearSelection()
             return
         self._selected = index
         self.viewport().update()
@@ -246,6 +249,9 @@ class MixGrid(QAbstractScrollArea):
         step = {Qt.Key.Key_Left: -1, Qt.Key.Key_Right: 1,
                 Qt.Key.Key_Up: -self._columns, Qt.Key.Key_Down: self._columns}
         key = event.key()
+        if key == Qt.Key.Key_Escape:
+            self.clearSelection()
+            return
         if key in step:
             start = self._selected if self._selected >= 0 else 0
             self.setSelectedIndex(start + step[key])
@@ -307,3 +313,22 @@ def _outline(rgb) -> QColor:
     r, g, b = rgb
     luminance = theme.relative_luminance(r, g, b)
     return QColor(0, 0, 0, 46) if luminance > 0.18 else QColor(255, 255, 255, 46)
+
+
+def _selection_colour(rgb) -> QColor:
+    """The selected swatch's own colour, at reduced opacity, for its ring.
+
+    The ring sits in the cell margin, i.e. on the white grid, so a pale
+    selection (a white filament, a near-white mix) would be invisible. Those
+    colours are first pulled down their own scale — the hue is kept, only the
+    level changes — and only then given the alpha. A saturated or dark colour is
+    already legible and is used as-is.
+    """
+    r, g, b = (int(channel) for channel in rgb)
+    level = theme.relative_luminance(r, g, b)
+    if level > 0.28:
+        factor = 0.30 + 0.42 * (1.0 - min(1.0, (level - 0.28) / 0.72))
+        r, g, b = (int(channel * factor) for channel in (r, g, b))
+    colour = QColor(r, g, b)
+    colour.setAlpha(190)
+    return colour

@@ -119,6 +119,49 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         not window._target_color.isSet(),
         "the 目标颜色 picker starts with no preset colour",
     )
+    # Clicking a mix marks it with a ring in its OWN colour, and blank space clears
+    # the selection again — the old build dimmed every other mix and boxed the
+    # selection in blue.
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+
+    from .ui import mix_grid
+
+    single = window._recipes[0]
+    window._grid.setRecipes([single])
+    app.processEvents()
+    window._grid.mousePressEvent(
+        QMouseEvent(
+            QEvent.Type.MouseButtonPress,
+            QPointF(mix_grid.CELL / 2, mix_grid.CELL / 2),
+            QPointF(mix_grid.CELL / 2, mix_grid.CELL / 2),
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButtons.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+    )
+    app.processEvents()
+    check(window._grid.selectedRecipe() is not None, "clicking a mix swatch selects it")
+    window._grid.mousePressEvent(
+        QMouseEvent(
+            QEvent.Type.MouseButtonPress,
+            QPointF(mix_grid.CELL + 6, mix_grid.CELL / 2),
+            QPointF(mix_grid.CELL + 6, mix_grid.CELL / 2),
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButtons.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+    )
+    app.processEvents()
+    check(window._grid.selectedRecipe() is None, "clicking blank space clears the selection")
+    check(window._detail.recipe() is None, "clearing the selection empties the recipe panel")
+    check(
+        not hasattr(window._grid, "setFocusPair"),
+        "the grid no longer dims the mixes that were not selected",
+    )
+    window._refresh_grid()
+    app.processEvents()
+    check(len(window._recipes) == 810, "the full catalogue comes back after clearing")
     check(
         window._picture_page is not None and window._tabs.count() == 2,
         "both pages are present",

@@ -271,6 +271,52 @@ def main() -> int:
         "pair_key is the parent spool id pair",
     )
 
+    # --- blank space clears the selection; nothing is ever dimmed --------------
+    from PySide6.QtCore import QEvent, QPointF, Qt  # noqa: E402
+    from PySide6.QtGui import QMouseEvent  # noqa: E402
+
+    from app.ui import mix_grid  # noqa: E402
+
+    def click_grid(x: float, y: float) -> None:
+        window._grid.mousePressEvent(
+            QMouseEvent(
+                QEvent.Type.MouseButtonPress,
+                QPointF(x, y),
+                QPointF(x, y),
+                Qt.MouseButton.LeftButton,
+                Qt.MouseButtons.LeftButton,
+                Qt.KeyboardModifier.NoModifier,
+            )
+        )
+
+    # One lonely cell in the top-left leaves the rest of its row blank.
+    single = window._recipes[0]
+    window._grid.setRecipes([single])
+    app.processEvents()
+    click_grid(mix_grid.CELL / 2, mix_grid.CELL / 2)
+    app.processEvents()
+    check(window._grid.selectedRecipe() is not None, "clicking a swatch selects it")
+    click_grid(mix_grid.CELL + 6, mix_grid.CELL / 2)
+    app.processEvents()
+    check(window._grid.selectedRecipe() is None, "clicking blank space deselects the mix")
+    check(window._detail.recipe() is None, "deselecting clears the detail panel")
+    # The old build dimmed every other mix to 22% and boxed the selection in blue.
+    check(not hasattr(window._grid, "setFocusPair"), "the grid has no dimming hook any more")
+    ring = mix_grid._selection_colour((255, 255, 255))
+    check(ring.alpha() < 255, "the selection ring is drawn at reduced opacity")
+    check(
+        max(ring.red(), ring.green(), ring.blue()) < 160,
+        "a white selection gets a darkened ring so it stays visible on white",
+    )
+    red_ring = mix_grid._selection_colour((216, 52, 44))
+    check(
+        red_ring.red() == 216 and red_ring.green() == 52 and red_ring.blue() == 44,
+        "a saturated selection keeps its own colour for the ring",
+    )
+    window._refresh_grid()
+    app.processEvents()
+    check(len(window._recipes) == 810, "restoring the full catalogue after the blank click")
+
     # --- nearest match --------------------------------------------------------
     nearest = window.nearest_recipe("#982C29")
     check(nearest is not None, "nearest_recipe returns something for #982C29")

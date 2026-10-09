@@ -1,30 +1,51 @@
-"""Visual design tokens and the application stylesheet."""
+"""Visual design tokens and the application stylesheet.
+
+The palette, radii and type scale deliberately follow Lumina Studio's own
+workshop-module design language (``src/style.css`` in the 创意工坊 project, whose
+public theme tokens are ``--lumina-*``): a near-white surface set, a single blue
+accent, 10 px cards / 7 px buttons / 6 px inputs, 13 px body type, and small
+muted section labels.
+
+Lumina exposes those tokens so a module can inherit the host theme. We cannot
+read them from the host — this is a standalone desktop app — so the fallback
+values Lumina itself ships are hard-coded here and every widget reads them from
+this module rather than from a literal.
+"""
 
 from __future__ import annotations
 
 # -- colours ---------------------------------------------------------------------------
-BG = "#F4F6F8"
-PANEL = "#FFFFFF"
-PANEL_ALT = "#FAFBFC"
-BORDER = "#E2E6EB"
-BORDER_STRONG = "#CBD2DA"
-TEXT = "#1F2429"
-TEXT_MUTED = "#6B7480"
-TEXT_FAINT = "#98A1AC"
-ACCENT = "#00A86B"
-ACCENT_DARK = "#008C58"
-ACCENT_SOFT = "#E6F5EE"
-SELECTION = "#DCEBFB"
-SELECTION_BORDER = "#2C7BE5"
+# Surfaces
+BG = "#F5F5F7"  # --lumina-surface-muted: the stage / page background
+PANEL = "#FFFFFF"  # --lumina-surface: cards, bars, inputs at rest
+PANEL_ALT = "#FAFAFC"  # a half-step between the two, for hover / input fills
+# Lines
+BORDER = "#D2D2D7"  # --lumina-border
+BORDER_STRONG = "#C7C7CC"
+# Type
+TEXT = "#1D1D1F"  # --lumina-text
+TEXT_MUTED = "#6E6E73"  # --lumina-text-muted
+TEXT_FAINT = "#AEAEB2"
+# Action
+ACCENT = "#0071E3"  # --lumina-accent
+ACCENT_DARK = "#0058B0"
+ACCENT_SOFT = "#E8F1FD"
+SELECTION = "#E8F1FD"
+SELECTION_BORDER = "#0071E3"
 WARNING = "#D9822B"
-DANGER = "#D64545"
+DANGER = "#D7392F"  # --ls-danger
 
 #: Stroke colours used to outline very light swatches so they stay visible.
-SWATCH_BORDER_LIGHT = "#C9D0D8"
+SWATCH_BORDER_LIGHT = "#D2D2D7"
 SWATCH_BORDER_DARK = "#2A3038"
 
-MONO_FONT = "Consolas, 'Cascadia Mono', 'Courier New', monospace"
-UI_FONT = "'Microsoft YaHei UI', 'Segoe UI', 'PingFang SC', sans-serif"
+#: Corner radii, kept as strings so they can be dropped straight into the sheet.
+RADIUS_CARD = "10px"
+RADIUS_CONTROL = "7px"
+RADIUS_INPUT = "6px"
+
+MONO_FONT = "Consolas, 'Cascadia Mono', 'SFMono-Regular', 'Courier New', monospace"
+UI_FONT = "'Segoe UI', 'Microsoft YaHei UI', 'PingFang SC', 'Hiragino Sans GB', sans-serif"
 
 STYLESHEET = f"""
 QWidget {{
@@ -35,34 +56,64 @@ QWidget {{
 QMainWindow, QDialog {{
     background: {BG};
 }}
-QTabWidget::pane {{
-    background: {BG};
+
+/* ---------------------------------------------------------------- top bars */
+QFrame#topbar {{
+    background: {PANEL};
+    border: none;
+    border-bottom: 1px solid {BORDER};
+}}
+QFrame#stagebar {{
+    background: {PANEL};
+    border: none;
+    border-top: 1px solid {BORDER};
+    border-bottom: 1px solid {BORDER};
+}}
+QFrame#panel {{
+    background: {PANEL};
     border: 1px solid {BORDER};
-    border-radius: 8px;
-    top: -1px;
+    border-radius: {RADIUS_CARD};
 }}
-QTabWidget > QWidget {{
-    background: {BG};
-}}
-QTabBar::tab {{
-    background: transparent;
+QStatusBar {{
+    background: {PANEL};
+    border-top: 1px solid {BORDER};
     color: {TEXT_MUTED};
-    border: 1px solid transparent;
-    border-bottom: none;
-    border-top-left-radius: 7px;
-    border-top-right-radius: 7px;
-    padding: 7px 18px;
-    margin-right: 4px;
+    font-size: 12px;
 }}
-QTabBar::tab:hover {{
-    color: {TEXT};
+QStatusBar::item {{
+    border: none;
+}}
+
+/* ------------------------------------------------------------------- menus */
+QMenuBar {{
+    background: transparent;
+}}
+QMenuBar::item {{
+    background: transparent;
+    padding: 4px 10px;
+    border-radius: {RADIUS_INPUT};
+}}
+QMenuBar::item:selected {{
     background: {PANEL_ALT};
 }}
-QTabBar::tab:selected {{
-    background: {BG};
+QMenu {{
+    background: {PANEL};
+    border: 1px solid {BORDER};
+    border-radius: 8px;
+    padding: 4px;
+}}
+QMenu::item {{
+    padding: 6px 22px 6px 12px;
+    border-radius: {RADIUS_INPUT};
+}}
+QMenu::item:selected {{
+    background: {ACCENT_SOFT};
     color: {TEXT};
-    border-color: {BORDER};
-    font-weight: 600;
+}}
+QMenu::separator {{
+    height: 1px;
+    background: {BORDER};
+    margin: 4px 8px;
 }}
 QToolBar {{
     background: {PANEL};
@@ -73,7 +124,7 @@ QToolBar {{
 }}
 QToolBar QToolButton {{
     padding: 5px 10px;
-    border-radius: 6px;
+    border-radius: {RADIUS_INPUT};
     border: 1px solid transparent;
 }}
 QToolBar QToolButton:hover {{
@@ -86,15 +137,53 @@ QToolBar QToolButton:pressed {{
 QToolBar QToolButton:disabled {{
     color: {TEXT_FAINT};
 }}
-QStatusBar {{
-    background: {PANEL};
-    border-top: 1px solid {BORDER};
-    color: {TEXT_MUTED};
+
+/* ------------------------------------------- tabs, drawn as a segmented control */
+QTabWidget::pane {{
+    background: transparent;
+    border: none;
+    top: -1px;
 }}
+QTabWidget > QWidget {{
+    background: transparent;
+}}
+QTabBar {{
+    background: transparent;
+    qproperty-drawBase: 0;
+}}
+QTabBar::tab {{
+    background: {PANEL};
+    color: {TEXT_MUTED};
+    border: 1px solid {BORDER};
+    border-radius: 0;
+    padding: 6px 18px;
+    margin-right: -1px;
+    font-size: 12px;
+}}
+QTabBar::tab:first {{
+    border-top-left-radius: {RADIUS_CONTROL};
+    border-bottom-left-radius: {RADIUS_CONTROL};
+}}
+QTabBar::tab:last {{
+    border-top-right-radius: {RADIUS_CONTROL};
+    border-bottom-right-radius: {RADIUS_CONTROL};
+    margin-right: 0;
+}}
+QTabBar::tab:hover {{
+    color: {TEXT};
+}}
+QTabBar::tab:selected {{
+    background: {ACCENT};
+    color: white;
+    border-color: {ACCENT};
+    font-weight: 600;
+}}
+
+/* ------------------------------------------------------------------ groups */
 QGroupBox {{
     background: {PANEL};
     border: 1px solid {BORDER};
-    border-radius: 8px;
+    border-radius: {RADIUS_CARD};
     margin-top: 12px;
     padding-top: 10px;
     font-weight: 600;
@@ -104,69 +193,87 @@ QGroupBox::title {{
     left: 10px;
     padding: 0 4px;
     color: {TEXT_MUTED};
+    font-size: 12px;
 }}
-QLineEdit, QComboBox, QSpinBox, QPlainTextEdit, QTextEdit {{
+
+/* ------------------------------------------------------------------ inputs */
+QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QPlainTextEdit, QTextEdit {{
+    background: {PANEL_ALT};
+    border: 1px solid {BORDER};
+    border-radius: {RADIUS_INPUT};
+    padding: 5px 8px;
+    font-size: 12px;
+    selection-background-color: {ACCENT};
+    selection-color: white;
+}}
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus,
+QPlainTextEdit:focus, QTextEdit:focus {{
     background: {PANEL};
-    border: 1px solid {BORDER_STRONG};
-    border-radius: 6px;
-    padding: 4px 8px;
-    selection-background-color: {SELECTION};
-    selection-color: {TEXT};
-}}
-QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QPlainTextEdit:focus {{
     border-color: {ACCENT};
 }}
-QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled {{
-    background: {PANEL_ALT};
+QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled {{
+    background: {BG};
+    border-color: {BORDER};
     color: {TEXT_FAINT};
 }}
 QComboBox::drop-down {{
     border: none;
-    width: 18px;
+    width: 20px;
 }}
 QComboBox QAbstractItemView {{
     background: {PANEL};
-    border: 1px solid {BORDER_STRONG};
+    border: 1px solid {BORDER};
+    border-radius: 8px;
+    padding: 4px;
     selection-background-color: {ACCENT_SOFT};
     selection-color: {TEXT};
     outline: none;
 }}
+
+/* ----------------------------------------------------------------- buttons */
 QPushButton {{
     background: {PANEL};
-    border: 1px solid {BORDER_STRONG};
-    border-radius: 6px;
-    padding: 6px 14px;
+    border: 1px solid {BORDER};
+    border-radius: {RADIUS_CONTROL};
+    padding: 6px 12px;
     min-height: 18px;
+    font-size: 12px;
 }}
-QPushButton:hover {{
-    background: {PANEL_ALT};
-    border-color: {ACCENT};
+QPushButton:hover:enabled {{
+    border-color: {TEXT_MUTED};
 }}
 QPushButton:pressed {{
-    background: {ACCENT_SOFT};
+    background: {PANEL_ALT};
 }}
 QPushButton:disabled {{
-    color: {TEXT_FAINT};
+    background: {PANEL};
     border-color: {BORDER};
+    color: {TEXT_FAINT};
 }}
 QPushButton[accent="true"] {{
     background: {ACCENT};
+    border: 1px solid {ACCENT};
     color: white;
-    border: 1px solid {ACCENT_DARK};
     font-weight: 600;
 }}
-QPushButton[accent="true"]:hover {{
+QPushButton[accent="true"]:hover:enabled {{
     background: {ACCENT_DARK};
+    border-color: {ACCENT_DARK};
 }}
 QPushButton[accent="true"]:disabled {{
-    background: {BORDER_STRONG};
-    border-color: {BORDER_STRONG};
-    color: white;
+    background: {BORDER};
+    border-color: {BORDER};
+    color: {PANEL};
 }}
-QPushButton[danger="true"]:hover {{
+QPushButton[danger="true"] {{
+    color: {DANGER};
+}}
+QPushButton[danger="true"]:hover:enabled {{
     border-color: {DANGER};
     color: {DANGER};
 }}
+
+/* ------------------------------------------------------------------- lists */
 QListWidget, QListView, QTreeView, QTableView {{
     background: {PANEL};
     border: 1px solid {BORDER};
@@ -174,11 +281,15 @@ QListWidget, QListView, QTreeView, QTableView {{
     outline: none;
 }}
 QListWidget::item {{
-    padding: 2px;
-    border-radius: 6px;
+    padding: 3px;
+    border-radius: {RADIUS_INPUT};
+    margin: 1px 2px;
+}}
+QListWidget::item:hover, QListView::item:hover {{
+    background: {PANEL_ALT};
 }}
 QListWidget::item:selected, QListView::item:selected {{
-    background: {SELECTION};
+    background: {ACCENT_SOFT};
     color: {TEXT};
 }}
 QHeaderView::section {{
@@ -190,6 +301,8 @@ QHeaderView::section {{
     font-weight: 600;
     color: {TEXT_MUTED};
 }}
+
+/* -------------------------------------------------------------- scrollbars */
 QScrollBar:vertical {{
     background: transparent;
     width: 11px;
@@ -220,25 +333,34 @@ QScrollBar::add-line, QScrollBar::sub-line {{
 QScrollBar::add-page, QScrollBar::sub-page {{
     background: transparent;
 }}
+
+/* ---------------------------------------------------------- splitters, tips */
 QSplitter::handle {{
-    background: {BORDER};
+    background: transparent;
 }}
 QSplitter::handle:horizontal {{
-    width: 3px;
+    width: 10px;
+}}
+QSplitter::handle:hover {{
+    background: {BORDER};
 }}
 QToolTip {{
-    background: #2B3138;
-    color: #F2F4F6;
+    background: {TEXT};
+    color: {PANEL};
     border: none;
-    padding: 4px 8px;
-    border-radius: 4px;
+    padding: 6px 9px;
+    border-radius: {RADIUS_INPUT};
+    font-size: 12px;
 }}
+
+/* ------------------------------------------------------------------ labels */
 QLabel[role="sectionTitle"] {{
-    font-size: 13px;
+    font-size: 12px;
     font-weight: 600;
-    color: {TEXT};
+    color: {TEXT_MUTED};
 }}
 QLabel[role="hint"] {{
+    font-size: 12px;
     color: {TEXT_MUTED};
 }}
 QLabel[role="mono"] {{
@@ -246,6 +368,7 @@ QLabel[role="mono"] {{
 }}
 QCheckBox {{
     spacing: 6px;
+    font-size: 12px;
 }}
 """
 

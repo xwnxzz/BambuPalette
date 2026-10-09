@@ -17,7 +17,6 @@ from PySide6.QtCore import QSize, Qt, QTimer
 from PySide6.QtGui import QAction, QColor, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
-    QCheckBox,
     QComboBox,
     QFileDialog,
     QFrame,
@@ -85,17 +84,13 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         title = QLabel("BambuPalette")
-        title.setStyleSheet(f"font-size: 18px; font-weight: 600; color: {theme.TEXT};")
-        subtitle = QLabel(
-            "输入你自己的耗材颜色，程序自动算出所有两两混色的 81 个配比；"
-            "点击任意一个混色，就知道它由哪两种耗材丝、按什么比例混成，方便直接在 Bambu Studio 里配置。"
-        )
+        title.setStyleSheet(f"font-size: 14px; font-weight: 650; color: {theme.TEXT};")
+        subtitle = QLabel("混色耗材色彩管理器 · 每两种耗材 81 个配比")
         subtitle.setProperty("role", "hint")
-        subtitle.setWordWrap(True)
 
         head = QVBoxLayout()
         head.setContentsMargins(0, 0, 0, 0)
-        head.setSpacing(2)
+        head.setSpacing(1)
         head.addWidget(title)
         head.addWidget(subtitle)
 
@@ -103,9 +98,15 @@ class MainWindow(QMainWindow):
         self._add_button.setProperty("accent", "true")
         self._add_button.clicked.connect(self._on_add)
 
-        head_row = QHBoxLayout()
+        # Lumina Studio's topbar: the brand block on the left, the primary action
+        # on the right, on a white bar closed by a hairline.
+        topbar = QFrame()
+        topbar.setObjectName("topbar")
+        head_row = QHBoxLayout(topbar)
+        head_row.setContentsMargins(16, 10, 16, 10)
+        head_row.setSpacing(10)
         head_row.addLayout(head, 1)
-        head_row.addWidget(self._add_button, 0, Qt.AlignmentFlag.AlignTop)
+        head_row.addWidget(self._add_button, 0, Qt.AlignmentFlag.AlignVCenter)
 
         # engine / sort / search controls
         self._engine_combo = QComboBox()
@@ -136,10 +137,6 @@ class MainWindow(QMainWindow):
         self._search.setClearButtonEnabled(True)
         self._search.textChanged.connect(lambda *_: self._refresh_grid())
 
-        self._focus_check = QCheckBox("高亮同源混色")
-        self._focus_check.setChecked(True)
-        self._focus_check.setToolTip("选中一个混色时，把其余配比压暗，只保留同一对耗材的混色")
-
         self._show_all_button = QPushButton("显示全部混色")
         self._show_all_button.clicked.connect(self._clear_filters)
         self._show_all_button.setEnabled(False)
@@ -161,7 +158,6 @@ class MainWindow(QMainWindow):
         controls.addWidget(QLabel("排序:"))
         controls.addWidget(self._sort_combo)
         controls.addWidget(self._search, 1)
-        controls.addWidget(self._focus_check)
         controls.addWidget(self._show_all_button)
 
         target_row = QHBoxLayout()
@@ -183,10 +179,18 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(2, 0)
         splitter.setSizes([300, 640, 400])
 
+        blurb = QLabel(
+            "输入你自己的耗材颜色，程序自动算出所有两两混色的 81 个配比；"
+            "点击任意一个混色，就知道它由哪两种耗材丝、按什么比例混成，方便直接在 Bambu Studio 里配置。"
+        )
+        blurb.setProperty("role", "hint")
+        blurb.setWordWrap(True)
+
         mix_page = QWidget()
         mix_layout = QVBoxLayout(mix_page)
-        mix_layout.setContentsMargins(0, 8, 0, 0)
+        mix_layout.setContentsMargins(0, 0, 0, 0)
         mix_layout.setSpacing(10)
+        mix_layout.addWidget(blurb)
         mix_layout.addLayout(controls)
         mix_layout.addLayout(target_row)
         mix_layout.addWidget(splitter, 1)
@@ -198,12 +202,18 @@ class MainWindow(QMainWindow):
         tabs.addTab(self._picture_page, "图片转模型")
         self._tabs = tabs
 
-        central = QWidget()
-        layout = QVBoxLayout(central)
-        layout.setContentsMargins(14, 12, 14, 10)
+        body = QWidget()
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(16, 12, 16, 10)
         layout.setSpacing(10)
-        layout.addLayout(head_row)
         layout.addWidget(tabs, 1)
+
+        central = QWidget()
+        outer = QVBoxLayout(central)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        outer.addWidget(topbar)
+        outer.addWidget(body, 1)
         self.setCentralWidget(central)
 
         self._status = QLabel("")
@@ -213,10 +223,6 @@ class MainWindow(QMainWindow):
     def _wrap(self, widget: QWidget, title: str) -> QWidget:
         frame = QFrame()
         frame.setObjectName("panel")
-        frame.setStyleSheet(
-            f"QFrame#panel {{ background: {theme.PANEL};"
-            f" border: 1px solid {theme.BORDER}; border-radius: 8px; }}"
-        )
         header = QLabel(title)
         header.setProperty("role", "sectionTitle")
         layout = QVBoxLayout(frame)
@@ -284,6 +290,7 @@ class MainWindow(QMainWindow):
         self._grid = MixGrid()
         self._grid.recipeSelected.connect(self._on_grid_selected)
         self._grid.recipeActivated.connect(lambda recipe: self._show_pair(recipe.a_id, recipe.b_id))
+        self._grid.selectionCleared.connect(self._on_grid_cleared)
         self._grid_info = QLabel("")
         self._grid_info.setProperty("role", "hint")
 
@@ -603,10 +610,6 @@ class MainWindow(QMainWindow):
     # -- selection ---------------------------------------------------------------
     def _on_grid_selected(self, recipe) -> None:
         self._detail.showRecipe(recipe)
-        if self._focus_check.isChecked() and self._pair_filter is None:
-            self._grid.setFocusPair(recipe.pair_index)
-        else:
-            self._grid.setFocusPair(None)
         filament_a = self.library.get(recipe.a_id)
         filament_b = self.library.get(recipe.b_id)
         if filament_a and filament_b:
@@ -614,6 +617,11 @@ class MainWindow(QMainWindow):
                 f"{recipe.color_hex}  =  {filament_a.display_name}（{filament_a.color_hex}）{recipe.percent_a}%"
                 f"  +  {filament_b.display_name}（{filament_b.color_hex}）{recipe.percent_b}%"
             )
+
+    def _on_grid_cleared(self) -> None:
+        """The user clicked blank space (or pressed Esc): drop the recipe."""
+        self._detail.clear()
+        self._update_status()
 
     # -- nearest colour ----------------------------------------------------------
     def nearest_recipe(self, target_hex: str):
