@@ -61,6 +61,24 @@ def executable_dir() -> Path:
     return Path(__file__).resolve().parent.parent.parent
 
 
+def resource_path(*parts: str) -> Path:
+    """Locate a read-only file shipped with the program (the logo, and so on).
+
+    Two different directories have to be tried, because PyInstaller unpacks
+    bundled data into ``sys._MEIPASS`` while a source checkout keeps it in the
+    project's ``assets`` folder.  ``parts`` are joined with the platform
+    separator, e.g. ``resource_path("logo.ico")``.
+    """
+    bundle = getattr(sys, "_MEIPASS", None)
+    roots = [Path(bundle) / "assets"] if bundle else []
+    roots.append(Path(__file__).resolve().parent.parent.parent / "assets")
+    for root in roots:
+        candidate = root.joinpath(*parts)
+        if candidate.is_file():
+            return candidate
+    return roots[-1].joinpath(*parts)
+
+
 def portable_mode() -> bool:
     override = os.environ.get("BAMBU_PALETTE_PORTABLE", os.environ.get("FILAMENT_STUDIO_PORTABLE", ""))
     override = override.strip().lower()

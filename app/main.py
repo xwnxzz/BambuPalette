@@ -7,15 +7,23 @@ import sys
 
 def build_application(argv=None):
     """Create the ``QApplication`` with the app-wide theme applied."""
-    from PySide6.QtGui import QColor, QPalette
+    from PySide6.QtGui import QColor, QIcon, QPalette
     from PySide6.QtWidgets import QApplication
 
+    from .core.paths import resource_path
     from .ui import theme
 
     app = QApplication.instance() or QApplication(argv if argv is not None else sys.argv)
     app.setApplicationName("BambuPalette")
     app.setOrganizationName("BambuPalette")
     app.setStyle("Fusion")
+    # The taskbar button, the Alt-Tab switcher and every dialog's title bar take
+    # their icon from the application, so it is set once here rather than per
+    # window.  A missing file is not worth failing over: the default icon is
+    # ugly, not broken.
+    icon_file = resource_path("logo.ico")
+    if icon_file.is_file():
+        app.setWindowIcon(QIcon(str(icon_file)))
     # An explicit light palette, so parts the stylesheet does not reach never
     # inherit the operating system's dark palette.
     palette = QPalette()

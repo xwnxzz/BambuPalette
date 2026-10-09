@@ -44,6 +44,28 @@ def _library(color: str = "#123456") -> dict:
     }
 
 
+class ResourcePathTests(unittest.TestCase):
+    """The logo has to be findable both from source and from inside the bundle."""
+
+    def test_the_shipped_logo_is_found(self):
+        icon = paths.resource_path("logo.ico")
+        self.assertTrue(icon.is_file(), icon)
+        self.assertEqual(icon.name, "logo.ico")
+
+    def test_a_bundle_directory_wins_over_the_source_tree(self):
+        with tempfile.TemporaryDirectory() as temp:
+            bundle = Path(temp) / "assets"
+            bundle.mkdir()
+            (bundle / "logo.ico").write_bytes(b"fake")
+            with mock.patch.object(paths.sys, "_MEIPASS", temp, create=True):
+                self.assertEqual(paths.resource_path("logo.ico"), bundle / "logo.ico")
+
+    def test_a_missing_name_still_returns_a_path_under_assets(self):
+        missing = paths.resource_path("nothing-here.png")
+        self.assertEqual(missing.name, "nothing-here.png")
+        self.assertEqual(missing.parent.name, "assets")
+
+
 class DataDirTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self._temp = tempfile.TemporaryDirectory(prefix="fcs-paths-")

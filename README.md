@@ -1,5 +1,7 @@
 # BambuPalette · 混色耗材色彩管理器
 
+<img src="assets/logo.png" alt="BambuPalette" width="260">
+
 一款独立的 Windows 桌面程序，用来管理自己的打印耗材颜色，并算出**任意两种耗材按 10%–90% 的 81 种比例混出来的颜色**——让你在 Bambu Studio 的「添加混色耗材」里一次就配对成功。
 
 程序不联网、不依赖网页，所有数据都存在本机。

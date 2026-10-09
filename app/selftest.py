@@ -16,6 +16,7 @@ also printed.  Exit code 0 means everything passed.
 
 from __future__ import annotations
 
+import os
 import sys
 import zipfile
 from pathlib import Path
@@ -75,6 +76,20 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     from .main import build_application
 
     app = build_application([])
+
+    from PySide6.QtCore import QSize as _QSize
+    from PySide6.QtGui import QIcon as _QIcon
+
+    from .core.paths import resource_path as _resource_path
+
+    _logo = _resource_path("logo.ico")
+    check(_logo.is_file(), f"the logo ships with the program ({_logo})")
+    _icon = app.windowIcon()
+    check(
+        not _icon.isNull() and not _icon.pixmap(_QSize(32, 32)).isNull(),
+        "the application has a window icon",
+    )
+    del _QIcon, _QSize
 
     from .core.engines import ENGINES, ENGINE_BAMBU, ENGINE_MIXER
     from .core.image_matching import MatchSettings, build_palette, match_image
@@ -449,4 +464,16 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         except Exception:  # pragma: no cover
             pass
 
-    return 1 if failures else 0
+    code = 1 if failures else 0
+    # The report is written and the window is closed, so nothing is left to
+    # clean up — and letting the interpreter tear Qt down afterwards exits with
+    # 0xC0000409 (STATUS_STACK_BUFFER_OVERRUN) on roughly half of all runs.
+    # That crash happens *after* the report, but a diagnostic that reports
+    # "SELFTEST OK" and then fails is worse than no diagnostic at all, so this
+    # path leaves through the front door instead.
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:  # pragma: no cover - no streams in a windowed build
+        pass
+    os._exit(code)
