@@ -287,31 +287,6 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     check("RGB 0, 0, 0" in row, "the duplicate hex is replaced by the RGB numbers")
     unnamed_window.close()
 
-    # The colour can be filled in on the 我的耗材 panel itself, no dialog.
-    first = window.library.filaments[0]
-    original_hex = first.color_hex
-    window._select_filament(first.id)
-    app.processEvents()
-    check(window._library_colour.isSet(), "selecting a spool fills the inline colour field")
-    check(
-        window._library_colour.hex() == original_hex,
-        "the inline colour field shows the spool's own colour",
-    )
-    window._library_colour.setValue("#123456")
-    window._on_apply_library_colour()
-    app.processEvents()
-    check(
-        window.library.require(first.id).color_hex == "#123456",
-        "applying the colour on the panel rewrites the spool",
-    )
-    window._library_colour.setValue(original_hex)
-    window._on_apply_library_colour()
-    app.processEvents()
-    check(
-        window.library.require(first.id).color_hex == original_hex,
-        "the panel colour change can be undone",
-    )
-
     check(
         window._picture_page is not None and window._tabs.count() == 2,
         "both pages are present",

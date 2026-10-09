@@ -290,23 +290,12 @@ class MainWindow(QMainWindow):
         self._library_hint.setProperty("role", "hint")
         self._library_hint.setWordWrap(True)
 
-        # Fill a spool's colour in right here, without opening anything.
-        self._library_colour = ColorField(None, stacked=True)
-        self._library_colour.setToolTip(
-            "选中左边的一种耗材后，在这里直接改它的颜色：输入 #RRGGBB，或者填 R / G / B 三个数字"
-        )
-        self._library_colour.colorChanged.connect(self._on_library_colour_changed)
-        self._apply_colour_button = QPushButton("应用颜色")
-        self._apply_colour_button.clicked.connect(self._on_apply_library_colour)
-
         panel = QWidget()
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
         layout.addWidget(self._list, 1)
         layout.addWidget(self._library_hint)
-        layout.addWidget(self._library_colour)
-        layout.addWidget(self._apply_colour_button)
         layout.addLayout(row_one)
         layout.addLayout(row_two)
 
@@ -382,12 +371,6 @@ class MainWindow(QMainWindow):
 
     # -- library -----------------------------------------------------------------
     def _reload_library(self) -> None:
-        # Remember which spool was selected: rebuilding the list drops it, and
-        # losing the selection right after the user changed that spool's colour
-        # is disorienting.
-        selected = self._selected_filament()
-        selected_id = selected.id if selected is not None else None
-
         self._suppress_list_signal = True
         self._list.clear()
         for filament in self.library:
@@ -420,48 +403,8 @@ class MainWindow(QMainWindow):
         has_any = len(self.library) > 0
         self._library_hint.setVisible(not has_any)
         self._list.setVisible(has_any)
-        if selected_id is not None and self.library.get(selected_id) is not None:
-            self._select_filament(selected_id)
-        self._sync_library_colour()
         self._rebuild_catalog()
         self._save_library()
-
-    # -- inline colour entry on the 我的耗材 panel ---------------------------------
-    def _sync_library_colour(self) -> None:
-        """Point the inline colour field at whatever spool is selected."""
-        filament = self._selected_filament()
-        if filament is None:
-            self._library_colour.setValue(None)
-            self._library_colour.setEnabled(False)
-            self._library_colour.setToolTip("先在左边选中一种耗材")
-            self._apply_colour_button.setEnabled(False)
-            self._apply_colour_button.setToolTip("先在左边选中一种耗材")
-            return
-        self._library_colour.setEnabled(True)
-        self._library_colour.setToolTip("改完点「应用颜色」写回这种耗材")
-        self._library_colour.setValue(filament.color_hex)
-        self._apply_colour_button.setEnabled(True)
-        self._apply_colour_button.setToolTip("把上面的颜色写给选中的耗材")
-
-    def _on_library_colour_changed(self, _value: str) -> None:
-        # Nothing is written until 「应用颜色」 is pressed: typing the three digits
-        # of a hex code should not rewrite the spool three times on the way.
-        self._apply_colour_button.setEnabled(
-            self._selected_filament() is not None and self._library_colour.isSet()
-        )
-
-    def _on_apply_library_colour(self) -> None:
-        filament = self._selected_filament()
-        if filament is None or not self._library_colour.isSet():
-            return
-        new_hex = self._library_colour.hex()
-        try:
-            self.library.update(filament.id, color_hex=new_hex)
-        except (LibraryError, ValueError) as exc:
-            self._status.setText(f"改色失败：{exc}")
-            return
-        self._reload_library()
-        self._status.setText(f"{filament.display_name} 的颜色已改成 {new_hex}")
 
     def _save_library(self) -> None:
         try:
@@ -544,13 +487,11 @@ class MainWindow(QMainWindow):
 
     def _on_list_selection(self, current, previous) -> None:
         if self._suppress_list_signal or current is None:
-            self._sync_library_colour()
             return
         filament = self.library.get(current.data(Qt.ItemDataRole.UserRole))
         if filament is not None:
             self._status.setText(f"{filament.display_name} · {filament.color_hex} · "
                                  f"{filament.brand or '—'} · {filament.material_type or '—'}")
-        self._sync_library_colour()
 
     def _on_list_menu(self, position) -> None:
         from PySide6.QtWidgets import QMenu
