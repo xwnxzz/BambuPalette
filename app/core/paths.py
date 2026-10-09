@@ -71,6 +71,21 @@ def portable_mode() -> bool:
     return (executable_dir() / "portable.txt").exists()
 
 
+def data_dir_override() -> Path | None:
+    """Explicit data directory from ``BAMBU_PALETTE_DATA_DIR``, if set.
+
+    This exists so that scripts — screenshot tools, experiments, a second copy
+    started for comparison — can be pointed at a scratch directory.  Without it
+    every ``MainWindow()`` writes its library straight into the user's real
+    data directory, which is exactly how a screenshot script once replaced a
+    user's spools with demo colours.
+    """
+    raw = os.environ.get("BAMBU_PALETTE_DATA_DIR", "").strip()
+    if not raw:
+        return None
+    return Path(raw).expanduser()
+
+
 def _copy_missing(source: Path, target: Path, names=None) -> None:
     """Copy tree ``source`` into ``target``, never overwriting what is there."""
     try:
@@ -134,6 +149,12 @@ def _adopt_legacy_data_dir(base: Path) -> None:
 
 def _candidate_roots() -> list[Path]:
     """Every place we are willing to keep data, best first."""
+    # An explicit override is the whole list: a caller that said "use this
+    # directory" must never end up quietly writing into the user's real one.
+    forced = data_dir_override()
+    if forced is not None:
+        return [forced]
+
     roots: list[Path] = []
     portable = portable_mode()
     if portable:

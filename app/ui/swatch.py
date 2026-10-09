@@ -9,6 +9,30 @@ from PySide6.QtWidgets import QColorDialog, QPushButton, QSizePolicy, QWidget
 from . import theme
 
 
+_LAST_PICKED: QColor | None = None
+
+#: Where a colour dialog opens when the caller has not chosen a colour yet and
+#: nothing has been picked this session.  Deliberately a neutral grey rather than
+#: white: white is a real filament colour, so a dialog that opens on it invites
+#: the user to confirm a spool they never described.  Grey reads as "you have not
+#: told me yet".
+_PICKER_FALLBACK = "#808080"
+
+
+def picker_start(current=None) -> QColor:
+    """Colour a :class:`QColorDialog` should open on, in order of preference.
+
+    The caller's own value wins; then whatever the user picked most recently in
+    this session; then a neutral grey.  White is never used as an implicit
+    default.
+    """
+    if not is_unset(current):
+        return qcolor(current)
+    if _LAST_PICKED is not None:
+        return QColor(_LAST_PICKED)
+    return QColor(_PICKER_FALLBACK)
+
+
 def qcolor(value) -> QColor:
     """Accept ``#RRGGBB``, ``(r, g, b)`` or ``QColor`` and return a :class:`QColor`."""
     if isinstance(value, QColor):
@@ -158,9 +182,10 @@ class ColorButton(QPushButton):
         self.clicked.connect(self._choose)
 
     def _choose(self) -> None:
-        start = self._value if self._value is not None else QColor("#FFFFFF")
-        chosen = QColorDialog.getColor(start, self, self._title)
+        global _LAST_PICKED
+        chosen = QColorDialog.getColor(picker_start(self._value), self, self._title)
         if chosen.isValid():
+            _LAST_PICKED = QColor(chosen)
             self.setValue(chosen.name().upper())
 
     def setValue(self, value) -> None:  # noqa: N802

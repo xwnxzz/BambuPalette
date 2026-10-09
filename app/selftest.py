@@ -246,6 +246,37 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     app.processEvents()
     check(len(window.library.filaments) == before, "the library can be restored after the Del test")
 
+    # One spool makes no mixes, but its own colour still has to reach the grid.
+    from .core.library import Filament as _SelftestFilament
+    from .ui.swatch import picker_start
+
+    lone_window = MainWindow(
+        library=FilamentLibrary([_SelftestFilament(material_type="PLA", color_hex="#0000FF")])
+    )
+    lone_window.resize(1100, 760)
+    lone_window.show()
+    app.processEvents()
+    check(lone_window._catalog.recipe_count == 0, "one spool makes zero mixes")
+    lone_window._all_colours.setChecked(True)
+    app.processEvents()
+    check(
+        len(lone_window._recipes) == 1,
+        f"ticking 全部颜色 shows the lone spool's colour, got {len(lone_window._recipes)}",
+    )
+    if lone_window._recipes:
+        check(lone_window._recipes[0].color_hex == "#0000FF", "the lone cell is the spool's own colour")
+    lone_window.close()
+
+    # An unnamed spool's display name IS its hex; repeating it reads like a bug.
+    unnamed_window = MainWindow(library=FilamentLibrary([_SelftestFilament(color_hex="#000000")]))
+    app.processEvents()
+    row = unnamed_window._list.item(0).text()
+    check("#000000   #000000" not in row, f"an unnamed spool does not print its hex twice ({row})")
+    check("RGB 0, 0, 0" in row, "the duplicate hex is replaced by the RGB numbers")
+    unnamed_window.close()
+
+    check(picker_start(None).name().upper() != "#FFFFFF", "the colour picker does not open on white")
+
     check(
         window._picture_page is not None and window._tabs.count() == 2,
         "both pages are present",

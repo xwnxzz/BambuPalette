@@ -17,7 +17,15 @@ from unittest import mock
 
 from app.core import paths
 
-ENV_KEYS = ("LOCALAPPDATA", "APPDATA", "TEMP", "TMP", "BAMBU_PALETTE_PORTABLE", "FILAMENT_STUDIO_PORTABLE")
+ENV_KEYS = (
+    "LOCALAPPDATA",
+    "APPDATA",
+    "TEMP",
+    "TMP",
+    "BAMBU_PALETTE_PORTABLE",
+    "FILAMENT_STUDIO_PORTABLE",
+    "BAMBU_PALETTE_DATA_DIR",
+)
 
 
 def _library(color: str = "#123456") -> dict:
@@ -371,6 +379,44 @@ class CopyMissingTests(DataDirTestCase):
         self.assertEqual((target / "nested" / "deep.txt").read_text(encoding="utf-8"), "deep")
 
 
+class DataDirOverrideTests(DataDirTestCase):
+    """``BAMBU_PALETTE_DATA_DIR`` is the seatbelt for every script and experiment.
+
+    A screenshot script that builds a bare ``MainWindow()`` saves its library on
+    construction.  Without an override it saves over the user's real spools —
+    which is not hypothetical, it happened, and the user found demo colours in
+    their library the next time they opened the program.
+    """
+
+    def test_the_override_is_the_only_root(self) -> None:
+        scratch = self.root / "scratch"
+        self.env(BAMBU_PALETTE_DATA_DIR=str(scratch), LOCALAPPDATA=self.root / "profile")
+
+        self.assertEqual(paths.data_dir(), scratch)
+        self.assertEqual(paths.library_path(), scratch / "filament-library.json")
+
+    def test_the_override_beats_a_library_in_the_profile(self) -> None:
+        """Even a populated profile directory must not win over explicit intent."""
+        profile = self.root / "profile" / "BambuPalette"
+        profile.mkdir(parents=True)
+        (profile / "filament-library.json").write_text("{}", encoding="utf-8")
+
+        scratch = self.root / "scratch"
+        self.env(BAMBU_PALETTE_DATA_DIR=str(scratch), LOCALAPPDATA=self.root / "profile")
+
+        self.assertEqual(paths.data_dir(), scratch)
+
+    def test_an_empty_override_is_ignored(self) -> None:
+        self.env(BAMBU_PALETTE_DATA_DIR="")
+        self.assertIsNone(paths.data_dir_override())
+
+    def test_the_override_is_expanded(self) -> None:
+        self.env(BAMBU_PALETTE_DATA_DIR="~/bambupalette-scratch")
+        override = paths.data_dir_override()
+        self.assertIsNotNone(override)
+        self.assertNotIn("~", str(override))
+
+
 class PortableModeTests(DataDirTestCase):
     def test_portable_flag_keeps_data_beside_the_program(self) -> None:
         program = self.root / "program"
@@ -675,7 +721,41 @@ class LibrarySaveTests(unittest.TestCase):
         lib.FilamentLibrary([]).save(target)
         lib.FilamentLibrary([]).save(target)
 
-        self.assertEqual([path.name for path in self.root.iterdir()], [target.name])
+        # The second save keeps one generation of undo beside the library; what
+        # must not survive is a stray ``.tmp`` from either write.
+        self.assertEqual(
+            sorted(path.name for path in self.root.iterdir()),
+            [target.name, target.name + ".bak"],
+        )
+
+    def test_a_save_keeps_the_previous_version_as_a_backup(self) -> None:
+        """An accident must cost one generation, not the whole library."""
+        from app.core import library as lib
+        from app.core.library import Filament
+
+        target = self.root / "filament-library.json"
+        original = lib.FilamentLibrary(
+            [Filament(color_hex="#123456", material_type="PLA")]
+        )
+        original.save(target)
+
+        # Something replaces the library wholesale, the way a stray script once
+        # did. The old file has to still be readable.
+        lib.FilamentLibrary([Filament(color_hex="#FFFFFF")]).save(target)
+
+        backup = target.with_name(target.name + ".bak")
+        self.assertTrue(backup.exists())
+        restored = lib.FilamentLibrary.load(backup)
+        self.assertEqual([f.color_hex for f in restored], ["#123456"])
+
+    def test_the_first_save_creates_no_backup(self) -> None:
+        """There is nothing to back up yet, and an empty ``.bak`` would lie."""
+        from app.core import library as lib
+
+        target = self.root / "filament-library.json"
+        lib.FilamentLibrary([]).save(target)
+
+        self.assertFalse(target.with_name(target.name + ".bak").exists())
 
 
 if __name__ == "__main__":  # pragma: no cover

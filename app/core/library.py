@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import uuid
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -118,6 +119,10 @@ class Filament:
     id: str = field(default_factory=_new_id)
     brand: str = ""
     material_type: str = ""
+    #: The colour this spool actually prints as.  The default exists only so the
+    #: dataclass can hold a value; every path that creates a spool for the user
+    #: supplies one, because a made-up white spool is a lie the user only finds
+    #: out about after a print.
     color_hex: str = "#FFFFFF"
     note: str = ""
     name: str = ""
@@ -175,7 +180,7 @@ class Filament:
             name=str(data.get("name") or ""),
             brand=str(data.get("brand") or ""),
             material_type=str(data.get("materialType") or data.get("material_type") or ""),
-            color_hex=str(data.get("colorHex") or data.get("color_hex") or "#FFFFFF"),
+            color_hex=str(data.get("colorHex") or data.get("color_hex") or ""),
             note=str(data.get("note") or ""),
             created_at=str(data.get("createdAt") or _now()),
             updated_at=str(data.get("updatedAt") or _now()),
@@ -302,7 +307,12 @@ class FilamentLibrary:
         for entry in raw:
             if not isinstance(entry, dict):
                 continue
-            filament = Filament.from_dict(entry)
+            try:
+                filament = Filament.from_dict(entry)
+            except (ValueError, TypeError):
+                # A row with no usable colour is not a spool. Skipping it keeps one
+                # damaged entry from taking the whole library down with it.
+                continue
             if filament.id in seen:
                 filament.id = _new_id()
             seen.add(filament.id)
@@ -318,6 +328,17 @@ class FilamentLibrary:
             raise LibraryError(
                 f"cannot create {target.parent}: {exc.strerror or exc}"
             ) from exc
+
+        # Keep the previous version beside the new one.  Saving is atomic, so the
+        # old file is never *corrupt*; but "atomic" says nothing about whether
+        # what just got written was what the user meant.  One generation of undo
+        # costs a few kilobytes and turns an accident into an inconvenience.
+        if target.exists():
+            try:
+                shutil.copy2(target, target.with_name(target.name + ".bak"))
+            except OSError:  # pragma: no cover - defensive
+                pass
+
         payload = json.dumps(self.to_dict(), ensure_ascii=False, indent=2)
         temp_name = _write_temp_file(target, payload)
         try:

@@ -24,9 +24,15 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("QT_QPA_PLATFORM", "windows" if os.name == "nt" else "offscreen")
 
+# Redirect the storage layer BEFORE anything imports it.  Both the environment
+# variable and the patched functions are set: the variable is what a script
+# written later will pick up, and the patch keeps this tool correct even if
+# something caches the paths at import time.
+TEMP = Path(tempfile.mkdtemp(prefix="fcs-ui-"))
+os.environ["BAMBU_PALETTE_DATA_DIR"] = str(TEMP)
+
 from app.core import paths  # noqa: E402
 
-TEMP = Path(tempfile.mkdtemp(prefix="fcs-ui-"))
 paths.library_path = lambda: TEMP / "filament-library.json"  # type: ignore[assignment]
 paths.data_dir = lambda: TEMP  # type: ignore[assignment]
 

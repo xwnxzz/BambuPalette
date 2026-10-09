@@ -23,9 +23,14 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+# Redirect storage before anything imports it, both ways: the environment
+# variable is the documented hook, the patch keeps this tool correct even if a
+# module cached the paths at import time.
+TEMP = Path(tempfile.mkdtemp(prefix="fcs-smoke-"))
+os.environ["BAMBU_PALETTE_DATA_DIR"] = str(TEMP)
+
 from app.core import paths  # noqa: E402
 
-TEMP = Path(tempfile.mkdtemp(prefix="fcs-smoke-"))
 paths.library_path = lambda: TEMP / "filament-library.json"  # type: ignore[assignment]
 paths.data_dir = lambda: TEMP  # type: ignore[assignment]
 
@@ -457,6 +462,62 @@ def main() -> int:
         window._reload_library()
         app.processEvents()
     check(len(window.library.filaments) == before, "the library is restored after the Del test")
+
+    # --- one spool: its own colour must still reach the middle grid -------------
+    lone = FilamentLibrary([Filament(name="只有一种", material_type="PLA", color_hex="#0000FF")])
+    lone_window = MainWindow(library=lone)
+    lone_window.resize(1200, 800)
+    lone_window.show()
+    app.processEvents()
+    check(lone_window._catalog.recipe_count == 0, "one spool really does make zero mixes")
+    check(len(lone_window._recipes) == 0, "with the box off the grid is legitimately empty")
+    lone_window._all_colours.setChecked(True)
+    app.processEvents()
+    check(
+        len(lone_window._recipes) == 1,
+        f"ticking 全部颜色 shows the single spool's own colour, got {len(lone_window._recipes)}",
+    )
+    if lone_window._recipes:
+        only = lone_window._recipes[0]
+        check(getattr(only, "is_spool", False), "the lone cell is a spool, not a mix")
+        check(only.color_hex == "#0000FF", "the lone cell carries the spool's colour")
+        lone_window._grid.selectRecipe(only)
+        lone_window._on_grid_selected(only)
+        app.processEvents()
+        check(
+            lone_window._detail.filament() is not None,
+            "clicking the lone spool explains it in the detail panel",
+        )
+    check(len(lone_window._recipes) > 0, "the empty-state message is not what a lone spool gets")
+    lone_window.close()
+
+    # --- an unnamed spool must not print its hex twice --------------------------
+    unnamed = FilamentLibrary([Filament(color_hex="#000000")])
+    unnamed_window = MainWindow(library=unnamed)
+    app.processEvents()
+    row_text = unnamed_window._list.item(0).text()
+    check(
+        not row_text.strip().endswith("#000000   #000000"),
+        f"an unnamed spool does not repeat its hex, got {row_text!r}",
+    )
+    check("RGB 0, 0, 0" in row_text, f"the duplicate hex becomes the RGB numbers, got {row_text!r}")
+    check(
+        not row_text.startswith("#000000   #000000"),
+        f"an unnamed spool does not repeat its hex at the front either, got {row_text!r}",
+    )
+    unnamed_window.close()
+
+    # --- no implicit white anywhere in the picker -------------------------------
+    from app.ui.swatch import picker_start  # noqa: E402
+
+    check(
+        picker_start(None).name().upper() != "#FFFFFF",
+        "an unset colour picker does not open on white",
+    )
+    check(
+        picker_start("#C8342E").name().upper() == "#C8342E",
+        "a set colour picker opens on the colour it is editing",
+    )
 
     # --- nearest match --------------------------------------------------------
     nearest = window.nearest_recipe("#982C29")

@@ -375,8 +375,17 @@ class MainWindow(QMainWindow):
         self._suppress_list_signal = True
         self._list.clear()
         for filament in self.library:
-            item = QListWidgetItem(swatch_icon(filament.color_hex, 28, 28),
-                                   f"{filament.display_name}   {filament.color_hex}")
+            # An unnamed spool's display_name IS its hex, so printing both would
+            # render "#000000   #000000". The one other thing the user needs is
+            # the numbers, so the duplicate becomes "RGB 0, 0, 0".
+            detail = filament.color_hex
+            if filament.display_name.strip().casefold() == filament.color_hex.casefold():
+                red, green, blue = filament.rgb
+                detail = f"RGB {red}, {green}, {blue}"
+            item = QListWidgetItem(
+                swatch_icon(filament.color_hex, 28, 28),
+                f"{filament.display_name}   {detail}",
+            )
             item.setData(Qt.ItemDataRole.UserRole, filament.id)
             item.setToolTip(
                 f"名称：{filament.display_name}\n"
@@ -614,20 +623,20 @@ class MainWindow(QMainWindow):
     def _refresh_grid(self) -> None:
         if self._catalog is None:
             return
-        if self._catalog.recipe_count == 0:
-            self._recipes = []
-            self._grid.setRecipes([], grouped=False)
-            self._show_all_button.setEnabled(False)
-            self._update_status()
-            return
 
         sort_key = self._sort_combo.currentData() or SORT_RGB
         if self._pair_filter is not None:
             recipes = self._catalog.pair_recipes(*self._pair_filter)
             grouped = False
-        else:
+        elif self._catalog.recipe_count:
             recipes = self._catalog.sorted_recipes(sort_key)
             grouped = sort_key == SORT_PAIR
+        else:
+            # Fewer than two spools: there are no mixes, but 「全部颜色」 can still
+            # have something to show.  Bailing out here was why a single spool
+            # left the middle panel empty while the footer counted its colour.
+            recipes = []
+            grouped = False
 
         # 「全部颜色」 adds the spools themselves, so a two-spool library offers
         # 81 mixes + 2 raw colours = 83 entries. The spools are NOT pinned on top:
@@ -648,6 +657,16 @@ class MainWindow(QMainWindow):
             cells = sorted_cells(spools + recipes, sort_key, label_of=self._label_of)
         else:
             cells = recipes
+
+        # Truly nothing to show — an empty library, or a search that matched
+        # nothing. The grid has to say so instead of rendering zero rows.
+        if not cells:
+            self._recipes = []
+            self._grid.setRecipes([], grouped=False)
+            self._show_all_button.setEnabled(False)
+            self._update_status()
+            return
+
         self._recipes = cells
         self._grid.setRecipes(cells, grouped=grouped)
         self._show_all_button.setEnabled(self._pair_filter is not None or bool(query))
