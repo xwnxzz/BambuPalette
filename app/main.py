@@ -80,7 +80,10 @@ def main(argv=None) -> int:
     from .ui.main_window import MainWindow
 
     try:
-        window = MainWindow()
+        # The window is shown before the first mix catalogue is built, so the app
+        # appears immediately and announces the calculation instead of looking
+        # hung for the ~3 s a 41-spool library needs.
+        window = MainWindow(defer_build=True)
     except DataDirectoryError as exc:
         _report_startup_failure(str(exc))
         return 1

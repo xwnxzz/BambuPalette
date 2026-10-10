@@ -63,9 +63,20 @@ from .swatch import ColorField, swatch_icon
 
 _HEX_QUERY = re.compile(r"^[0-9a-fA-F]{1,6}$")
 
+# How long the launcher waits, after showing the window, before it starts the
+# first mix-catalogue build.  Long enough for the window to paint (a zero timer
+# loses the race against the paint event), short enough not to feel like a pause.
+BUILD_DELAY_MS = 150
+
 
 class MainWindow(QMainWindow):
-    def __init__(self, library: FilamentLibrary | None = None, parent=None) -> None:
+    def __init__(
+        self,
+        library: FilamentLibrary | None = None,
+        parent=None,
+        *,
+        defer_build: bool = False,
+    ) -> None:
         super().__init__(parent)
         self.library = library if library is not None else self._load_library()
         self._catalog: MixCatalog | None = None
@@ -73,6 +84,11 @@ class MainWindow(QMainWindow):
         self._pair_filter: tuple[str, str] | None = None
         self._build_seconds = 0.0
         self._suppress_list_signal = False
+        # The real launcher asks for the first catalogue build to happen after the
+        # window is on screen (see _rebuild_catalog).  Tests and the headless tools
+        # keep the synchronous default, so nothing has to wait for a timer.
+        self._defer_build = defer_build
+        self._build_notice = False
 
         self.setWindowTitle("BambuPalette — 混色耗材色彩管理器")
         self.resize(1320, 840)
@@ -568,6 +584,21 @@ class MainWindow(QMainWindow):
         engine_id = self._engine_combo.currentData()
         catalog = getattr(self, "_catalog", None)
         if catalog is None or catalog.engine.id != engine_id:
+            if self._defer_build:
+                # 41 spools is 66,420 recipes and ~3 s of solid computation. Doing
+                # that inside __init__ means the window takes 4.4 s to appear and
+                # looks hung; doing it here, on a zero timer, lets the window paint
+                # a "calculating…" line and a wait cursor first.  The flag is
+                # cleared before re-entering so the second call takes the normal
+                # path below.
+                self._defer_build = False
+                self._announce_build()
+                # A zero timer is NOT enough: it fires before the paint event
+                # show() posted, so the window would still appear only after the
+                # build.  A short delay lets the window paint its "calculating…"
+                # state first, which is the whole point.
+                QTimer.singleShot(BUILD_DELAY_MS, self._rebuild_catalog)
+                return
             self._catalog = MixCatalog(self.library.filaments, MIX_RATIOS, engine=engine_id)
             self._catalog.build()
         else:
@@ -575,6 +606,7 @@ class MainWindow(QMainWindow):
             # rebuild is 66,420 recipes and ~3 s at 41 spools.
             catalog.sync(self.library.filaments)
         self._build_seconds = time.perf_counter() - started
+        self._end_build_notice()
         self._detail.setContext(self.library, self._catalog.engine)
         if getattr(self, "_picture_page", None) is not None:
             self._picture_page.setLibrary(self.library, self._catalog)
@@ -583,6 +615,26 @@ class MainWindow(QMainWindow):
             if self.library.get(a_id) is None or self.library.get(b_id) is None:
                 self._pair_filter = None
         self._refresh_grid()
+
+    def _announce_build(self) -> None:
+        """Say what the pending catalogue build is about to do."""
+        count = len(self.library)
+        total = count * (count - 1) // 2 * len(MIX_RATIOS)
+        self._status.setText(f"正在计算 {total:,} 个混色，请稍候…")
+        self._grid_info.setText("正在计算混色表…")
+        # The grid's own empty state blames the library ("add two spools"); while
+        # the calculation is running that is simply untrue.
+        self._grid.setEmptyText("正在计算混色表…")
+        if not self._build_notice:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            self._build_notice = True
+        QApplication.processEvents()
+
+    def _end_build_notice(self) -> None:
+        self._grid.setEmptyText("还没有混色。请先添加至少两种耗材。")
+        if self._build_notice:
+            self._build_notice = False
+            QApplication.restoreOverrideCursor()
 
     def _on_engine_changed(self, *args) -> None:
         try:

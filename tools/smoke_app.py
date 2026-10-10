@@ -573,6 +573,55 @@ def main() -> int:
     check(len(lone_window._recipes) > 0, "the empty-state message is not what a lone spool gets")
     lone_window.close()
 
+    # --- the launcher defers the first catalogue build ---------------------------
+    # 41 spools is 66,420 recipes and ~3 s; doing that inside __init__ made the
+    # window take 4.4 s to appear.  The real launcher passes defer_build=True.
+    deferred = MainWindow(library=library, defer_build=True)
+    deferred.resize(1200, 800)
+    deferred.show()
+    check(
+        deferred._catalog is None and not deferred._recipes,
+        "a deferred window comes up before the catalogue exists",
+    )
+    check(
+        "正在计算" in deferred._status.text(),
+        f"it says what it is doing, got {deferred._status.text()!r}",
+    )
+    check(
+        deferred._build_notice and app.overrideCursor() is not None,
+        "a deferred build shows a wait cursor",
+    )
+    check(
+        deferred._grid._empty_text == "正在计算混色表…",
+        f"the grid stops blaming the library mid-build, got "
+        f"{deferred._grid._empty_text!r}",
+    )
+    app.processEvents()
+    check(
+        deferred._catalog is None,
+        "the build waits for the window to paint, it is not on a zero timer",
+    )
+    deadline = time.perf_counter() + 30.0
+    while deferred._catalog is None and time.perf_counter() < deadline:
+        app.processEvents()
+        time.sleep(0.01)
+    check(
+        deferred._catalog is not None and deferred._catalog.recipe_count == 810,
+        f"the delayed build fills the catalogue, got "
+        f"{None if deferred._catalog is None else deferred._catalog.recipe_count}",
+    )
+    check(len(deferred._recipes) == 810, "and the grid fills in")
+    check(not deferred._build_notice, "the wait cursor is taken back down")
+    check(app.overrideCursor() is None, "no override cursor is left behind")
+    check(
+        deferred._grid._empty_text == "还没有混色。请先添加至少两种耗材。",
+        "the grid's own empty state comes back after the build",
+    )
+    check("正在计算" not in deferred._status.text(), "the notice is replaced by the real status")
+    # The synchronous default still holds for every test and headless tool.
+    check(not window._defer_build, "an ordinary window builds straight away")
+    deferred.close()
+
     # --- an unnamed spool must not print its hex twice --------------------------
     unnamed = FilamentLibrary([Filament(color_hex="#000000")])
     unnamed_window = MainWindow(library=unnamed)

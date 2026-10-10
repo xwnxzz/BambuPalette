@@ -120,6 +120,7 @@ class MixGrid(QAbstractScrollArea):
         self._selected = -1
         self._grouped = True
         self._hover = -1
+        self._empty_text = "还没有混色。请先添加至少两种耗材。"
 
         self.setFrameShape(QAbstractScrollArea.Shape.NoFrame)
         self.setBackgroundRole(self.backgroundRole())
@@ -132,6 +133,17 @@ class MixGrid(QAbstractScrollArea):
         self.setPalette(palette)
 
     # -- content -----------------------------------------------------------------
+    def setEmptyText(self, text: str) -> None:
+        """What the grid says when it has nothing to draw.
+
+        The default blames the library; during the startup catalogue build the
+        truthful message is that the calculation is still running.
+        """
+        text = str(text)
+        if text != self._empty_text:
+            self._empty_text = text
+            self.viewport().update()
+
     def setRecipes(self, recipes, grouped: bool = True) -> None:
         self._recipes = list(recipes)
         self._grouped = grouped
@@ -240,7 +252,7 @@ class MixGrid(QAbstractScrollArea):
             painter.drawText(
                 self.viewport().rect(),
                 Qt.AlignmentFlag.AlignCenter,
-                "还没有混色。请先添加至少两种耗材。",
+                self._empty_text,
             )
             painter.end()
             return
