@@ -26,6 +26,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from app.core.engines import ENGINE_BAMBU  # noqa: E402
 from app.core.image_matching import (  # noqa: E402
     MatchSettings,
+    _fold_clusters,
     _merge_indistinguishable,
     _merge_similar_colours,
     build_palette,
@@ -315,10 +316,29 @@ class IndistinguishableColourTests(unittest.TestCase):
 
     def test_switching_the_merge_off_brings_the_speckle_back(self):
         # Proves the merge is what fixes it, rather than the picture being easy.
-        settings = MatchSettings(max_colours=12, merge_delta_e=0.0)
+        # Smoothing is switched off too, because averaging the texture away is
+        # the *other* defence against speckle and would hide this one.
+        settings = MatchSettings(max_colours=12, merge_delta_e=0.0, smooth_radius=0)
         result = match_image(self._noisy_flat(), self.palette, settings)
         transitions = int(np.count_nonzero(result.indices[32][1:] != result.indices[32][:-1]))
         self.assertGreater(transitions, 2)
+
+    def test_smoothing_alone_already_calms_the_speckle(self):
+        settings = MatchSettings(max_colours=12, merge_delta_e=0.0, smooth_radius=2)
+        result = match_image(self._noisy_flat(), self.palette, settings)
+        transitions = int(np.count_nonzero(result.indices[32][1:] != result.indices[32][:-1]))
+        self.assertLessEqual(transitions, 2, f"the region is speckled: {transitions} changes")
+
+    def test_smoothing_cannot_push_a_pixel_outside_the_picture(self):
+        # The mean filter must not average the transparent surround in, and it
+        # must leave the mask intact.
+        image = self._noisy_flat(size=32)
+        mask = np.zeros((32, 32), dtype=bool)
+        mask[8:24, 8:24] = True
+        colours, classes = reduce_colours(image, MatchSettings(smooth_radius=3), mask)
+        self.assertTrue((classes[mask] >= 0).all())
+        self.assertTrue((classes[~mask] == -1).all())
+        self.assertGreater(len(colours), 0)
 
     def test_source_clusters_closer_than_the_threshold_are_folded(self):
         colours = np.array([[250, 212, 181], [250, 212, 183], [10, 10, 10]], dtype=np.uint8)
@@ -408,6 +428,187 @@ class RecipeTextTests(unittest.TestCase):
         text = entry_recipe_text(mix, None)
         self.assertIn("配方", text)
         self.assertIn("%", text)
+
+
+class LargePaletteTests(unittest.TestCase):
+    """A palette far bigger than one picture ever uses.
+
+    The bundled 大简 PETG HF preset is 41 spools, which is 41 + C(41,2)×81 =
+    66,461 palette entries.  The per-pixel class map used to be ``int16``, so
+    any index past 32,767 wrapped negative — and negative means "transparent"
+    everywhere downstream, so those colours were silently deleted and a
+    five-colour pig came out with two.  These tests pin the dtype to the
+    palette, not to the number of colours a picture happens to need.
+    """
+
+    @staticmethod
+    def _wide_library(count: int = 30) -> FilamentLibrary:
+        # Spread the spools over the cube so the mixes fill a wide gamut.
+        filaments = []
+        for index in range(count):
+            step = index / max(count - 1, 1)
+            filaments.append(
+                Filament(
+                    name=f"P{index}",
+                    brand="测试",
+                    material_type="PETG HF",
+                    color_hex="#%02X%02X%02X"
+                    % (
+                        int(round(255 * step)),
+                        int(round(255 * abs(1.0 - 2.0 * step))),
+                        int(round(255 * (1.0 - step))),
+                    ),
+                )
+            )
+        return FilamentLibrary(filaments)
+
+    def test_the_palette_is_bigger_than_the_int16_range(self):
+        library = self._wide_library()
+        catalog = MixCatalog(library.filaments, engine=ENGINE_BAMBU).build()
+        palette = build_palette(library, catalog)
+        self.assertGreater(len(palette), np.iinfo(np.int16).max)
+
+    def test_no_matched_colour_is_lost_past_index_32767(self):
+        library = self._wide_library()
+        catalog = MixCatalog(library.filaments, engine=ENGINE_BAMBU).build()
+        palette = build_palette(library, catalog)
+
+        # Five solid bands.  Run them through the picture-matching path, then
+        # check every band still owns at least one pixel: a wrapped index reads
+        # as transparent and the band would come back empty.
+        bands = [(250, 212, 181), (222, 76, 96), (60, 50, 45), (240, 236, 226), (120, 170, 200)]
+        size = 40
+        row = np.zeros((size, size, 3), dtype=np.uint8)
+        for index, colour in enumerate(bands):
+            row[index * (size // len(bands)) : (index + 1) * (size // len(bands)), :] = colour
+        image = Image.fromarray(row, "RGB").convert("RGBA")
+
+        result = match_image(image, palette, MatchSettings(max_colours=8, smooth_radius=0))
+        self.assertEqual(int(np.count_nonzero(result.indices < 0)), 0)
+        self.assertLess(int(result.indices.max()), len(result.palette))
+        self.assertEqual(int(result.counts.sum()), size * size)
+        for colour in bands:
+            key = "".join(f"{value:02X}" for value in colour)
+            index = next(
+                (i for i, entry in enumerate(result.palette) if entry.color_hex.endswith(key)),
+                None,
+            )
+            if index is None:
+                continue  # the matcher is allowed to pick a mix instead
+            self.assertGreater(int(result.counts[index]), 0, colour)
+
+
+class SmallDistinctRegionTests(unittest.TestCase):
+    """A tiny distinct region must survive a big flat field.
+
+    Median cut splits the box with the most pixels, so a flat body with a few
+    units of texture eats the whole colour budget and the eyes come back light
+    grey — the user's 「颜色识别错误，不止两个颜色」.
+    """
+
+    def test_a_small_dark_patch_survives_a_big_flat_field(self):
+        # A behavioural guard for the user's «不止两个颜色» complaint: a region
+        # covering 1 % of the picture must still reach the palette.
+        library = _library()
+        catalog = MixCatalog(library.filaments, engine=ENGINE_BAMBU).build()
+        palette = build_palette(library, catalog)
+
+        rng = np.random.default_rng(20261009)
+        shades = np.array([(250, 212, 181), (249, 210, 179), (251, 213, 182), (248, 209, 178),
+                           (250, 211, 180), (252, 214, 183), (247, 208, 177), (249, 212, 181),
+                           (251, 211, 179), (248, 212, 182), (250, 213, 180), (249, 209, 178)],
+                          dtype=np.int16)
+        field = np.empty((200, 200, 3), dtype=np.int16)
+        for row_index, row_block in enumerate(np.array_split(np.arange(200), len(shades))):
+            field[row_block, :, :] = shades[row_index]
+        field += rng.integers(-1, 2, size=field.shape, dtype=np.int16)
+        field[90:110, 90:110] = (60, 50, 45)  # 400 px out of 40,000 = 1 %
+        image = Image.fromarray(np.clip(field, 0, 255).astype(np.uint8), "RGB").convert("RGBA")
+
+        result = match_image(image, palette, MatchSettings(max_colours=6, smooth_radius=0))
+        self.assertLessEqual(len(result.palette), 6)
+
+        darkest = min(entry.rgb for entry in result.palette)
+        self.assertLess(
+            max(darkest),
+            140,
+            f"the dark patch was folded away: {[e.color_hex for e in result.palette]}",
+        )
+        # And it must actually own pixels, not just sit in the kept list.
+        index = result.palette.index(next(e for e in result.palette if e.rgb == darkest))
+        self.assertGreater(int(result.counts[index]), 100)
+
+    def test_a_flat_field_is_not_shredded_into_shades(self):
+        rng = np.random.default_rng(7)
+        field = np.full((120, 120, 3), (233, 196, 168), dtype=np.int16)
+        field += rng.integers(-2, 3, size=field.shape, dtype=np.int16)
+        image = Image.fromarray(np.clip(field, 0, 255).astype(np.uint8), "RGB").convert("RGBA")
+
+        library = _library()
+        palette = build_palette(library, MixCatalog(library.filaments, engine=ENGINE_BAMBU).build())
+        result = match_image(image, palette, MatchSettings(max_colours=8))
+        self.assertLessEqual(len(result.palette), 3)
+
+
+class ClusterFoldingTests(unittest.TestCase):
+    """``_fold_clusters`` must not chain.
+
+    A union-find over "everything within the threshold" collapses a smooth
+    gradient to one colour, because every cluster is within the threshold of
+    its neighbour.  A leader pass only ever compares a cluster to the leaders,
+    so the ends of a ramp stay apart while a flat fill still folds to one.
+    """
+
+    @staticmethod
+    def _fold(labs, limit=8, threshold=2.0):
+        colours = np.array([_color.rgb_from_lab(lab) for lab in labs], dtype=np.int64)
+        classes = np.repeat(np.arange(len(labs), dtype=np.int64), 10)
+        classes = np.repeat(classes.reshape(1, -1), 10, axis=0)
+        return _fold_clusters(colours, classes, limit, threshold)
+
+    def test_a_chain_of_close_colours_does_not_collapse_to_one(self):
+        labs = [[50.0, 0.0, 0.0], [51.5, 0.0, 0.0], [53.0, 0.0, 0.0], [54.5, 0.0, 0.0]]
+        for near, far in zip(labs, labs[1:]):
+            self.assertLess(_color.delta_e_2000(near, far), 2.0)
+        self.assertGreaterEqual(_color.delta_e_2000(labs[0], labs[-1]), 2.0)
+
+        colours, classes = self._fold(labs)
+        # Union-find would give 1 here; the leader pass gives 50 and 53.
+        self.assertEqual(len(colours), 2)
+        self.assertEqual(sorted(set(int(v) for v in np.unique(classes))), [0, 1])
+
+    def test_colours_all_within_the_threshold_still_fold_to_one(self):
+        # 8-bit rounding of ``rgb_from_lab`` moves ΔE00 by a few hundredths, so
+        # the spread stays well inside the threshold rather than on its edge.
+        labs = [[50.0, 0.0, 0.0], [50.4, 0.0, 0.0], [50.8, 0.0, 0.0], [51.2, 0.0, 0.0]]
+        for lab in labs[1:]:
+            self.assertLess(_color.delta_e_2000(labs[0], lab), 2.0)
+        colours, classes = self._fold(labs)
+        self.assertEqual(len(colours), 1)
+        self.assertEqual(set(int(v) for v in np.unique(classes)), {0})
+
+    def test_the_budget_caps_the_number_of_leaders(self):
+        labs = [[float(20 + 12 * index), 0.0, 0.0] for index in range(8)]
+        colours, _ = self._fold(labs, limit=3)
+        self.assertEqual(len(colours), 3)
+        # The largest-first walk makes the first cluster a leader, so colour 0
+        # is always kept; nothing here is size-weighted, they are all equal.
+        self.assertEqual(len(self._fold(labs, limit=1)[0]), 1)
+
+    def test_a_single_cluster_is_returned_untouched(self):
+        colours = np.array([[10, 20, 30]], dtype=np.int64)
+        classes = np.zeros((4, 4), dtype=np.int64)
+        out_colours, out_classes = _fold_clusters(colours, classes, 8, 2.0)
+        self.assertEqual(len(out_colours), 1)
+        self.assertEqual(int(out_colours[0][0]), 10)
+        self.assertEqual(int(out_classes[0, 0]), 0)
+
+    def test_transparent_pixels_stay_transparent(self):
+        labs = [[40.0, 0.0, 0.0], [80.0, 0.0, 0.0]]
+        colours = np.array([_color.rgb_from_lab(lab) for lab in labs], dtype=np.int64)
+        classes = np.array([[0, 1, -1, -1], [0, 1, -1, -1]], dtype=np.int64)
+        _, out_classes = _fold_clusters(colours, classes, 8, 2.0)
+        self.assertEqual(list(out_classes[0]), [0, 1, -1, -1])
 
 
 if __name__ == "__main__":

@@ -38,6 +38,14 @@ ProgressFn = Callable[[str, float], None]
 #: CIEDE2000 is far too slow to evaluate against a palette of tens of thousands.
 _SHORTLIST = 24
 
+#: Dtype of the per-pixel palette index.  It must be wide enough for the WHOLE
+#: palette, not just for the colours a picture happens to use: a 41-spool
+#: library already has 66,461 entries, so an ``int16`` index silently wraps
+#: past 32,767 into a negative number — which reads as "transparent" and quietly
+#: deletes that colour from the plate.  That is how a seven-colour pig came out
+#: with two colours.
+_INDEX_DTYPE = np.int32
+
 
 def _report(progress: ProgressFn | None, message: str, fraction: float) -> None:
     if progress is not None:
@@ -181,6 +189,14 @@ class MatchSettings:
     # region, the plate comes out speckled, and a filament change is spent on a
     # difference nobody can see.
     merge_delta_e: float = 2.0
+    # Radius of the mean filter applied before the colour count is reduced.
+    # Generated illustrations carry a few units of paper texture over their
+    # flat fills; a quantiser fed that noise spends nearly every colour slot on
+    # ten shades of the same beige and drops the small dark details — on the
+    # bundled pig the eyes and the brown hair simply vanished.  Averaging the
+    # texture away first leaves the slots for colours that are actually
+    # different.  0 turns it off.
+    smooth_radius: int = 2
 
     def clamped(self) -> "MatchSettings":
         # Imported here rather than at module level: ``app.mesh.plate`` imports
@@ -193,6 +209,7 @@ class MatchSettings:
             max_dimension=max(32, min(4096, int(self.max_dimension))),
             alpha_threshold=max(0, min(255, int(self.alpha_threshold))),
             merge_delta_e=max(0.0, min(10.0, float(self.merge_delta_e))),
+            smooth_radius=max(0, min(8, int(self.smooth_radius))),
         )
 
 
@@ -203,7 +220,7 @@ class MatchResult:
     width: int
     height: int
     palette: list[PaletteEntry]
-    indices: np.ndarray  # (H, W) int16, -1 where transparent
+    indices: np.ndarray  # (H, W) int32, -1 where transparent
     counts: np.ndarray  # (len(palette),) pixel counts, largest first
     settings: MatchSettings
     source: str = ""
@@ -276,39 +293,199 @@ def _unpack(key: int) -> tuple[int, int, int]:
     return ((key >> 16) & 0xFF, (key >> 8) & 0xFF, key & 0xFF)
 
 
+#: How many clusters to ask the quantiser for per colour the user requested.
+#: See ``reduce_colours`` for why overshooting and folding back is better than
+#: asking for the final number directly.
+_OVERSAMPLE = 6
+
+
+def _box_sum(values: np.ndarray, radius: int) -> np.ndarray:
+    """Sum over the ``(2 * radius + 1)²`` window around every pixel.
+
+    An integral image makes this independent of the radius; the window is
+    clipped at the borders rather than zero-padded so edges do not darken.
+    """
+    height, width = values.shape[:2]
+    integral = np.zeros((height + 1, width + 1) + values.shape[2:], dtype=np.float64)
+    integral[1:, 1:] = values
+    np.cumsum(integral, axis=0, out=integral)
+    np.cumsum(integral, axis=1, out=integral)
+
+    rows = np.arange(height)
+    columns = np.arange(width)
+    top = np.maximum(rows - radius, 0)
+    bottom = np.minimum(rows + radius + 1, height)
+    left = np.maximum(columns - radius, 0)
+    right = np.minimum(columns + radius + 1, width)
+    top_grid, left_grid = np.meshgrid(top, left, indexing="ij")
+    bottom_grid, right_grid = np.meshgrid(bottom, right, indexing="ij")
+    return (
+        integral[bottom_grid, right_grid]
+        - integral[top_grid, right_grid]
+        - integral[bottom_grid, left_grid]
+        + integral[top_grid, left_grid]
+    )
+
+
+def _smooth_colours(rgb: np.ndarray, keep: np.ndarray | None, radius: int) -> np.ndarray:
+    """Mean filter that only ever averages pixels the caller cares about."""
+    if radius <= 0:
+        return rgb.astype(np.float64)
+    weight = np.ones(rgb.shape[:2], dtype=np.float64)
+    if keep is not None:
+        weight = keep.astype(np.float64)
+    total = _box_sum(rgb.astype(np.float64) * weight[:, :, None], radius)
+    divisor = _box_sum(weight, radius)
+    return total / np.maximum(divisor, 1.0)[:, :, None]
+
+
+def _class_means(rgb: np.ndarray, classes: np.ndarray, count: int) -> np.ndarray:
+    """Mean of the ORIGINAL pixels behind every class.
+
+    The classes come from a smoothed image, so their own values are blurred;
+    reporting the untouched pixels instead keeps the swatch and the ΔE00 the
+    user judges against honest.
+    """
+    flat = classes.reshape(-1)
+    pixels = rgb.reshape(-1, 3).astype(np.float64)
+    valid = flat >= 0
+    totals = np.zeros((count, 3), dtype=np.float64)
+    np.add.at(totals, flat[valid], pixels[valid])
+    counts = np.bincount(flat[valid], minlength=count).astype(np.float64)
+    return np.rint(totals / np.maximum(counts, 1.0)[:, None]).astype(np.int64)
+
+
 def reduce_colours(
-    image: Image.Image, settings: MatchSettings
+    image: Image.Image, settings: MatchSettings, mask: np.ndarray | None = None
 ) -> tuple[np.ndarray, np.ndarray]:
     """Reduce a picture to at most ``max_colours`` classes.
 
     Returns ``(colours, classes)`` where ``colours`` is ``(N, 3)`` int64 and
-    ``classes`` is the ``(H, W)`` int64 class map.  Both branches are fully
-    vectorised, so a 512×512 picture costs a few milliseconds.
+    ``classes`` is the ``(H, W)`` int64 class map (``-1`` outside ``mask``).
+
+    ``mask`` matters more than it looks.  ``image.convert("RGB")`` turns a
+    transparent background into solid BLACK, and on an illustration that
+    background is usually most of the picture — on the bundled pig it is
+    138,095 of 262,144 pixels.  A quantiser handed that image spends its whole
+    colour budget on black and on the anti-aliased fringe where the artwork
+    meets it, and real colours disappear into the black cluster.
     """
     rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
-    keys = _pack(rgb)
-    unique_keys, inverse = np.unique(keys.reshape(-1), return_inverse=True)
-    classes = inverse.reshape(rgb.shape[:2]).astype(np.int64)
 
+    keep: np.ndarray | None = None
+    if mask is not None:
+        keep = np.asarray(mask, dtype=bool)
+        if keep.shape != rgb.shape[:2] or not keep.any() or keep.all():
+            keep = None
+
+    smoothed = _smooth_colours(rgb, keep, settings.smooth_radius)
+    if keep is not None:
+        # Compact the opaque pixels into a one-row strip so the quantiser sees
+        # the artwork and nothing else.  Median cut works from the colour
+        # histogram, so the arrangement is irrelevant to the result.
+        source = Image.fromarray(
+            np.clip(np.rint(smoothed[keep]), 0, 255).astype(np.uint8).reshape(1, -1, 3), "RGB"
+        )
+        keys = _pack(rgb[keep])
+    else:
+        source = Image.fromarray(np.clip(np.rint(smoothed), 0, 255).astype(np.uint8), "RGB")
+        keys = _pack(rgb)
+
+    unique_keys, inverse = np.unique(keys, return_inverse=True)
     if unique_keys.size <= settings.max_colours:
         colours = np.array([_unpack(int(key)) for key in unique_keys], dtype=np.int64)
+        if keep is None:
+            return colours, inverse.reshape(rgb.shape[:2]).astype(np.int64)
+        classes = np.full(rgb.shape[:2], -1, dtype=np.int64)
+        classes[keep] = inverse
         return colours, classes
 
-    quantized = image.convert("RGB").quantize(
-        colors=settings.max_colours,
+    # Ask for more clusters than the user did, then collapse the ones a person
+    # cannot tell apart.  Median cut splits whichever box holds the most
+    # pixels, so on a big flat fill it happily spends every slot on a dozen
+    # shades of the same beige and never reaches the 1,700 dark pixels that are
+    # the eyes — the picture came out with no dark colour at all.  Overshooting
+    # and folding afterwards gives the small distinct colours a cluster to
+    # themselves while the near-identical ones still collapse to one.
+    budget = min(256, max(settings.max_colours, settings.max_colours * _OVERSAMPLE))
+    dither = Image.Dither.NONE
+    if keep is None and settings.dither:
+        dither = Image.Dither.FLOYDSTEINBERG
+    # The compacted strip has no meaningful neighbour relationship, so error
+    # diffusion there would scatter noise instead of smoothing gradients.
+    quantized = source.quantize(
+        colors=budget,
         method=Image.Quantize.MEDIANCUT,
-        dither=Image.Dither.FLOYDSTEINBERG if settings.dither else Image.Dither.NONE,
+        dither=dither,
     )
-    palette = quantized.getpalette() or []
-    classes = np.asarray(quantized, dtype=np.int64)
-    used = np.unique(classes)
-    colours = np.array(
-        [[palette[i * 3], palette[i * 3 + 1], palette[i * 3 + 2]] for i in used],
-        dtype=np.int64,
-    )
-    lookup = np.zeros(int(classes.max()) + 1, dtype=np.int64)
+    class_map = np.asarray(quantized, dtype=np.int64)
+    if keep is None:
+        classes = class_map
+        region = classes
+    else:
+        classes = np.full(rgb.shape[:2], -1, dtype=np.int64)
+        classes[keep] = class_map.reshape(-1)
+        region = classes
+    used = np.unique(region[region >= 0])
+    lookup = np.full(int(region.max()) + 1, -1, dtype=np.int64)
     lookup[used] = np.arange(len(used))
-    return colours, lookup[classes]
+    classes = np.where(region >= 0, lookup[np.clip(region, 0, None)], -1)
+    colours = _class_means(rgb, classes, len(used))
+    return _fold_clusters(colours, classes, settings.max_colours, settings.merge_delta_e)
+
+
+def _class_counts(classes: np.ndarray, count: int) -> np.ndarray:
+    """Pixels per class, ignoring the ``-1`` that marks the transparent surround."""
+    flat = classes.reshape(-1)
+    flat = flat[flat >= 0]
+    return np.bincount(flat, minlength=count).astype(np.int64)
+
+
+def _fold_clusters(
+    colours: np.ndarray, classes: np.ndarray, limit: int, threshold: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fold the oversampled clusters down to at most ``limit`` of them.
+
+    A plain union-find over "everything within ``threshold``" is not usable
+    here.  On a smooth gradient every cluster is within ``threshold`` of its
+    neighbour, so the union chains across the whole ramp and a 金→红 gradient
+    collapses to a single colour — measured, and it is why this is a leader
+    pass instead: a cluster is only ever compared against the leaders, never
+    against its neighbour, so a ramp keeps several representatives while a flat
+    fill's near-identical shades still fold onto the first one.
+
+    Clusters are visited largest first, so the leaders are the colours the
+    picture actually uses; once ``limit`` leaders exist every later cluster
+    joins its nearest one, which is what keeps a small-but-distinct region (the
+    eyes) ahead of yet another shade of the background.
+    """
+    if len(colours) <= 1:
+        return colours, classes
+
+    lab = _color.lab_from_rgb(colours)
+    counts = _class_counts(classes, len(colours))
+    order = [int(index) for index in np.argsort(-counts, kind="stable")]
+
+    leaders: list[int] = []
+    for index in order:
+        if len(leaders) >= limit:
+            break
+        if all(_color.delta_e_2000(lab[index], lab[leader]) >= threshold for leader in leaders):
+            leaders.append(index)
+    if not leaders:  # threshold <= 0 and limit <= 0 would land here
+        leaders = [order[0]]
+
+    survivors = sorted(leaders)
+    lookup = np.empty(len(colours), dtype=np.int64)
+    for index in range(len(colours)):
+        lookup[index] = min(
+            range(len(survivors)),
+            key=lambda position: _color.delta_e_2000(lab[index], lab[survivors[position]]),
+        )
+    return (
+        colours[survivors],
+        np.where(classes >= 0, lookup[np.clip(classes, 0, None)], -1),
+    )
 
 
 def load_image(source: str | Path | Image.Image) -> Image.Image:
@@ -356,7 +533,12 @@ def _merge_similar_colours(
     if not merged:
         return colours, classes
 
-    counts = np.bincount(np.clip(classes, 0, None).reshape(-1), minlength=len(colours))
+    # ``-1`` marks a pixel outside the opacity mask.  Clipping it to 0 would
+    # credit every transparent pixel to the first colour and could make the
+    # wrong shade the survivor of a merge.
+    flat = classes.reshape(-1)
+    flat = flat[flat >= 0]
+    counts = np.bincount(flat, minlength=len(colours))
     groups: dict[int, list[int]] = {}
     for index in range(len(colours)):
         groups.setdefault(find(index), []).append(index)
@@ -368,7 +550,11 @@ def _merge_similar_colours(
     for new_index, survivor in enumerate(survivors):
         for member in groups[find(survivor)]:
             remap[member] = new_index
-    return colours[survivors], remap[np.clip(classes, 0, None)]
+    # ``remap[-1]`` would silently dress the transparent pixels up as a real
+    # class, so the mask has to survive the fold.
+    return colours[survivors], np.where(
+        classes >= 0, remap[np.clip(classes, 0, None)], -1
+    )
 
 
 def _merge_indistinguishable(
@@ -417,18 +603,18 @@ def _merge_indistinguishable(
         max(members, key=lambda member: (int(counts[member]), -member))
         for members in groups.values()
     )
-    remap = np.full(len(kept), -1, dtype=np.int16)
+    remap = np.full(len(kept), -1, dtype=_INDEX_DTYPE)
     for new_index, survivor in enumerate(survivors):
         for member in groups[find(survivor)]:
             remap[member] = new_index
-    folded = np.where(indices >= 0, remap[np.clip(indices, 0, None)], -1).astype(np.int16)
+    folded = np.where(indices >= 0, remap[np.clip(indices, 0, None)], -1).astype(_INDEX_DTYPE)
 
     folded_counts = np.array(
         [int(np.count_nonzero(folded == index)) for index in range(len(survivors))],
         dtype=np.int64,
     )
     order = np.argsort(-folded_counts, kind="stable")
-    final = np.where(folded >= 0, np.argsort(order)[np.clip(folded, 0, None)], -1).astype(np.int16)
+    final = np.where(folded >= 0, np.argsort(order)[np.clip(folded, 0, None)], -1).astype(_INDEX_DTYPE)
     return (
         [kept[survivors[int(position)]] for position in order],
         folded_counts[order],
@@ -464,7 +650,7 @@ def match_image(
         mask = np.ones(alpha.shape, dtype=bool)
 
     _report(progress, "减少图片颜色数量", 0.30)
-    colours, classes = reduce_colours(image, config)
+    colours, classes = reduce_colours(image, config, mask)
     colours, classes = _merge_similar_colours(colours, classes, config.merge_delta_e)
 
     _report(progress, "在耗材与混色库里寻找最接近的颜色", 0.55)
@@ -472,17 +658,17 @@ def match_image(
     chosen = _nearest_entries(labs, palette)
 
     _report(progress, "按像素分配颜色", 0.80)
-    indices = np.where(mask, chosen[classes], -1).astype(np.int16)
+    indices = np.where(mask, chosen[classes], -1).astype(_INDEX_DTYPE)
 
     # Drop palette entries the picture never used, then renumber largest first.
     used = sorted(int(value) for value in np.unique(indices) if value >= 0)
     counts = np.array([int(np.count_nonzero(indices == value)) for value in used], dtype=np.int64)
     order = np.argsort(-counts, kind="stable")
     kept = [list(palette)[used[int(position)]] for position in order]
-    remap = np.full(len(palette), -1, dtype=np.int16)
+    remap = np.full(len(palette), -1, dtype=_INDEX_DTYPE)
     for new_index, position in enumerate(order):
         remap[used[int(position)]] = new_index
-    final = np.where(indices >= 0, remap[np.clip(indices, 0, None)], -1).astype(np.int16)
+    final = np.where(indices >= 0, remap[np.clip(indices, 0, None)], -1).astype(_INDEX_DTYPE)
 
     # The picture's own average colour per region, so the UI can show
     # 「图片 #xxxxxx → 匹配 #yyyyyy」 and the user can judge the match.
