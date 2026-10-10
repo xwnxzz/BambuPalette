@@ -140,7 +140,7 @@ class MixDetail(QWidget):
         rows_box = QVBoxLayout()
         rows_box.setContentsMargins(0, 0, 0, 0)
         rows_box.setSpacing(8)
-        for slot in (1, 2):
+        for slot in (1, 2, 3):
             swatch = SwatchLabel("#FFFFFF", size=34, caption=False, parent=self)
             badge = QLabel(f"耗材丝{slot}", self)
             badge.setProperty("role", "hint")
@@ -328,16 +328,10 @@ class MixDetail(QWidget):
         for row, recipe in zip(self._formula_rows, shown):
             row["frame"].setVisible(True)
             row["swatch"].setValue(recipe.color_hex)
-            name_a = _short(self._library.get(recipe.a_id))
-            name_b = _short(self._library.get(recipe.b_id))
-            row["text"].setText(
-                f"{name_a} {recipe.percent_a}%  +  {name_b} {recipe.percent_b}%"
-            )
+            line = _recipe_line(self._library, recipe)
+            row["text"].setText(line)
             row["key"].setText(recipe.key)
-            row["frame"].setToolTip(
-                f"{name_a} {recipe.percent_a}%  +  {name_b} {recipe.percent_b}%\n"
-                f"{recipe.color_hex}"
-            )
+            row["frame"].setToolTip(f"{line}\n{recipe.color_hex}")
         for row in self._formula_rows[len(shown):]:
             row["frame"].setVisible(False)
 
@@ -385,24 +379,28 @@ class MixDetail(QWidget):
         self._colour = None
         self._filament = None
         self._empty.setVisible(False)
-        filament_a = self._library.get(recipe.a_id)
-        filament_b = self._library.get(recipe.b_id)
-        hex_a = filament_a.color_hex if filament_a else "?"
-        hex_b = filament_b.color_hex if filament_b else "?"
+        # Two- and three-filament recipes both arrive here: read the parents off
+        # the recipe instead of assuming a pair.
+        parent_ids = tuple(getattr(recipe, "parent_ids", ()) or (recipe.a_id, recipe.b_id))
+        percents = tuple(getattr(recipe, "percents", ()) or (recipe.percent_a, recipe.percent_b))
+        parents = [self._library.get(filament_id) for filament_id in parent_ids]
+        hexes = [filament.color_hex if filament else "?" for filament in parents]
 
         self._preview.setValue(recipe.color_hex)
         self._preview.setVisible(True)
         self._hex.setText(f"预测颜色 {recipe.color_hex}   RGB {recipe.rgb[0]}, {recipe.rgb[1]}, {recipe.rgb[2]}")
         self._hex.setVisible(True)
-        self._ratio.setText(f"{recipe.percent_a}% + {recipe.percent_b}%")
+        self._ratio.setText(" + ".join(f"{percent}%" for percent in percents))
         self._ratio.setVisible(True)
         self._engine_label.setText(f"混色模型：{self._engine.name}")
         self._engine_label.setVisible(True)
 
-        for row, filament, percent, slot in (
-            (self._rows[0], filament_a, recipe.percent_a, 1),
-            (self._rows[1], filament_b, recipe.percent_b, 2),
-        ):
+        for index, row in enumerate(self._rows):
+            if index >= len(parents):
+                row["frame"].setVisible(False)
+                continue
+            filament = parents[index]
+            percent = percents[index]
             row["frame"].setVisible(True)
             if filament is None:
                 row["swatch"].setValue("#FFFFFF")
@@ -420,20 +418,28 @@ class MixDetail(QWidget):
                 + (f"\n备注：{filament.note}" if filament.note else "")
             )
 
-        self._bar.setVisible(True)
-        self._bar.setPair(hex_a, hex_b, recipe.percent_a, self._engine)
-        self._pair_button.setVisible(True)
+        # The 0→100 % bar only means something for a pair of spools.
+        three = len(parents) > 2
+        self._bar.setVisible(not three)
+        if not three:
+            self._bar.setPair(hexes[0], hexes[1], percents[0], self._engine)
+        self._pair_button.setVisible(not three)
 
-        self._steps.setVisible(True)
-        self._steps.setText(
-            "在 Bambu Studio 里这样复现：\n"
-            f"  1. 打开「添加混色耗材」（Add Mixed Filament）\n"
-            f"  2. 耗材丝1 选 {_short(filament_a)}\n"
-            f"  3. 耗材丝2 选 {_short(filament_b)}\n"
-            f"  4. 比例拖到 {recipe.percent_a}% : {recipe.percent_b}%\n"
-            f"  5. 效果预览应显示 {recipe.color_hex}\n"
-            "注意：两种耗材的「耗材种类」必须相同，Bambu Studio 才允许混色。"
+        steps = [
+            "在 Bambu Studio 里这样复现：",
+            "  1. 打开「添加混色耗材」（Add Mixed Filament）",
+        ]
+        for slot, filament in enumerate(parents, start=1):
+            steps.append(f"  {slot + 1}. 耗材丝{slot} 选 {_short(filament)}")
+        steps.append(f"  {len(parents) + 2}. 比例拖到 " + " : ".join(f"{p}%" for p in percents))
+        steps.append(f"  {len(parents) + 3}. 效果预览应显示 {recipe.color_hex}")
+        steps.append(
+            "注意：所有耗材的「耗材种类」必须相同，Bambu Studio 才允许混色。"
+            if three
+            else "注意：两种耗材的「耗材种类」必须相同，Bambu Studio 才允许混色。"
         )
+        self._steps.setVisible(True)
+        self._steps.setText("\n".join(steps))
         self._copy.setEnabled(True)
 
     def showFilament(self, filament) -> None:
@@ -543,6 +549,24 @@ class MixDetail(QWidget):
         from PySide6.QtCore import QTimer
 
         QTimer.singleShot(1200, lambda: self._copy.setText("复制配方"))
+
+
+def _recipe_line(library, recipe) -> str:
+    """「白 30%  +  黑 40%  +  灰 30%」——两色和三色配方都走这里。"""
+    ids = tuple(getattr(recipe, "parent_ids", ()) or (recipe.a_id, recipe.b_id))
+    percents = tuple(getattr(recipe, "percents", ()) or (recipe.percent_a, recipe.percent_b))
+    # 三色配方再带 #RRGGBB 就比面板还宽，会被硬裁掉，所以只在两色时带色号；
+    # 完整文字仍然放在 tooltip 里。
+    with_hex = len(ids) <= 2
+    parts = []
+    for filament_id, percent in zip(ids, percents):
+        filament = library.get(filament_id)
+        if filament is None:
+            name = "（耗材已删除）"
+        else:
+            name = _short(filament) if with_hex else filament.display_name
+        parts.append(f"{name} {percent}%")
+    return "  +  ".join(parts)
 
 
 def _short(filament) -> str:

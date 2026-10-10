@@ -56,6 +56,13 @@ from ..core.mixes import (
     sorted_cells,
 )
 from ..spectral import color as _color
+from ..core.triples import (
+    TripleCatalog,
+    load_triple_cache,
+    mix_sidecar_path,
+    save_triple_cache,
+    triple_cache_key,
+)
 from . import theme
 from .filament_dialog import FilamentDialog
 from .mix_detail import MixDetail
@@ -89,6 +96,11 @@ class MainWindow(QMainWindow):
         # filament id -> the case-folded text the search box matches on; rebuilt
         # whenever the library changes.  See _filament_haystack.
         self._haystacks: dict[str, str] = {}
+        # Three-filament mixing: the built table, the lazy view handed to the
+        # grid, and the QTimer that advances the sliced build.
+        self._triples = None
+        self._triple_view = None
+        self._triple_timer = None
         # The real launcher asks for the first catalogue build to happen after the
         # window is on screen (see _rebuild_catalog).  Tests and the headless tools
         # keep the synchronous default, so nothing has to wait for a timer.
@@ -363,6 +375,25 @@ class MainWindow(QMainWindow):
         )
         self._all_colours.toggled.connect(lambda *_: self._refresh_grid())
 
+        # Three-filament mixes: every (a, b, c) of whole percents with each ≥ 10
+        # and a+b+c = 100, i.e. 2556 ratios per triple.  At 41 spools that is
+        # 27,246,960 recipes, so this is built in slices (the window keeps
+        # painting), written to a cache, and only then shown.
+        self._triples_box = QCheckBox("三色混色")
+        self._triples_box.setToolTip(
+            "把三种耗材混合的颜色也算出来。\n"
+            "每种三卷组合有 2556 个配比（每种至少 10%，合计 100%，按 1% 递增）。\n"
+            "颜色完全相同的配方会合成一个颜色，点开可以看它所有的配方。\n"
+            "第一次算要几分钟，算完会存进缓存，以后打开就很快。"
+        )
+        self._triples_box.toggled.connect(self._on_triples_toggled)
+        header_extra = QWidget()
+        header_row = QHBoxLayout(header_extra)
+        header_row.setContentsMargins(0, 0, 0, 0)
+        header_row.setSpacing(10)
+        header_row.addWidget(self._triples_box)
+        header_row.addWidget(self._all_colours)
+
         # Double-clicking a mix narrows the grid to that one parent pair. That
         # used to be signalled only by a line of small print under the grid, so
         # the panel looked like it had lost every other colour with no way back.
@@ -388,7 +419,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._filter_bar)
         layout.addWidget(self._grid, 1)
         layout.addWidget(self._grid_info)
-        return self._wrap(panel, "全部混色", header_extra=self._all_colours)
+        return self._wrap(panel, "全部混色", header_extra=header_extra)
 
     def _build_menus(self) -> None:
         file_menu = self.menuBar().addMenu("文件(&F)")
@@ -581,7 +612,12 @@ class MainWindow(QMainWindow):
             self.library.add(filament)
             added += 1
         self._reload_library()
-        QMessageBox.information(self, "导入完成", f"已导入 {added} 条耗材。")
+        sidecar = mix_sidecar_path(Path(path))
+        note = ""
+        if sidecar.is_file() and self._catalog is not None:
+            if self._adopt_mix_sidecar(sidecar):
+                note = "\n同时用上了档案里的三色混色缓存，不用重算。"
+        QMessageBox.information(self, "导入完成", f"已导入 {added} 条耗材。{note}")
 
     def _on_export(self) -> None:
         default = paths.default_start_dir() / "filament-library-export.json"
@@ -593,7 +629,61 @@ class MainWindow(QMainWindow):
         except LibraryError as exc:
             QMessageBox.warning(self, "导出失败", str(exc))
             return
-        QMessageBox.information(self, "导出完成", f"已写入\n{path}")
+        note = ""
+        written = self._write_mix_sidecar(Path(path))
+        if written:
+            note = (
+                f"\n并把整套三色混色缓存一起导出到\n{written.name}"
+                f"（{written.stat().st_size / 1024 / 1024:.1f} MB），"
+                "下次导入这套耗材就不用重算了。"
+            )
+        QMessageBox.information(self, "导出完成", f"已写入\n{path}{note}")
+
+    def _write_mix_sidecar(self, path: Path) -> Path | None:
+        """把已经算好的三色混色表放在档案旁边，免得下次再等几分钟。"""
+        catalog = self._triples
+        if catalog is None or not getattr(catalog, "built", False):
+            return None
+        target = mix_sidecar_path(path)
+        try:
+            save_triple_cache(catalog, target)
+        except Exception:  # a cache we cannot write is only a slow next launch
+            return None
+        return target
+
+    def _adopt_mix_sidecar(self, sidecar: Path) -> bool:
+        """档案旁边的混色表只有在确实属于这套耗材时才认。"""
+        try:
+            with np.load(sidecar, allow_pickle=False) as data:
+                stored = str(data["key"].item()) if "key" in data else ""
+                if stored != triple_cache_key(self.library.filaments, self._catalog.engine.id):
+                    return False
+                payload = {name: data[name] for name in data.files if name != "key"}
+        except Exception:
+            return False
+        try:
+            catalog = TripleCatalog.loads(
+                self.library.filaments, payload, self._catalog.engine.id
+            )
+        except Exception:
+            return False
+        if not catalog.built:
+            return False
+        # Wire the checkbox without letting it kick off the build we just skipped.
+        self._triples_box.blockSignals(True)
+        self._triples_box.setChecked(True)
+        self._triples_box.blockSignals(False)
+        self._set_search_enabled(False)
+        self._all_colours.setChecked(False)
+        self._all_colours.setEnabled(False)
+        self._triples = catalog
+        self._triple_view = catalog.colours()
+        try:
+            save_triple_cache(catalog, self._triples_path())
+        except Exception:
+            pass
+        self._refresh_grid()
+        return True
 
     # -- catalogue ---------------------------------------------------------------
     def _rebuild_catalog(self) -> None:
@@ -713,6 +803,115 @@ class MainWindow(QMainWindow):
                     return True
         return False
 
+    # -- three-filament mixes ---------------------------------------------------
+
+    def _triples_path(self):
+        """三色混色缓存在哪：一个耗材库 + 一个引擎一个文件。"""
+        engine_id = self._catalog.engine.id if self._catalog is not None else DEFAULT_ENGINE
+        key = triple_cache_key(self.library.filaments, engine_id)
+        return paths.data_dir() / "cache" / f"triples-{key}.npz"
+
+    def _set_search_enabled(self, enabled: bool) -> None:
+        """三色混色时关掉搜索框：4.3 M 个颜色没法逐个套名字。"""
+        if not hasattr(self, "_search"):
+            return
+        if not enabled and not getattr(self, "_search_tip", None):
+            self._search_tip = self._search.toolTip()
+        self._search.setEnabled(enabled)
+        if enabled:
+            self._search.setToolTip(getattr(self, "_search_tip", ""))
+        else:
+            self._search.setToolTip("三色混色的颜色太多，暂时不能按名称搜索；取消勾选就可以搜两色混色。")
+
+    def _on_triples_toggled(self, checked: bool) -> None:
+        self._set_search_enabled(not checked)
+        # The spool colours cannot be folded into a four-million-cell colour
+        # order without materialising it, so 全部颜色 sits this one out.
+        self._all_colours.setEnabled(not checked)
+        if checked:
+            self._all_colours.setChecked(False)
+        if not checked:
+            self._stop_triple_timer()
+            self._triples = None
+            self._triple_view = None
+            self._end_build_notice()
+            self._refresh_grid()
+            return
+        if self._catalog is None or len(self.library) < 3:
+            self._triples = None
+            self._triple_view = None
+            self._refresh_grid()
+            self._grid_info.setText("三色混色至少需要 3 种耗材。")
+            return
+        cached = load_triple_cache(
+            self._triples_path(), self.library.filaments, self._catalog.engine.id
+        )
+        if cached is not None and cached.colour_count:
+            self._triples = cached
+            self._triple_view = cached.colours()
+            self._refresh_grid()
+            return
+        self._start_triple_build()
+
+    def _start_triple_build(self) -> None:
+        catalog = TripleCatalog(self.library.filaments, engine=self._catalog.engine.id)
+        self._triples = catalog
+        if not catalog.triple_count:
+            self._triple_view = None
+            self._refresh_grid()
+            self._grid_info.setText("三色混色至少需要 3 种耗材。")
+            return
+        self._triple_view = None
+        catalog.begin()
+        self._announce_triples()
+        self._triple_timer = QTimer(self)
+        self._triple_timer.setInterval(0)
+        self._triple_timer.timeout.connect(self._step_triple_build)
+        self._triple_timer.start()
+
+    def _announce_triples(self) -> None:
+        text = f"正在计算三色混色：{self._triples.recipe_total:,} 条配方，请稍候…"
+        self._status.setText(text)
+        self._grid_info.setText(text)
+        self._grid.setEmptyText("正在计算三色混色…")
+        if not self._build_notice:
+            self._build_notice = True
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+
+    def _step_triple_build(self) -> None:
+        catalog = self._triples
+        if catalog is None:
+            self._stop_triple_timer()
+            return
+        finished = catalog.step(0.18)
+        done = catalog.mixed_done
+        total = catalog.recipe_total
+        percent = (done * 100 // total) if total else 100
+        text = f"正在计算三色混色：{done:,} / {total:,}（{percent}%）"
+        self._status.setText(text)
+        self._grid_info.setText(text)
+        if not finished:
+            return
+        self._stop_triple_timer()
+        self._status.setText("正在排序去重…")
+        self._grid_info.setText("正在排序去重…")
+        QApplication.processEvents()
+        catalog.finish()
+        self._triple_view = catalog.colours()
+        try:
+            save_triple_cache(catalog, self._triples_path())
+        except Exception:  # a cache we cannot write is only a slow next launch
+            pass
+        self._end_build_notice()
+        self._refresh_grid()
+
+    def _stop_triple_timer(self) -> None:
+        timer = self._triple_timer
+        if timer is not None:
+            timer.stop()
+            timer.deleteLater()
+            self._triple_timer = None
+
     def _refresh_grid(self) -> None:
         if self._catalog is None:
             return
@@ -722,6 +921,11 @@ class MainWindow(QMainWindow):
             # One pair still has to be merged: its 81 recipes can repeat a colour.
             recipes = self._catalog.pair_recipes(*self._pair_filter)
             cells_source = merge_recipes(recipes)
+            grouped = False
+        elif self._triple_view is not None:
+            # Millions of colours: the order stays a numpy permutation and the
+            # grid only ever materialises the cells it is drawing.
+            cells_source = self._triples.ordered_colours(sort_key)
             grouped = False
         elif self._catalog.recipe_count:
             cells_source = self._catalog.sorted_colours(sort_key)
@@ -743,6 +947,10 @@ class MainWindow(QMainWindow):
             spools = [spool_cell(f) for f in self.library.filaments]
 
         query = self._search.text().strip().lstrip("#").casefold()
+        if self._triple_view is not None:
+            # The search box is disabled while 三色混色 is on, but text left over
+            # from before must not filter a four-million-cell lazy sequence.
+            query = ""
         if query:
             cells_source = [
                 colour for colour in cells_source if self._matches(colour, query)
@@ -791,6 +999,15 @@ class MainWindow(QMainWindow):
         if self._build_seconds:
             parts.append(f"计算用时 {self._build_seconds * 1000:.0f} ms")
         self._status.setText(" · ".join(parts))
+        if self._triple_view is not None and self._triples is not None:
+            self._grid_info.setText(
+                f"三色混色：每三卷 2556 个配比（每种 10%–80%，按 1% 递增）"
+                f" · {self._triples.recipe_count:,} 条配方去重后共 "
+                f"{self._triples.colour_count:,} 个颜色"
+                f" · 已按「{self._sort_combo.currentText()}」排列"
+            )
+            self._update_filter_bar(shown, self._triples.colour_count, count)
+            return
         self._grid_info.setText(
             f"每两种耗材 81 个配比（10%–90%）"
             + (

@@ -25,6 +25,12 @@ INSET = 4.0
 #: Extra vertical space inserted between two parent-pair groups.
 GROUP_GAP = 10
 
+# Above this many cells the grid stops building a list-of-lists layout (one
+# Python int per cell, plus one float per row) and switches to arithmetic rows:
+# the three-filament table can hold millions of colours, which no per-cell
+# Python structure can survive.
+LAZY_LIMIT = 120_000
+
 
 @dataclass(frozen=True)
 class SpoolCell:
@@ -119,6 +125,8 @@ class MixGrid(QAbstractScrollArea):
         self._columns = 1
         self._selected = -1
         self._grouped = True
+        self._flat = False
+        self._row_count = 0
         self._hover = -1
         self._empty_text = "还没有混色。请先添加至少两种耗材。"
 
@@ -145,7 +153,10 @@ class MixGrid(QAbstractScrollArea):
             self.viewport().update()
 
     def setRecipes(self, recipes, grouped: bool = True) -> None:
-        self._recipes = list(recipes)
+        # A small catalogue is copied into a list (callers rely on identity and
+        # on `is` comparisons); a huge one is kept as a lazy sequence and only
+        # touched one cell at a time while painting.
+        self._recipes = list(recipes) if len(recipes) <= LAZY_LIMIT else recipes
         self._grouped = grouped
         self._selected = -1
         self._hover = -1
@@ -182,6 +193,15 @@ class MixGrid(QAbstractScrollArea):
         """Select by identity, then scroll so it is visible."""
         if recipe is None:
             return
+        if self._flat:
+            # Scanning millions of lazy cells would materialise all of them, so
+            # ask the cell for its own position (the triple model knows it).
+            index = self._index_of_lazy(recipe)
+            if index < 0:
+                return
+            self.setSelectedIndex(index)
+            self.recipeSelected.emit(self._recipes[index])
+            return
         for index, candidate in enumerate(self._recipes):
             if candidate is recipe or candidate.key == recipe.key:
                 self.setSelectedIndex(index)
@@ -189,10 +209,20 @@ class MixGrid(QAbstractScrollArea):
                 return
 
     def indexOfKey(self, key: str) -> int:
+        if self._flat:
+            finder = getattr(self._recipes, "index_of_key", None)
+            if finder is not None:
+                return int(finder(key))
         for index, candidate in enumerate(self._recipes):
             if candidate.key == key:
                 return index
         return -1
+
+    def _index_of_lazy(self, recipe) -> int:
+        index = getattr(recipe, "index", -1)
+        if isinstance(index, int) and 0 <= index < len(self._recipes):
+            return index
+        return self.indexOfKey(getattr(recipe, "key", ""))
 
     # -- layout ------------------------------------------------------------------
     def _relayout(self) -> None:
@@ -200,6 +230,20 @@ class MixGrid(QAbstractScrollArea):
         columns = max(1, width // CELL)
         self._columns = columns
 
+        count = len(self._recipes)
+        # Grouping needs to know where one pair ends and the next begins, which
+        # means touching every cell.  Past LAZY_LIMIT we drop the group gaps and
+        # use pure arithmetic rows instead; the sort order still groups pairs.
+        self._flat = count > LAZY_LIMIT
+        if self._flat:
+            self._rows = []
+            self._row_y = []
+            self._row_count = (count + columns - 1) // columns
+            self._content_h = self._row_count * CELL
+            self._sync_scrollbars()
+            return
+
+        self._row_count = 0
         rows: list[list[int]] = []
         row_y: list[float] = []
         current: list[int] = []
@@ -260,6 +304,18 @@ class MixGrid(QAbstractScrollArea):
         offset = self.verticalScrollBar().value()
         top = offset
         bottom = offset + self.viewport().height()
+
+        if self._flat:
+            first = max(0, int(top // CELL))
+            last = min(self._row_count - 1, int(bottom // CELL))
+            for row_index in range(first, last + 1):
+                start = row_index * self._columns
+                y = row_index * CELL
+                for column in range(min(self._columns, len(self._recipes) - start)):
+                    self._paint_cell(painter, start + column, column, y - offset)
+            painter.end()
+            return
+
         first = max(0, bisect.bisect_right(self._row_y, top) - 1)
 
         for row_index in range(first, len(self._rows)):
@@ -269,35 +325,45 @@ class MixGrid(QAbstractScrollArea):
             if y + CELL < top:
                 continue
             for column, item_index in enumerate(self._rows[row_index]):
-                recipe = self._recipes[item_index]
-                left = column * CELL
-                cell_top = y - offset
-                rect = QRectF(left + INSET, cell_top + INSET,
-                              CELL - 2 * INSET, CELL - 2 * INSET)
-                # Nothing is ever dimmed. A selected mix is marked by a ring in its
-                # OWN colour (drawn in the cell's margin, around the swatch), so the
-                # neighbouring mixes keep showing the colour they really mix to.
-                painter.fillRect(rect, QColor(*recipe.rgb))
-                painter.setPen(QPen(_outline(recipe.rgb), 1))
-                painter.drawRect(rect.adjusted(0.5, 0.5, -0.5, -0.5))
-                if item_index == self._selected:
-                    painter.setPen(QPen(_selection_colour(recipe.rgb), 2))
-                    painter.drawRect(QRectF(left + 2.0, cell_top + 2.0, CELL - 4.0, CELL - 4.0))
-                elif item_index == self._hover:
-                    painter.setPen(QPen(QColor(theme.BORDER_STRONG), 1))
-                    painter.drawRect(QRectF(left + 1.5, cell_top + 1.5, CELL - 3.0, CELL - 3.0))
+                self._paint_cell(painter, item_index, column, y - offset)
         painter.end()
+
+    def _paint_cell(self, painter, item_index: int, column: int, cell_top: float) -> None:
+        recipe = self._recipes[item_index]
+        left = column * CELL
+        rect = QRectF(left + INSET, cell_top + INSET,
+                      CELL - 2 * INSET, CELL - 2 * INSET)
+        # Nothing is ever dimmed. A selected mix is marked by a ring in its
+        # OWN colour (drawn in the cell's margin, around the swatch), so the
+        # neighbouring mixes keep showing the colour they really mix to.
+        painter.fillRect(rect, QColor(*recipe.rgb))
+        painter.setPen(QPen(_outline(recipe.rgb), 1))
+        painter.drawRect(rect.adjusted(0.5, 0.5, -0.5, -0.5))
+        if item_index == self._selected:
+            painter.setPen(QPen(_selection_colour(recipe.rgb), 2))
+            painter.drawRect(QRectF(left + 2.0, cell_top + 2.0, CELL - 4.0, CELL - 4.0))
+        elif item_index == self._hover:
+            painter.setPen(QPen(QColor(theme.BORDER_STRONG), 1))
+            painter.drawRect(QRectF(left + 1.5, cell_top + 1.5, CELL - 3.0, CELL - 3.0))
 
     # -- interaction -------------------------------------------------------------
     def _indexAt(self, point) -> int:
+        y = point.y() + self.verticalScrollBar().value()
+        column = int(point.x()) // CELL
+        if self._flat:
+            if column < 0 or column >= self._columns:
+                return -1
+            row_index = int(y // CELL)
+            if row_index < 0 or row_index >= self._row_count or y < 0:
+                return -1
+            index = row_index * self._columns + column
+            return index if index < len(self._recipes) else -1
         if not self._rows:
             return -1
-        y = point.y() + self.verticalScrollBar().value()
         row_index = bisect.bisect_right(self._row_y, y) - 1
         if row_index < 0 or row_index >= len(self._rows):
             return -1
         row = self._rows[row_index]
-        column = int(point.x()) // CELL
         if 0 <= column < len(row):
             return row[column]
         return -1
@@ -378,24 +444,36 @@ class MixGrid(QAbstractScrollArea):
 
     # -- helpers -----------------------------------------------------------------
     def _tooltip(self, recipe) -> str:
-        if getattr(recipe, "pair_index", 0) < 0:
+        if getattr(recipe, "pair_index", 0) < 0 and hasattr(recipe, "label"):
             return (
                 f"{recipe.label}\n"
                 f"{recipe.color_hex}\n"
                 "这是耗材丝本身的颜色（不是混色）"
             )
-        return (
-            f"{recipe.color_hex}\n"
-            f"{recipe.percent_a}% + {recipe.percent_b}%\n"
-            "单击查看是哪两种耗材丝"
-        )
+        if hasattr(recipe, "percent_c"):
+            detail = f"{recipe.percent_a}% + {recipe.percent_b}% + {recipe.percent_c}%"
+            hint = "单击查看合成这个颜色的所有配方（三色混色）"
+        elif hasattr(recipe, "percent_a"):
+            detail = f"{recipe.percent_a}% + {recipe.percent_b}%"
+            hint = "单击查看是哪两种耗材丝"
+        else:
+            detail = getattr(recipe, "ratio_text", "")
+            hint = "单击查看合成这个颜色的所有配方"
+        return f"{recipe.color_hex}\n{detail}\n{hint}"
 
     def _scrollToIndex(self, index: int) -> None:
+        viewport_h = self.viewport().height()
+        value = self.verticalScrollBar().value()
+        if self._flat:
+            y = (index // self._columns) * CELL
+            if y < value:
+                self.verticalScrollBar().setValue(int(y))
+            elif y + CELL > value + viewport_h:
+                self.verticalScrollBar().setValue(int(y + CELL - viewport_h))
+            return
         for row_index, row in enumerate(self._rows):
             if index in row:
                 y = self._row_y[row_index]
-                viewport_h = self.viewport().height()
-                value = self.verticalScrollBar().value()
                 if y < value:
                     self.verticalScrollBar().setValue(int(y))
                 elif y + CELL > value + viewport_h:

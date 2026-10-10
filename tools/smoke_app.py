@@ -388,6 +388,231 @@ def main() -> int:
     window._refresh_grid()
     app.processEvents()
 
+    # --- 三色混色: every triple, merged, cached --------------------------------
+    from app.core.triples import TripleCatalog, triple_recipe_count  # noqa: E402
+
+    spools = len(library)
+    check(spools >= 3, f"the library has enough spools for triples ({spools})")
+    expected_triples = spools * (spools - 1) * (spools - 2) // 6
+    reference = TripleCatalog(library.filaments, engine=window._catalog.engine.id).build()
+    check(
+        reference.triple_count == expected_triples,
+        f"{spools} spools give {expected_triples} triples",
+    )
+    check(
+        reference.recipe_count == triple_recipe_count(spools),
+        f"every triple carries 2556 ratios ({reference.recipe_count:,} recipes)",
+    )
+    first_recipes = reference.recipes_at(0)
+    check(
+        bool(first_recipes) and all(r.color_hex == reference.color_hex_at(0) for r in first_recipes),
+        "every recipe behind one triple colour really makes that colour",
+    )
+    check(
+        all(sum(r.percents) == 100 for r in first_recipes)
+        and all(min(r.percents) >= 10 for r in first_recipes),
+        "every triple ratio sums to 100 with each colour at least 10%",
+    )
+
+    window._triples_box.setChecked(True)
+    deadline = time.time() + 60
+    while window._triple_view is None and time.time() < deadline:
+        app.processEvents()
+        time.sleep(0.01)
+    check(window._triple_view is not None, "三色混色 finishes building")
+    check(
+        len(window._triple_view) == reference.colour_count,
+        f"the grid shows all {reference.colour_count:,} distinct triple colours",
+    )
+    check(
+        len(window._recipes) == reference.colour_count,
+        "the triple view is what the grid is holding",
+    )
+    check(
+        "三色混色" in window._grid_info.text(),
+        f"the footer explains the triple table, got {window._grid_info.text()!r}",
+    )
+    cache_file = window._triples_path()
+    check(cache_file.is_file(), f"the triple table is cached at {cache_file.name}")
+    check(not window._search.isEnabled(), "search is off while 三色混色 is on")
+    check(not window._all_colours.isEnabled(), "全部颜色 is off while 三色混色 is on")
+    window._triples_box.setChecked(False)
+    app.processEvents()
+    check(window._triple_view is None, "unticking 三色混色 goes back to the pair table")
+    check(window._search.isEnabled(), "search comes back")
+    check(
+        len(window._recipes) == window._catalog.colour_count,
+        "the pair table is back",
+    )
+
+    # --- the grid's flat layout, exercised with a stub -------------------------
+    # A real 200,000-colour table would cost seconds to build, so the switch to
+    # arithmetic rows is proved against a stand-in lazy sequence instead.
+    from PySide6.QtCore import QPoint  # noqa: E402
+
+    from app.ui import mix_grid as _grid_module  # noqa: E402
+
+    class _StubColour:
+        __slots__ = (
+            "index",
+            "rgb",
+            "color_hex",
+            "key",
+            "pair_index",
+            "ratio_text",
+            "recipes",
+            "a_id",
+            "b_id",
+            "percent_a",
+            "percent_b",
+            "lab",
+            "lightness",
+            "hue",
+            "chroma",
+        )
+
+        def __init__(self, index: int) -> None:
+            self.index = index
+            self.rgb = (index & 0xFF, (index >> 8) & 0xFF, (index >> 16) & 0xFF)
+            self.color_hex = f"#{index:06X}"
+            self.key = f"triple|{self.color_hex}"
+            self.pair_index = -1
+            self.ratio_text = "1 个配方"
+            self.recipes = ()
+            self.a_id = library[0].id
+            self.b_id = library[1].id
+            self.percent_a = 50
+            self.percent_b = 50
+            self.lab = (50.0, 0.0, 0.0)
+            self.lightness = 50.0
+            self.hue = 0.0
+            self.chroma = 0.0
+
+    class _StubView:
+        def __init__(self, count: int) -> None:
+            self._count = count
+
+        def __len__(self) -> int:
+            return self._count
+
+        def __getitem__(self, index):
+            if isinstance(index, slice):
+                return [self[i] for i in range(*index.indices(self._count))]
+            index = int(index)
+            if index < 0:
+                index += self._count
+            if not 0 <= index < self._count:
+                raise IndexError(index)
+            return _StubColour(index)
+
+        def index_of_key(self, key: str) -> int:
+            text = key[7:] if key.startswith("triple|") else key
+            try:
+                return int(text.lstrip("#"), 16)
+            except ValueError:
+                return -1
+
+    stub = _StubView(200_000)
+    window._grid.resize(660, 400)
+    window._grid.setRecipes(stub, grouped=False)
+    app.processEvents()
+    # The viewport still carries the scroll offset of whatever was shown before,
+    # and _indexAt works in content coordinates.
+    window._grid.verticalScrollBar().setValue(0)
+    app.processEvents()
+    check(window._grid._flat, "the grid switches to the flat layout above LAZY_LIMIT")
+    check(window._grid._recipes is stub, "a huge lazy sequence is kept, not copied")
+    check(
+        not isinstance(window._grid._recipes, list),
+        "no per-cell Python list is built for it",
+    )
+    index = window._grid._indexAt(
+        QPoint(3 * _grid_module.CELL + 5, 7 * _grid_module.CELL + 5)
+    )
+    check(
+        index == 7 * window._grid._columns + 3,
+        f"a click still maps to the right cell (got {index})",
+    )
+    target = stub[index]
+    window._grid.selectRecipe(target)
+    check(
+        window._grid.selectedRecipe().key == target.key,
+        "selecting a lazy cell does not scan the whole table",
+    )
+    check(
+        window._grid.indexOfKey("triple|#FFFFFF") == 0xFFFFFF,
+        "a key maps back to its position without a scan",
+    )
+    window._refresh_grid()
+    app.processEvents()
+
+    # --- the export carries the mixes, and only the right library may adopt them
+    import tempfile  # noqa: E402
+
+    from app.core.library import Filament as _Filament  # noqa: E402
+    from app.core.library import FilamentLibrary as _Library  # noqa: E402
+
+    sidecar_dir = Path(tempfile.mkdtemp(prefix="bp-sidecar-"))
+    archive = sidecar_dir / "lib.json"
+    check(window._write_mix_sidecar(archive) is None, "a plain export writes no mix cache")
+    window._triples_box.setChecked(True)
+    deadline = time.time() + 60
+    while window._triple_view is None and time.time() < deadline:
+        app.processEvents()
+        time.sleep(0.01)
+    written = window._write_mix_sidecar(archive)
+    check(
+        written is not None and written.is_file() and written.name == "lib.mixes.npz",
+        "once 三色混色 is built, the export carries the cache",
+    )
+    if written is not None:
+        import numpy as np  # noqa: E402
+
+        with np.load(written) as data:
+            check("key" in data.files, "the cache records which library it belongs to")
+
+        other_library = _Library()
+        for position, filament in enumerate(library):
+            other_library.add(
+                _Filament(
+                    id=filament.id,
+                    brand=filament.brand,
+                    material_type=filament.material_type,
+                    color_hex="#010203" if position == 0 else filament.color_hex,
+                )
+            )
+        other = MainWindow(library=other_library)
+        check(
+            not other._adopt_mix_sidecar(written),
+            "a different library refuses a foreign mix cache",
+        )
+        other.close()
+
+        # The same spools must pick the mixes up instead of recomputing them.
+        fresh_library = _Library()
+        for filament in library:
+            fresh_library.add(filament)
+        fresh = MainWindow(library=fresh_library)
+        check(
+            fresh._triple_view is None,
+            "a window built from the same spools starts without the mixes",
+        )
+        check(fresh._adopt_mix_sidecar(written), "the same spools adopt the exported cache")
+        check(
+            fresh._triple_view is not None
+            and fresh._triples_box.isChecked()
+            and not fresh._search.isEnabled()
+            and not fresh._all_colours.isEnabled(),
+            "adopting it lands the window in 三色混色 mode",
+        )
+        check(
+            len(fresh._recipes) == len(window._triples.colours()),
+            "the adopted table has exactly as many colours as the one that built it",
+        )
+        fresh.close()
+    window._triples_box.setChecked(False)
+    app.processEvents()
+
     # --- blank space clears the selection; nothing is ever dimmed --------------
     from PySide6.QtCore import QEvent, QPointF, Qt  # noqa: E402
     from PySide6.QtGui import QMouseEvent  # noqa: E402
@@ -442,9 +667,18 @@ def main() -> int:
     check(isinstance(window._all_colours, QCheckBox), "it is a checkbox, as requested")
     check(window._all_colours.text() == "全部颜色", "the checkbox is labelled 全部颜色")
     check(not window._all_colours.isChecked(), "the checkbox starts unchecked (mixes only)")
-    panel = window._all_colours.parentWidget()
+    header = window._all_colours.parentWidget()
+    panel = header.parentWidget() if header is not None else None
     check(panel is not None and panel.objectName() == "panel",
           "the checkbox lives on the 全部混色 panel")
+    check(
+        hasattr(window, "_triples_box") and window._triples_box.text() == "三色混色",
+        "the same header offers 三色混色",
+    )
+    check(
+        window._triples_box.parentWidget() is header and not window._triples_box.isChecked(),
+        "三色混色 sits beside 全部颜色 and starts off",
+    )
     headings = [w for w in panel.findChildren(QLabel) if w.text() == "全部混色"]
     check(len(headings) == 1, "the panel still carries its 全部混色 heading")
     if headings:
