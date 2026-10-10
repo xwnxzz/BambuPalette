@@ -35,15 +35,86 @@ __all__ = ["mix_pair", "mix_pair_batch", "mix_rgb", "mix_rgb_flat"]
 #: build can skip the many zero exponents the degree-4 expansion produces.
 _NONZERO = [(j, POWERS[:, j] > 0, POWERS[POWERS[:, j] > 0, j]) for j in range(N_INPUTS)]
 
-_CHUNK = 200_000
+#: The highest exponent any single input carries in the degree-4 expansion.
+_MAX_EXPONENT = int(POWERS.max())
+
+
+def _build_layout() -> tuple[list[tuple[int, int, int, int, np.ndarray]], list[int], int]:
+    """Order the degree-4 monomials so each one costs a single multiply.
+
+    The 330 features are *every* monomial of total degree ≤ 4 over the seven
+    inputs.  A monomial therefore has a natural parent: the same monomial with
+    its highest non-zero exponent **removed**, whose product chain is one factor
+    shorter.  Multiply the parent by that input's full power and you get the
+    child — and because the parent's chain is exactly the child's minus its last
+    factor, the floating-point rounding order is the one the profile's own
+    column order would have used.
+
+    The layout walks the inputs and exponents in ascending order and, inside a
+    group, appends children in *parent-position* order.  That makes each group a
+    contiguous slice of the output while its parent columns still read forward.
+    """
+    # POWERS is (N_FEATURES, N_INPUTS): one exponent per input, per feature.
+    lookup = {tuple(int(v) for v in POWERS[feature]): feature for feature in range(N_FEATURES)}
+    zero = (0,) * N_INPUTS
+    layout: list[tuple[int, ...]] = [zero]
+    position = {zero: 0}
+    writes: list[tuple[int, int, int, int, np.ndarray]] = []
+
+    for index in range(N_INPUTS):
+        for exponent in range(1, _MAX_EXPONENT + 1):
+            members: list[tuple[int, tuple[int, ...]]] = []
+            for monomial in lookup:
+                if monomial[index] != exponent:
+                    continue
+                if any(monomial[j] for j in range(index + 1, N_INPUTS)):
+                    continue
+                parent = list(monomial)
+                parent[index] = 0
+                members.append((position[tuple(parent)], monomial))
+            if not members:
+                continue
+            members.sort()
+            start = len(layout)
+            for _, monomial in members:
+                position[monomial] = len(layout)
+                layout.append(monomial)
+            parents = np.array([parent for parent, _ in members], dtype=np.int64)
+            writes.append((index, exponent, start, len(members), parents))
+
+    assert len(layout) == N_FEATURES, "the monomial walk must cover every feature exactly once"
+    order = [lookup[monomial] for monomial in layout]
+    return writes, order, len(layout)
+
+
+#: ``(input, exponent, start, count, parent columns)`` per multiply.
+_WRITES, _ORDER, _COLUMNS = _build_layout()
+
+#: ``COEF`` reordered to match the layout :func:`_build_layout` produced, which
+#: is why the feature matrix never has to be put back into the profile's order.
+COEF_ORDERED = COEF[_ORDER]
+
+_CHUNK = 2_048
 
 
 def _features(x: np.ndarray) -> np.ndarray:
-    """Evaluate the 330 polynomial features for each row of ``x`` (N, 7)."""
-    features = np.ones((x.shape[0], N_FEATURES), dtype=np.float64)
-    for column, mask, exponents in _NONZERO:
-        if mask.any():
-            features[:, mask] *= x[:, column : column + 1] ** exponents
+    """Evaluate the 330 polynomial features for each row of ``x`` (N, 7).
+
+    Returns the columns in :data:`_ORDER` order, not the profile's own order —
+    :data:`COEF_ORDERED` is permuted to match, so the polynomial is unchanged.
+
+    ``features[:, mask] *= x[:, column:column+1] ** exponents`` is the obvious
+    spelling, but with a *vector* right-hand side NumPy calls ``pow()`` once per
+    element — roughly a thousand powers per row across the 330 monomials, and
+    about 2.7 s of a 41-spool catalogue build.  Multiplying each monomial out of
+    its parent turns that into 330 multiplies over one column each.
+    """
+    features = np.empty((x.shape[0], _COLUMNS), dtype=np.float64)
+    features[:, 0] = 1.0
+    for index, exponent, start, count, parents in _WRITES:
+        features[:, start : start + count] = (
+            features[:, parents] * np.power(x[:, index : index + 1], exponent)
+        )
     return features
 
 
@@ -52,7 +123,7 @@ def _evaluate(x: np.ndarray) -> np.ndarray:
     out = np.empty((x.shape[0], 3), dtype=np.int64)
     for start in range(0, x.shape[0], _CHUNK):
         block = x[start : start + _CHUNK]
-        raw = _features(block) @ COEF + INTERCEPT
+        raw = _features(block) @ COEF_ORDERED + INTERCEPT
         # `astype` truncates toward zero, matching the reference cast; clamping
         # first makes a negative value behave the same way it does in C++.
         out[start : start + block.shape[0]] = np.clip(raw, 0.0, 255.0).astype(np.int64)

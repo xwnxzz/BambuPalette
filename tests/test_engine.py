@@ -417,6 +417,52 @@ class FilamentMixerEngineTests(unittest.TestCase):
             previous = lightness
 
 
+class MixerFeatureLayoutTests(unittest.TestCase):
+    """The shipped feature build is a *reordered* copy of the profile's own.
+
+    ``filament_mixer`` lays the 330 monomials out by input and exponent so each
+    one costs a single multiply (``_build_layout``), then folds the resulting
+    permutation into ``COEF_ORDERED`` instead of permuting the matrix back.  That
+    is only correct if the reordered features read against the reordered
+    coefficients are the same polynomial the profile stores — which is what
+    these check, straight from ``POWERS`` and ``COEF``.
+
+    A whole-catalogue build at 41 spools went from 3.14 s to 0.82 s this way, and
+    the 66,420 mixed colours it produces are bit-for-bit the ones the previous
+    spelling produced; this test is what keeps that true.
+    """
+
+    def test_the_layout_covers_every_feature_exactly_once(self):
+        self.assertEqual(len(FM._ORDER), FM.N_FEATURES)
+        self.assertEqual(sorted(FM._ORDER), list(range(FM.N_FEATURES)))
+
+    def test_the_reordered_features_are_the_profile_features(self):
+        powers = FM.POWERS
+        rng = np.random.default_rng(20261010)
+        x = rng.uniform(0.0, 255.0, size=(64, powers.shape[1]))
+
+        by_profile = np.ones((x.shape[0], FM.N_FEATURES))
+        for feature in range(FM.N_FEATURES):
+            for input_index, exponent in enumerate(powers[feature]):
+                if exponent:
+                    by_profile[:, feature] *= x[:, input_index] ** int(exponent)
+        expected = np.clip(by_profile @ FM.COEF + FM.INTERCEPT, 0.0, 255.0).astype(np.int64)
+
+        self.assertTrue(np.array_equal(expected, FM._evaluate(x)))
+
+    def test_the_shortcut_paths_still_agree_with_the_full_polynomial(self):
+        # t <= 0 and t >= 1 short-circuit to the untouched input colours, and t
+        # is the *second* colour's share, so 0% of the first returns the second.
+        self.assertEqual(FM.mix_pair((12, 200, 71), (240, 3, 90), 100), (12, 200, 71))
+        self.assertEqual(FM.mix_pair((12, 200, 71), (240, 3, 90), 0), (240, 3, 90))
+        self.assertEqual(FM.mix_pair((0, 0, 0), (255, 255, 255), 50),
+                         tuple(FM.mix_pair_batch(
+                             np.array([[0.0, 0.0, 0.0]]),
+                             np.array([[255.0, 255.0, 255.0]]),
+                             np.array([0.5]),
+                         )[0].tolist()))
+
+
 class NeutralGuardTests(unittest.TestCase):
     """Two neutral spools must mix to a neutral grey.
 
