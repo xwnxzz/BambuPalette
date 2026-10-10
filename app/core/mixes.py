@@ -102,6 +102,120 @@ class MixRecipe:
         return f"{self.percent_a}% + {self.percent_b}%"
 
 
+@dataclass(frozen=True)
+class MixColour:
+    """One distinct predicted colour, plus every recipe that produces it.
+
+    Two different parent pairs — or two different ratios of the same pair —
+    often land on exactly the same ``#RRGGBB``.  The user asked for those to be
+    one entry: 「如果混色中出现了完全相同的颜色，则合并成同一个颜色，颜色详情里有合成这个颜色的所有配方」.
+    So the grid shows the colour once and the detail panel lists all of its
+    recipes.
+
+    It deliberately exposes the same read-only attributes as :class:`MixRecipe`
+    (``rgb``, ``lab``, ``lightness``/``hue``/``chroma``, ``pair_index``,
+    ``percent_a``/``percent_b``, ``a_id``/``b_id``), so :func:`sorted_cells` and
+    the grid can mix colours and raw spools in one list without a special case.
+    ``pair_index`` is the smallest of the merged recipes' pair indices: under
+    「按母材组合」 a merged colour has to sit somewhere, and its first parent pair
+    is the only defensible place.
+    """
+
+    rgb: tuple[int, int, int]
+    color_hex: str
+    lab: tuple[float, float, float]
+    recipes: tuple[MixRecipe, ...]
+    pair_index: int = -1
+
+    @property
+    def key(self) -> str:
+        return f"colour|{self.color_hex}"
+
+    @property
+    def recipe_count(self) -> int:
+        return len(self.recipes)
+
+    @property
+    def first(self) -> MixRecipe:
+        return self.recipes[0]
+
+    @property
+    def engine(self) -> MixEngine:
+        """Every recipe of one colour shares the catalogue's engine."""
+        return self.first.engine
+
+    @property
+    def a_id(self) -> str:
+        return self.first.a_id
+
+    @property
+    def b_id(self) -> str:
+        return self.first.b_id
+
+    @property
+    def percent_a(self) -> int:
+        return self.first.percent_a
+
+    @property
+    def percent_b(self) -> int:
+        return self.first.percent_b
+
+    @property
+    def is_spool(self) -> bool:
+        return False
+
+    @property
+    def lightness(self) -> float:
+        return self.lab[0]
+
+    @property
+    def hue(self) -> float:
+        """Hue angle in degrees, 0 for achromatic colours."""
+        _, a, b = self.lab
+        if abs(a) < 1e-9 and abs(b) < 1e-9:
+            return 0.0
+        return float(np.degrees(np.arctan2(b, a)) % 360.0)
+
+    @property
+    def chroma(self) -> float:
+        _, a, b = self.lab
+        return float(np.hypot(a, b))
+
+    @property
+    def ratio_text(self) -> str:
+        if self.recipe_count == 1:
+            return self.first.ratio_text
+        return f"{self.recipe_count} 个配方"
+
+
+def merge_recipes(recipes: Iterable[MixRecipe]) -> list[MixColour]:
+    """Group recipes by the colour they predict, ordered by RGB.
+
+    The order is the catalogue's own: ascending ``(r, g, b)``, which is what
+    「按 RGB 排列」 relies on as a stable base order.
+    """
+    groups: dict[str, list[MixRecipe]] = {}
+    for recipe in recipes:
+        group = groups.get(recipe.color_hex)
+        if group is None:
+            groups[recipe.color_hex] = [recipe]
+        else:
+            group.append(recipe)
+
+    colours = [
+        MixColour(
+            rgb=group[0].rgb,
+            color_hex=color_hex,
+            lab=group[0].lab,
+            recipes=tuple(group),
+            pair_index=min(recipe.pair_index for recipe in group),
+        )
+        for color_hex, group in groups.items()
+    ]
+    colours.sort(key=lambda colour: colour.rgb)
+    return colours
+
+
 def _filament_lab(filament) -> tuple[float, float, float]:
     return _color.lab_from_rgb(filament.rgb)
 
@@ -222,6 +336,8 @@ class MixCatalog:
         self._ratios = tuple(int(r) for r in ratios)
         self._engine = get_engine(engine)
         self._recipes: list[MixRecipe] = []
+        self._colours: list[MixColour] = []
+        self._by_colour: dict[str, MixColour] = {}
         self._pairs: list[tuple[str, str]] = []
         self._by_pair: dict[tuple[str, str], list[MixRecipe]] = {}
         self._by_id: dict[str, object] = {}
@@ -253,6 +369,21 @@ class MixCatalog:
         return list(self._recipes)
 
     @property
+    def colours(self) -> list[MixColour]:
+        """Distinct predicted colours, each carrying all of its recipes."""
+        self._ensure_built()
+        return list(self._colours)
+
+    @property
+    def colour_count(self) -> int:
+        return len(self._colours)
+
+    def colour_for(self, color_hex: str) -> MixColour | None:
+        """The merged colour with this ``#RRGGBB``, if the catalogue predicts it."""
+        self._ensure_built()
+        return self._by_colour.get(f"colour|{str(color_hex).upper()}")
+
+    @property
     def pairs(self) -> list[tuple[str, str]]:
         return list(self._pairs)
 
@@ -266,6 +397,7 @@ class MixCatalog:
 
         count = len(self._filaments)
         if count < 2:
+            self._remerge()
             return self
 
         self._compute_pairs(
@@ -275,7 +407,13 @@ class MixCatalog:
                 for j in range(i + 1, count)
             ]
         )
+        self._remerge()
         return self
+
+    def _remerge(self) -> None:
+        """Rebuild the merged-colour index from the current recipes."""
+        self._colours = merge_recipes(self._recipes)
+        self._by_colour = {colour.key: colour for colour in self._colours}
 
     def sync(self, filaments: Sequence) -> "MixCatalog":
         """Bring the catalogue up to date with ``filaments``, reusing what exists.
@@ -337,6 +475,7 @@ class MixCatalog:
                 for j in range(i + 1, len(added))
             ]
             self._compute_pairs(pairs)
+        self._remerge()
         return self
 
     def _compute_pairs(self, pairs: Sequence[tuple]) -> None:
@@ -435,6 +574,25 @@ class MixCatalog:
             key=lambda m: recipe_sort_key(key, m, self._label, target_rgb),
         )
 
+    def sorted_colours(self, key: str = SORT_RGB, *, target_rgb=None) -> list[MixColour]:
+        """The merged colours ordered by ``key``; see :data:`SORT_CHOICES`.
+
+        ``MixColour`` exposes the same attributes as ``MixRecipe``, so this is
+        the same key function the recipe list uses — a colour and a recipe sort
+        identically when they carry the same RGB/Lab.
+        """
+        self._ensure_built()
+        return sorted(
+            self._colours,
+            key=lambda colour: recipe_sort_key(key, colour, self._label, target_rgb),
+        )
+
+    def recipes_of(self, colour: MixColour) -> list[MixRecipe]:
+        """Every recipe that produces ``colour`` — 「合成这个颜色的所有配方」."""
+        if colour is None:
+            return []
+        return list(colour.recipes)
+
     def _label(self, filament_id: str):
         filament = self._by_id.get(filament_id)
         return filament.display_name.casefold() if filament is not None else filament_id
@@ -458,6 +616,7 @@ class MixCatalog:
             "filaments": len(self._filaments),
             "pairs": len(self._pairs),
             "recipes": len(self._recipes),
+            "colours": len(self._colours),
             "ratios": len(self._ratios),
         }
 

@@ -107,12 +107,32 @@ class PaletteTests(unittest.TestCase):
         library = _library()
         catalog = MixCatalog(library.filaments, engine=ENGINE_BAMBU).build()
         palette = build_palette(library, catalog)
-        # 4 spools + C(4,2) pairs × 81 ratios
-        self.assertEqual(len(palette), 4 + 6 * 81)
+        # 4 spools + one entry per DISTINCT mixed colour (identical hexes merge,
+        # so this is never more than C(4,2) pairs × 81 ratios).
+        mixed = [entry for entry in palette if entry.is_mix]
+        self.assertEqual(len(palette), 4 + len(mixed))
+        self.assertLessEqual(len(mixed), 6 * 81)
+        self.assertEqual(len({entry.color_hex for entry in mixed}), len(mixed))
         self.assertEqual([entry.kind for entry in palette[:4]], ["filament"] * 4)
         self.assertTrue(all(entry.kind == "mix" for entry in palette[4:]))
         self.assertTrue(all(len(entry.filament_ids) == 2 for entry in palette[4:]))
         self.assertTrue(all(entry.filament_ids[0] != entry.filament_ids[1] for entry in palette[4:]))
+
+    def test_a_merged_entry_carries_every_recipe_behind_it(self):
+        library = _library()
+        catalog = MixCatalog(library.filaments, engine=ENGINE_BAMBU).build()
+        palette = build_palette(library, catalog)
+        mixed = [entry for entry in palette if entry.is_mix]
+        self.assertEqual(sum(entry.recipe_count for entry in mixed), 6 * 81)
+        for entry in mixed:
+            self.assertEqual(entry.recipes, tuple(catalog.colour_for(entry.color_hex).recipes))
+            self.assertTrue(all(r.color_hex == entry.color_hex for r in entry.recipes))
+        many = [entry for entry in mixed if entry.recipe_count > 1]
+        if many:
+            self.assertEqual(many[0].ratio_text, f"{len(many[0].recipes)} 个配方")
+        single = [entry for entry in mixed if entry.recipe_count == 1]
+        self.assertTrue(single)
+        self.assertEqual(single[0].ratio_text, single[0].recipe.ratio_text)
 
     def test_palette_can_exclude_mixes(self):
         library = _library()
@@ -433,31 +453,31 @@ class RecipeTextTests(unittest.TestCase):
 class LargePaletteTests(unittest.TestCase):
     """A palette far bigger than one picture ever uses.
 
-    The bundled 大简 PETG HF preset is 41 spools, which is 41 + C(41,2)×81 =
-    66,461 palette entries.  The per-pixel class map used to be ``int16``, so
-    any index past 32,767 wrapped negative — and negative means "transparent"
-    everywhere downstream, so those colours were silently deleted and a
-    five-colour pig came out with two.  These tests pin the dtype to the
-    palette, not to the number of colours a picture happens to need.
+    The per-pixel class map used to be ``int16``, so any index past 32,767
+    wrapped negative — and negative means "transparent" everywhere downstream,
+    so those colours were silently deleted and a five-colour pig came out with
+    two.  These tests pin the dtype to the palette, not to the number of colours
+    a picture happens to need.
+
+    Since identical ``#RRGGBB`` values are merged (m06962) the palette has to be
+    built from a WELL-SPREAD library to cross 32,767 at all: 30 spools scattered
+    over the RGB cube give ~33,200 entries, where 30 collinear spools would
+    collapse to ~14,500.
     """
 
     @staticmethod
     def _wide_library(count: int = 30) -> FilamentLibrary:
-        # Spread the spools over the cube so the mixes fill a wide gamut.
+        # Deterministic, but spread over the whole cube so the mixes stay apart.
+        rng = np.random.default_rng(20261011)
         filaments = []
         for index in range(count):
-            step = index / max(count - 1, 1)
+            r, g, b = (int(value) for value in rng.integers(0, 256, size=3))
             filaments.append(
                 Filament(
                     name=f"P{index}",
                     brand="测试",
                     material_type="PETG HF",
-                    color_hex="#%02X%02X%02X"
-                    % (
-                        int(round(255 * step)),
-                        int(round(255 * abs(1.0 - 2.0 * step))),
-                        int(round(255 * (1.0 - step))),
-                    ),
+                    color_hex=f"#{r:02X}{g:02X}{b:02X}",
                 )
             )
         return FilamentLibrary(filaments)

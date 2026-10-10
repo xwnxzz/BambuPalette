@@ -20,6 +20,11 @@ from .swatch import SwatchLabel
 #: How many stops the pair bar samples from the active mixing engine.
 BAR_STOPS = 129
 
+#: How many recipes of one merged colour the detail panel is willing to draw.
+#: Two colours rarely give more than a handful, but three colours can give the
+#: same hex dozens of times and a list nobody can read helps nobody.
+MAX_RECIPE_ROWS = 50
+
 
 class PairBar(QWidget):
     """The whole 0 %→100 % sweep of one pair, with the recipe marked.
@@ -85,6 +90,7 @@ class MixDetail(QWidget):
         self._engine = None
         self._recipe = None
         self._filament = None
+        self._colour = None
         self._pair_filtered = False
 
         self.setMinimumWidth(320)
@@ -183,6 +189,21 @@ class MixDetail(QWidget):
         self._bar = PairBar(self)
         self._bar.setToolTip("左端 = 第一种耗材 100%，右端 = 第二种耗材 100%；白线是当前比例")
 
+        # 「颜色详情里有合成这个颜色的所有配方」: one distinct colour can be reached by
+        # several spool pairs and several ratios, so the panel lists them all
+        # rather than pretending the first one is the only one.
+        self._formula_title = QLabel("", self)
+        self._formula_title.setProperty("role", "sectionTitle")
+        self._formula_title.setWordWrap(True)
+        self._formula_note = QLabel("", self)
+        self._formula_note.setProperty("role", "hint")
+        self._formula_note.setWordWrap(True)
+        self._formula_box = QWidget(self)
+        self._formula_layout = QVBoxLayout(self._formula_box)
+        self._formula_layout.setContentsMargins(0, 0, 0, 0)
+        self._formula_layout.setSpacing(4)
+        self._formula_rows: list[dict] = []
+
         self._pair_button = QPushButton("只看这一对耗材的全部混色", self)
         self._pair_button.setToolTip("把中间网格缩小到这两种耗材的 81 个配比")
         self._pair_button.clicked.connect(self._on_pair)
@@ -211,6 +232,9 @@ class MixDetail(QWidget):
         layout.addLayout(top)
         layout.addLayout(rows_box)
         layout.addWidget(self._bar)
+        layout.addWidget(self._formula_title)
+        layout.addWidget(self._formula_note)
+        layout.addWidget(self._formula_box)
         layout.addWidget(self._pair_button)
         layout.addWidget(self._steps)
         layout.addStretch(1)
@@ -230,11 +254,17 @@ class MixDetail(QWidget):
     def recipe(self):
         return self._recipe
 
+    def colour(self):
+        """The merged colour being shown, or None when a plain recipe is shown."""
+        return self._colour
+
     def filament(self):
         return self._filament
 
     def selectionKey(self) -> str:
         """Whatever is currently shown, as one comparable key."""
+        if self._colour is not None:
+            return self._colour.key
         if self._recipe is not None:
             return self._recipe.key
         if self._filament is not None:
@@ -245,6 +275,7 @@ class MixDetail(QWidget):
     def clear(self) -> None:
         self._recipe = None
         self._filament = None
+        self._colour = None
         self._copy.setEnabled(False)
         self._empty.setVisible(True)
         for key in ("_hex", "_ratio", "_engine_label"):
@@ -255,12 +286,103 @@ class MixDetail(QWidget):
         self._steps.setVisible(False)
         for row in self._rows:
             row["frame"].setVisible(False)
+        self._clear_formulas()
+
+    def _clear_formulas(self) -> None:
+        self._formula_title.setVisible(False)
+        self._formula_note.setVisible(False)
+        self._formula_box.setVisible(False)
+        for row in self._formula_rows:
+            row["frame"].setVisible(False)
+
+    def showColour(self, colour) -> None:
+        """A merged colour: the usual panel for its first recipe, then all of them.
+
+        The user asked for the detail panel to name every recipe behind a colour
+        (「颜色详情里有合成这个颜色的所有配方」).  The preview, the pair bar and the
+        Bambu Studio steps keep describing the FIRST recipe, because that is the
+        one the panel is already built around; the list underneath is the full
+        answer, and clicking a row there re-points the panel at that recipe.
+        """
+        if colour is None or self._library is None or self._engine is None:
+            self.clear()
+            return
+        recipes = list(getattr(colour, "recipes", ()))
+        if not recipes:
+            self.clear()
+            return
+        self.showRecipe(recipes[0])
+        self._fill_formulas(colour, recipes)
+        # showRecipe() clears this, so it is restored last on purpose: the panel
+        # remembers the merged colour the user actually clicked.
+        self._colour = colour
+
+    def _fill_formulas(self, colour, recipes) -> None:
+        total = len(recipes)
+        self._formula_title.setText(f"合成 {colour.color_hex} 的所有配方（{total} 条）")
+        self._formula_title.setVisible(True)
+
+        shown = recipes[:MAX_RECIPE_ROWS]
+        while len(self._formula_rows) < len(shown):
+            self._formula_rows.append(self._make_formula_row())
+        for row, recipe in zip(self._formula_rows, shown):
+            row["frame"].setVisible(True)
+            row["swatch"].setValue(recipe.color_hex)
+            name_a = _short(self._library.get(recipe.a_id))
+            name_b = _short(self._library.get(recipe.b_id))
+            row["text"].setText(
+                f"{name_a} {recipe.percent_a}%  +  {name_b} {recipe.percent_b}%"
+            )
+            row["key"].setText(recipe.key)
+            row["frame"].setToolTip(
+                f"{name_a} {recipe.percent_a}%  +  {name_b} {recipe.percent_b}%\n"
+                f"{recipe.color_hex}"
+            )
+        for row in self._formula_rows[len(shown):]:
+            row["frame"].setVisible(False)
+
+        if total > MAX_RECIPE_ROWS:
+            self._formula_note.setText(
+                f"只列出前 {MAX_RECIPE_ROWS} 条，还有 {total - MAX_RECIPE_ROWS} 条没有显示。"
+            )
+            self._formula_note.setVisible(True)
+        else:
+            self._formula_note.setVisible(False)
+        self._formula_box.setVisible(True)
+
+    def _make_formula_row(self) -> dict:
+        swatch = SwatchLabel("#FFFFFF", size=20, caption=False, parent=self._formula_box)
+        text = QLabel("—", self._formula_box)
+        text.setProperty("role", "hint")
+        # Deliberately NOT word-wrapped: a wrapping label reports a tiny minimum
+        # height, so a colour reachable by eighteen recipes would squeeze all
+        # eighteen rows into a few pixels and print them on top of each other.
+        # Without wrapping the column has a real minimum and the page scrolls.
+        text.setWordWrap(False)
+        key = QLabel("—", self._formula_box)
+        key.setProperty("role", "mono")
+        key.setVisible(False)
+
+        line = QHBoxLayout()
+        line.setContentsMargins(0, 0, 0, 0)
+        line.setSpacing(8)
+        line.addWidget(swatch, 0, Qt.AlignmentFlag.AlignTop)
+        line.addWidget(text, 1)
+
+        frame = QWidget(self._formula_box)
+        frame.setLayout(line)
+        self._formula_layout.addWidget(frame)
+        return {"frame": frame, "swatch": swatch, "text": text, "key": key}
 
     def showRecipe(self, recipe) -> None:
         if recipe is None or self._library is None or self._engine is None:
             self.clear()
             return
+        # A plain recipe has exactly one formula, so the merged-colour list must
+        # not linger from a previous selection.
+        self._clear_formulas()
         self._recipe = recipe
+        self._colour = None
         self._filament = None
         self._empty.setVisible(False)
         filament_a = self._library.get(recipe.a_id)
@@ -325,7 +447,9 @@ class MixDetail(QWidget):
         if filament is None:
             self.clear()
             return
+        self._clear_formulas()
         self._recipe = None
+        self._colour = None
         self._filament = filament
         self._empty.setVisible(False)
 

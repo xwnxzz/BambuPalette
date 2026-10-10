@@ -58,7 +58,14 @@ def _report(progress: ProgressFn | None, message: str, fraction: float) -> None:
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class PaletteEntry:
-    """One printable colour: a spool on its own, or a two-spool recipe."""
+    """One printable colour: a spool on its own, or a mixed colour.
+
+    A mixed colour is ONE entry however many recipes reach it: the grid merges
+    identical ``#RRGGBB`` values (m06962), so offering the same colour twice to
+    the matcher or to the 更换颜色 list would only waste rows.  ``recipe`` stays
+    the first recipe (what the compact label shows) and ``recipes`` carries all
+    of them.
+    """
 
     key: str
     color_hex: str
@@ -69,13 +76,22 @@ class PaletteEntry:
     filament_ids: tuple[str, ...]
     recipe: MixRecipe | None = None
     filament: Filament | None = None
+    recipes: tuple[MixRecipe, ...] = ()
 
     @property
     def is_mix(self) -> bool:
         return self.kind == "mix"
 
     @property
+    def recipe_count(self) -> int:
+        if self.recipes:
+            return len(self.recipes)
+        return 1 if self.recipe is not None else 0
+
+    @property
     def ratio_text(self) -> str:
+        if len(self.recipes) > 1:
+            return f"{len(self.recipes)} 个配方"
         return self.recipe.ratio_text if self.recipe is not None else ""
 
     @property
@@ -93,7 +109,7 @@ def build_palette(
     *,
     include_mixes: bool = True,
 ) -> list[PaletteEntry]:
-    """Every colour the user can print: each spool, then every two-spool mix.
+    """Every colour the user can print: each spool, then every distinct mix.
 
     Spools come first so that, when a mix lands exactly on a spool colour, the
     cheaper answer (one spool) wins the tie.
@@ -114,21 +130,26 @@ def build_palette(
         )
 
     if include_mixes and catalog is not None:
-        for recipe in catalog.recipes:
+        for colour in catalog.colours:
+            recipe = colour.first
             a = library.get(recipe.a_id)
             b = library.get(recipe.b_id)
             if a is None or b is None:
                 continue
             entries.append(
                 PaletteEntry(
-                    key=f"mix:{recipe.key}",
-                    color_hex=recipe.color_hex,
-                    rgb=tuple(int(v) for v in recipe.rgb),
-                    lab=np.asarray(recipe.lab, dtype=np.float64),
-                    label=f"{a.display_name} {recipe.percent_a}% + {b.display_name} {recipe.percent_b}%",
+                    key=f"colour:{colour.color_hex}",
+                    color_hex=colour.color_hex,
+                    rgb=tuple(int(v) for v in colour.rgb),
+                    lab=np.asarray(colour.lab, dtype=np.float64),
+                    label=(
+                        f"{a.display_name} {recipe.percent_a}% + "
+                        f"{b.display_name} {recipe.percent_b}%"
+                    ),
                     kind="mix",
                     filament_ids=(recipe.a_id, recipe.b_id),
                     recipe=recipe,
+                    recipes=tuple(colour.recipes),
                 )
             )
     return entries

@@ -45,7 +45,9 @@ from app.core.mixes import (  # noqa: E402
     MIX_RATIOS,
     SORT_CHOICES,
     MixCatalog,
+    MixColour,
     expected_recipe_count,
+    merge_recipes,
     sorted_cells,
     sorted_filaments,
 )
@@ -772,8 +774,10 @@ class CatalogTests(unittest.TestCase):
 
     def test_stats(self):
         catalog = MixCatalog(self._library(4)).build()
-        self.assertEqual(catalog.stats(),
-                         {"filaments": 4, "pairs": 6, "recipes": 486, "ratios": 81})
+        self.assertEqual(
+            catalog.stats(),
+            {"filaments": 4, "pairs": 6, "recipes": 486, "colours": 486, "ratios": 81},
+        )
 
     # -- incremental sync --------------------------------------------------------
     def test_sync_adding_a_spool_matches_a_full_rebuild(self):
@@ -858,6 +862,103 @@ class CatalogTests(unittest.TestCase):
         library.create(brand="大简", material_type="PETG HF", color_hex="#ABCDEF", name="Newer")
         catalog.sync(library)
         self.assertEqual(catalog.recipe_count, expected_recipe_count(2))
+
+
+class MergeColourTests(unittest.TestCase):
+    """「如果混色中出现了完全相同的颜色，则合并成同一个颜色」."""
+
+    def _library(self, *hex_values) -> FilamentLibrary:
+        library = FilamentLibrary()
+        for index, value in enumerate(hex_values):
+            library.create(
+                brand="大简",
+                material_type="PETG HF",
+                color_hex=value,
+                name=f"Spool {index + 1}",
+            )
+        return library
+
+    def test_near_black_mixes_all_collapse_to_one_colour(self):
+        """#000000 and #010101 truncate to #000000 at every ratio."""
+        catalog = MixCatalog(self._library("#000000", "#010101")).build()
+        self.assertEqual(catalog.recipe_count, 81)
+        colours = catalog.colours
+        self.assertEqual(len(colours), 1)
+        self.assertEqual(colours[0].color_hex, "#000000")
+        self.assertEqual(colours[0].recipe_count, 81)
+        self.assertEqual(colours[0].pair_index, 0)
+        self.assertEqual(colours[0].ratio_text, "81 个配方")
+
+    def test_merging_loses_no_recipe(self):
+        catalog = MixCatalog(
+            self._library("#000000", "#010101", "#FFFFFF", "#FEFEFE")
+        ).build()
+        self.assertLess(catalog.colour_count, catalog.recipe_count)
+        self.assertEqual(
+            sum(colour.recipe_count for colour in catalog.colours),
+            catalog.recipe_count,
+        )
+
+    def test_every_merged_recipe_really_has_that_colour(self):
+        catalog = MixCatalog(self._library("#FFFFFF", "#000000", "#FF0000")).build()
+        for colour in catalog.colours:
+            for recipe in colour.recipes:
+                self.assertEqual(recipe.color_hex, colour.color_hex)
+                self.assertEqual(recipe.rgb, colour.rgb)
+
+    def test_an_unambiguous_library_still_merges(self):
+        """Four well-separated spools produce 486 recipes; merging must not
+        invent or drop anything even when every colour is already distinct."""
+        catalog = MixCatalog(self._library("#FFFFFF", "#000000", "#FF0000", "#00FF00")).build()
+        self.assertEqual(catalog.recipe_count, expected_recipe_count(4))
+        self.assertEqual(catalog.colour_count, len(set(r.color_hex for r in catalog.recipes)))
+
+    def test_colour_lookup_by_hex(self):
+        catalog = MixCatalog(self._library("#000000", "#010101")).build()
+        found = catalog.colour_for("#000000")
+        self.assertIsInstance(found, MixColour)
+        self.assertEqual(found.recipe_count, 81)
+        self.assertIsNone(catalog.colour_for("#ABCDEF"))
+
+    def test_colours_are_rgb_sorted_and_sortable(self):
+        catalog = MixCatalog(self._library("#FFFFFF", "#000000", "#FF0000")).build()
+        rgb_order = [colour.rgb for colour in catalog.colours]
+        self.assertEqual(rgb_order, sorted(rgb_order))
+        for key, _ in SORT_CHOICES:
+            with self.subTest(sort=key):
+                self.assertEqual(len(catalog.sorted_colours(key)), catalog.colour_count)
+
+    def test_recipes_of_returns_the_whole_group(self):
+        catalog = MixCatalog(self._library("#000000", "#010101")).build()
+        colour = catalog.colours[0]
+        recipes = catalog.recipes_of(colour)
+        self.assertEqual(len(recipes), 81)
+        self.assertIs(recipes[0], colour.recipes[0])
+
+    def test_sync_rebuilds_the_merged_colours(self):
+        library = self._library("#000000", "#010101")
+        catalog = MixCatalog(library).build()
+        self.assertEqual(catalog.colour_count, 1)
+
+        library.create(brand="大简", material_type="PETG HF", color_hex="#FFFFFF", name="White")
+        catalog.sync(library)
+
+        rebuilt = MixCatalog(library).build()
+        self.assertEqual(catalog.colour_count, rebuilt.colour_count)
+        self.assertEqual(
+            [(c.color_hex, c.recipe_count) for c in catalog.colours],
+            [(c.color_hex, c.recipe_count) for c in rebuilt.colours],
+        )
+        self.assertEqual(
+            sum(c.recipe_count for c in catalog.colours), catalog.recipe_count
+        )
+
+    def test_merge_recipes_is_pure(self):
+        library = self._library("#000000", "#010101")
+        catalog = MixCatalog(library).build()
+        merged = merge_recipes(catalog.recipes)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0].pair_index, 0)
 
 
 class SortedFilamentTests(unittest.TestCase):

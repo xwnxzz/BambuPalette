@@ -133,7 +133,14 @@ def main() -> int:
 
     # --- catalogue -------------------------------------------------------------
     check(window._catalog.pair_count == 10, "10 pairs for 5 spools")
-    check(len(window._recipes) == 810, f"810 mixes in the grid, got {len(window._recipes)}")
+    # The grid shows DISTINCT colours since m06962, so its size is the merged
+    # count — never larger than the raw recipe count.
+    merged = window._catalog.colour_count
+    check(merged <= 810, f"merging never invents colours ({merged} <= 810)")
+    check(
+        len(window._recipes) == merged,
+        f"{merged} distinct colours in the grid, got {len(window._recipes)}",
+    )
     check(window._catalog.engine.id == ENGINE_MIXER, "the Bambu 2.8 pigment engine is the default")
     check(all(r.engine == ENGINE_MIXER for r in window._recipes), "every recipe records its engine")
     check(
@@ -168,8 +175,11 @@ def main() -> int:
     for index, (label, key) in enumerate(SORT_CHOICES):
         window._sort_combo.setCurrentIndex(index)
         app.processEvents()
-        check(len(window._recipes) == 810, f"sort {key!r} keeps all 810 mixes")
-        check(len({id(r) for r in window._recipes}) == 810, f"sort {key!r} has no duplicate cards")
+        check(len(window._recipes) == merged, f"sort {key!r} keeps all {merged} colours")
+        check(
+            len({id(r) for r in window._recipes}) == merged,
+            f"sort {key!r} has no duplicate cards",
+        )
     window._sort_combo.setCurrentIndex(0)
     app.processEvents()
 
@@ -191,7 +201,10 @@ def main() -> int:
 
     select_engine(ENGINE_SPECTRAL)
     check(window._catalog.engine.id == ENGINE_SPECTRAL, "switching the combo swaps the engine")
-    check(len(window._recipes) == 810, "spectral engine still yields 810 mixes")
+    check(
+        len(window._recipes) == window._catalog.colour_count,
+        "spectral engine still covers every merged colour",
+    )
     check(
         all(r.engine == ENGINE_SPECTRAL for r in window._recipes),
         "spectral recipes are tagged with the spectral engine",
@@ -213,7 +226,10 @@ def main() -> int:
 
     select_engine(ENGINE_BAMBU)
     check(window._catalog.engine.id == ENGINE_BAMBU, "the legacy 2.5 sRGB engine is selectable")
-    check(len(window._recipes) == 810, "legacy engine still yields 810 mixes")
+    check(
+        len(window._recipes) == window._catalog.colour_count,
+        "legacy engine still covers every merged colour",
+    )
     check(
         all(r.engine == ENGINE_BAMBU for r in window._recipes),
         "legacy recipes are tagged with the legacy engine",
@@ -234,20 +250,20 @@ def main() -> int:
     probe = window._recipes[len(window._recipes) // 3].color_hex[1:5]
     window._search.setText(probe)
     app.processEvents()
-    check(0 < len(window._recipes) < 810, f"hex search {probe!r} narrows the grid")
+    check(0 < len(window._recipes) < merged, f"hex search {probe!r} narrows the grid")
     check(all(probe in r.color_hex for r in window._recipes), "hex search only keeps matches")
     window._search.setText("大简")
     app.processEvents()
-    check(len(window._recipes) == 810, "a brand search keeps every mix")
+    check(len(window._recipes) == merged, "a brand search keeps every colour")
     window._search.setText("PETG HF 青")
     app.processEvents()
-    check(0 < len(window._recipes) < 810, "a spool-name search narrows the grid")
+    check(0 < len(window._recipes) < merged, "a spool-name search narrows the grid")
     window._search.setText("zzzz-not-a-colour")
     app.processEvents()
     check(window._recipes == [], "a miss empties the grid")
     window._search.clear()
     app.processEvents()
-    check(len(window._recipes) == 810, "clearing the search restores all 810")
+    check(len(window._recipes) == merged, f"clearing the search restores all {merged} colours")
 
     # --- pair filter ----------------------------------------------------------
     a, b = library[0], library[2]
@@ -271,9 +287,10 @@ def main() -> int:
         a.display_name in window._filter_label.text() or b.display_name in window._filter_label.text(),
         f"the banner names the filtered spools, got {window._filter_label.text()!r}",
     )
+    hidden = max(window._catalog.colour_count - 81, 0)
     check(
         "现在显示 81 个" in window._filter_label.text()
-        and "另外 729 个没有显示" in window._filter_label.text(),
+        and f"另外 {hidden} 个没有显示" in window._filter_label.text(),
         "the banner says how many are shown and how many are hidden, "
         f"got {window._filter_label.text()!r}",
     )
@@ -292,7 +309,7 @@ def main() -> int:
 
     window._clear_filters()
     app.processEvents()
-    check(len(window._recipes) == 810, "clear filters restores the full catalogue")
+    check(len(window._recipes) == merged, "clear filters restores the full catalogue")
     check(window._filter_bar.isHidden(), "clearing the filter hides the banner")
     check(
         window._show_all_button.property("accent") == "false",
@@ -309,7 +326,19 @@ def main() -> int:
     window._on_grid_selected(target)
     app.processEvents()
     shown = window._detail.recipe()
-    check(shown is not None and shown.key == target.key, "selection reaches the detail panel")
+    check(
+        window._detail.colour() is target and shown is not None,
+        "selection reaches the detail panel",
+    )
+    check(
+        shown.key == target.first.key,
+        "the panel explains the merged colour's first recipe",
+    )
+    check(
+        window._detail.selectionKey() == target.key,
+        "the detail panel remembers the merged colour, not just one recipe",
+    )
+    check(target.recipe_count >= 1, "a merged colour always keeps at least one recipe")
     check(shown.percent_a + shown.percent_b == 100, "a pair ratio always sums to 100")
     check(
         shown.a_id in {f.id for f in library} and shown.b_id in {f.id for f in library},
@@ -319,6 +348,45 @@ def main() -> int:
         tuple(shown.pair_key) == (shown.a_id, shown.b_id),
         "pair_key is the parent spool id pair",
     )
+
+    # --- a merged colour lists EVERY recipe that reaches it --------------------
+    shared = [colour for colour in window._catalog.colours if colour.recipe_count > 1]
+    check(bool(shared), f"some colours are reachable more than once ({len(shared)})")
+    if shared:
+        merged_colour = max(shared, key=lambda colour: colour.recipe_count)
+        window._grid.selectRecipe(merged_colour)
+        window._on_grid_selected(merged_colour)
+        app.processEvents()
+        check(
+            window._detail.colour() is merged_colour,
+            "the detail panel keeps the clicked merged colour",
+        )
+        listed = [row for row in window._detail._formula_rows if not row["frame"].isHidden()]
+        check(
+            len(listed) == merged_colour.recipe_count,
+            f"all {merged_colour.recipe_count} recipes are listed, got {len(listed)}",
+        )
+        check(
+            window._detail._formula_title.isVisible()
+            and str(merged_colour.recipe_count) in window._detail._formula_title.text(),
+            f"the list is titled with the count, got {window._detail._formula_title.text()!r}",
+        )
+        keys = [row["key"].text() for row in listed]
+        check(
+            set(keys) == {recipe.key for recipe in merged_colour.recipes},
+            "the listed rows are exactly that colour's recipes",
+        )
+        check(
+            all(row["swatch"].hex() == merged_colour.color_hex for row in listed),
+            "every listed recipe really produces the selected colour",
+        )
+        check(
+            all(row["text"].text().count("%") == 2 for row in listed),
+            "each listed row spells out both percentages",
+        )
+        window._detail.clear()
+    window._refresh_grid()
+    app.processEvents()
 
     # --- blank space clears the selection; nothing is ever dimmed --------------
     from PySide6.QtCore import QEvent, QPointF, Qt  # noqa: E402
@@ -364,7 +432,7 @@ def main() -> int:
     )
     window._refresh_grid()
     app.processEvents()
-    check(len(window._recipes) == 810, "restoring the full catalogue after the blank click")
+    check(len(window._recipes) == merged, "restoring the full catalogue after the blank click")
 
     # --- 全部颜色: raw spools beside the mixes --------------------------------
     # The request was "输入两个颜色，全部颜色就是83个颜色" -> 81 mixes + 2 raw spools.
@@ -388,17 +456,17 @@ def main() -> int:
     check(expected_recipe_count(2) == 81, "two spools make 81 mixes")
     check(expected_recipe_count(2) + 2 == 83, "81 mixes + the 2 raw spools = the 83 colours asked for")
 
-    check(len(window._recipes) == 810, "with the box off the grid is mixes only")
+    check(len(window._recipes) == merged, "with the box off the grid is mixes only")
     window._all_colours.setChecked(True)
     app.processEvents()
     check(
-        len(window._recipes) == 810 + len(library),
+        len(window._recipes) == merged + len(library),
         f"ticking it adds one row per spool, got {len(window._recipes)} for {len(library)} spools",
     )
     spools = [cell for cell in window._recipes if getattr(cell, "pair_index", 0) < 0]
     mixes = [cell for cell in window._recipes if getattr(cell, "pair_index", 0) >= 0]
     check(len(spools) == len(library), f"one spool row per spool, got {len(spools)}")
-    check(len(mixes) == 810, f"the 810 mixes are untouched, got {len(mixes)}")
+    check(len(mixes) == merged, f"the {merged} merged colours are untouched, got {len(mixes)}")
     check(all(cell.is_spool for cell in spools), "every spool row reports itself as a spool")
     check(
         all(cell.color_hex == cell.filament.color_hex for cell in spools),
@@ -450,14 +518,14 @@ def main() -> int:
     window._search.setText("大简")
     app.processEvents()
     check(
-        len(window._recipes) == 810 + len(library),
+        len(window._recipes) == merged + len(library),
         "a brand search keeps every spool row too",
     )
     window._search.clear()
     app.processEvents()
     window._all_colours.setChecked(False)
     app.processEvents()
-    check(len(window._recipes) == 810, "un-ticking 全部颜色 restores the mixes-only grid")
+    check(len(window._recipes) == merged, "un-ticking 全部颜色 restores the mixes-only grid")
     window._detail.clear()
 
     # --- a one-spool edit reuses the catalogue instead of rebuilding it --------
@@ -495,7 +563,7 @@ def main() -> int:
         remove_seconds < 1.0,
         f"a one-spool delete is not a full rebuild, took {remove_seconds:.3f}s",
     )
-    check(len(window._recipes) == 810, "the grid is back to 810 after the round trip")
+    check(len(window._recipes) == merged, "the grid is back to the merged count after the round trip")
 
     # --- no preset colour, no delete prompt, Del deletes -----------------------
     from PySide6.QtGui import QKeySequence  # noqa: E402
@@ -610,7 +678,10 @@ def main() -> int:
         f"the delayed build fills the catalogue, got "
         f"{None if deferred._catalog is None else deferred._catalog.recipe_count}",
     )
-    check(len(deferred._recipes) == 810, "and the grid fills in")
+    check(
+        len(deferred._recipes) == deferred._catalog.colour_count,
+        "and the grid fills in with the merged colours",
+    )
     check(not deferred._build_notice, "the wait cursor is taken back down")
     check(app.overrideCursor() is None, "no override cursor is left behind")
     check(

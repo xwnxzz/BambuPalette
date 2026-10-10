@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QFrame,
+    QScrollArea,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -51,6 +52,7 @@ from ..core.mixes import (
     SORT_PAIR,
     SORT_RGB,
     MixCatalog,
+    merge_recipes,
     sorted_cells,
 )
 from ..spectral import color as _color
@@ -204,11 +206,20 @@ class MainWindow(QMainWindow):
         self._detail = MixDetail()
         self._detail.pairRequested.connect(self._show_pair)
         self._detail.showAllRequested.connect(self._clear_filters)
-        splitter.addWidget(self._wrap(self._detail, ""))
+        # A colour reachable by a dozen recipes makes this panel taller than the
+        # window, and a QSplitter squeezes its children rather than scrolling
+        # them — the recipe rows then collapse to a few pixels and print on top
+        # of each other.  The scroll area gives the panel its real height back.
+        detail_scroll = QScrollArea()
+        detail_scroll.setWidgetResizable(True)
+        detail_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        detail_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        detail_scroll.setWidget(self._detail)
+        splitter.addWidget(self._wrap(detail_scroll, ""))
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 0)
-        splitter.setSizes([300, 640, 400])
+        splitter.setSizes([288, 612, 440])
 
         blurb = QLabel(
             "输入你自己的耗材颜色，程序自动算出所有两两混色的 81 个配比；"
@@ -684,21 +695,22 @@ class MainWindow(QMainWindow):
     def _matches(self, cell, query: str) -> bool:
         """Does one grid cell survive the search box?
 
-        A spool cell is matched on its own name/brand/type/note; a mix cell also
-        on both of its parents, so searching a spool name still finds every mix
-        made from it.
+        A spool cell is matched on its own name/brand/type/note; a colour cell
+        also on the parents of every recipe that produces it, so searching a
+        spool name still finds every colour that spool takes part in.
         """
-        if getattr(cell, "pair_index", 0) < 0:
+        if getattr(cell, "pair_index", 0) < 0 and hasattr(cell, "filament"):
             filament = cell.filament
             if _HEX_QUERY.match(query):
                 return query.lower() in filament.color_hex[1:].lower()
             return query in self._filament_haystack(filament)
         if _HEX_QUERY.match(query):
             return query.lower() in cell.color_hex[1:].lower()
-        for filament_id in (cell.a_id, cell.b_id):
-            filament = self.library.get(filament_id)
-            if filament is not None and query in self._filament_haystack(filament):
-                return True
+        for recipe in getattr(cell, "recipes", (cell,)):
+            for filament_id in (recipe.a_id, recipe.b_id):
+                filament = self.library.get(filament_id)
+                if filament is not None and query in self._filament_haystack(filament):
+                    return True
         return False
 
     def _refresh_grid(self) -> None:
@@ -707,16 +719,18 @@ class MainWindow(QMainWindow):
 
         sort_key = self._sort_combo.currentData() or SORT_RGB
         if self._pair_filter is not None:
+            # One pair still has to be merged: its 81 recipes can repeat a colour.
             recipes = self._catalog.pair_recipes(*self._pair_filter)
+            cells_source = merge_recipes(recipes)
             grouped = False
         elif self._catalog.recipe_count:
-            recipes = self._catalog.sorted_recipes(sort_key)
+            cells_source = self._catalog.sorted_colours(sort_key)
             grouped = sort_key == SORT_PAIR
         else:
             # Fewer than two spools: there are no mixes, but 「全部颜色」 can still
             # have something to show.  Bailing out here was why a single spool
             # left the middle panel empty while the footer counted its colour.
-            recipes = []
+            cells_source = []
             grouped = False
 
         # 「全部颜色」 adds the spools themselves, so a two-spool library offers
@@ -730,14 +744,16 @@ class MainWindow(QMainWindow):
 
         query = self._search.text().strip().lstrip("#").casefold()
         if query:
-            recipes = [recipe for recipe in recipes if self._matches(recipe, query)]
+            cells_source = [
+                colour for colour in cells_source if self._matches(colour, query)
+            ]
             spools = [cell for cell in spools if self._matches(cell, query)]
             grouped = False
 
         if spools:
-            cells = sorted_cells(spools + recipes, sort_key, label_of=self._label_of)
+            cells = sorted_cells(spools + cells_source, sort_key, label_of=self._label_of)
         else:
-            cells = recipes
+            cells = cells_source
 
         # Truly nothing to show — an empty library, or a search that matched
         # nothing. The grid has to say so instead of rendering zero rows.
@@ -765,10 +781,12 @@ class MainWindow(QMainWindow):
         pairs = count * (count - 1) // 2
         shown = len(self._recipes)
         total = pairs * len(MIX_RATIOS)
+        colours = self._catalog.colour_count if self._catalog is not None else 0
+        everything = colours + (count if self._all_colours.isChecked() else 0)
         parts = [f"耗材 {count} 种", f"母材组合 {pairs} 对", f"混色 {total} 个"]
-        if self._all_colours.isChecked():
-            parts.append(f"加耗材本色后 {total + count} 个")
-        if shown != total + (count if self._all_colours.isChecked() else 0):
+        if colours and colours != total:
+            parts.append(f"去掉重复后 {colours} 个颜色")
+        if shown != everything:
             parts.append(f"当前显示 {shown} 个")
         if self._build_seconds:
             parts.append(f"计算用时 {self._build_seconds * 1000:.0f} ms")
@@ -776,15 +794,15 @@ class MainWindow(QMainWindow):
         self._grid_info.setText(
             f"每两种耗材 81 个配比（10%–90%）"
             + (
-                f" · 含 {count} 种耗材本色，共 {total + count} 个颜色"
+                f" · 含 {count} 种耗材本色，共 {colours + count} 个颜色"
                 if self._all_colours.isChecked()
-                else ""
+                else f" · 去重后共 {colours} 个颜色" if colours else ""
             )
             + (f" · 已按「{self._sort_combo.currentText()}」排列" if self._pair_filter is None else "")
         )
-        self._update_filter_bar(shown, total, count)
+        self._update_filter_bar(shown, everything, count)
 
-    def _update_filter_bar(self, shown: int, total: int, count: int) -> None:
+    def _update_filter_bar(self, shown: int, everything: int, count: int) -> None:
         """Show why the grid is short, and offer the way back to everything."""
         reasons = []
         if self._pair_filter is not None:
@@ -802,7 +820,6 @@ class MainWindow(QMainWindow):
         if not reasons:
             self._filter_bar.setVisible(False)
         else:
-            everything = total + (count if self._all_colours.isChecked() else 0)
             hidden = max(everything - shown, 0)
             self._filter_label.setText(
                 f"{'、'.join(reasons)}：现在显示 {shown} 个，另外 {hidden} 个没有显示。"
@@ -846,27 +863,30 @@ class MainWindow(QMainWindow):
     def _on_grid_selected(self, cell) -> None:
         # A spool cell is not a mix, so it has no pair to explain: it gets the
         # single-colour view instead of a fabricated 100% : 0% recipe.
-        if getattr(cell, "pair_index", 0) < 0:
+        if getattr(cell, "pair_index", 0) < 0 and hasattr(cell, "filament"):
             self._detail.showFilament(cell.filament)
             self._status.setText(
                 f"{cell.color_hex}  =  {cell.filament.display_name}（耗材本色，不是混色）"
             )
             return
-        self._detail.showRecipe(cell)
-        filament_a = self.library.get(cell.a_id)
-        filament_b = self.library.get(cell.b_id)
+        self._detail.showColour(cell)
+        first = cell.recipes[0] if getattr(cell, "recipes", None) else cell
+        filament_a = self.library.get(first.a_id)
+        filament_b = self.library.get(first.b_id)
         if filament_a and filament_b:
+            more = f"  等 {cell.recipe_count} 条配方" if getattr(cell, "recipe_count", 1) > 1 else ""
             self._status.setText(
-                f"{cell.color_hex}  =  {filament_a.display_name}（{filament_a.color_hex}）{cell.percent_a}%"
-                f"  +  {filament_b.display_name}（{filament_b.color_hex}）{cell.percent_b}%"
+                f"{cell.color_hex}  =  {filament_a.display_name}（{filament_a.color_hex}）{first.percent_a}%"
+                f"  +  {filament_b.display_name}（{filament_b.color_hex}）{first.percent_b}%{more}"
             )
 
     def _on_grid_activated(self, cell) -> None:
-        """Double-click: a mix jumps to its parent pair, a spool has no pair."""
-        if getattr(cell, "pair_index", 0) < 0:
+        """Double-click: a colour jumps to its first parent pair, a spool has none."""
+        if getattr(cell, "pair_index", 0) < 0 and hasattr(cell, "filament"):
             self._detail.showFilament(cell.filament)
             return
-        self._show_pair(cell.a_id, cell.b_id)
+        first = cell.recipes[0] if getattr(cell, "recipes", None) else cell
+        self._show_pair(first.a_id, first.b_id)
 
     def _on_grid_cleared(self) -> None:
         """The user clicked blank space (or pressed Esc): drop the recipe."""

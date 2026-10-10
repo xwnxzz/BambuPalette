@@ -111,8 +111,33 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     window.show()
     app.processEvents()
 
-    check(len(window._recipes) == expected_recipe_count(5) == 810, "5 spools produce 810 mixes")
+    check(expected_recipe_count(5) == 810, "5 spools produce 810 mixes")
+    merged = window._catalog.colour_count
+    check(merged <= 810, f"merging identical colours never adds any ({merged} <= 810)")
+    check(
+        len(window._recipes) == merged,
+        f"the grid holds one card per distinct colour, got {len(window._recipes)} for {merged}",
+    )
     check(window._catalog.pair_count == 10, "5 spools produce 10 pairs")
+
+    # 「颜色详情里有合成这个颜色的所有配方」: a colour reached by two recipes must
+    # list both, not just the first.
+    shared = [colour for colour in window._catalog.colours if colour.recipe_count > 1]
+    check(
+        len(shared) == 810 - merged,
+        f"{810 - merged} colours are reachable by more than one recipe, got {len(shared)}",
+    )
+    if shared:
+        window._grid.selectRecipe(shared[0])
+        window._on_grid_selected(shared[0])
+        app.processEvents()
+        check(window._detail.colour() is shared[0], "the detail panel keeps the merged colour")
+        listed = [row for row in window._detail._formula_rows if not row["frame"].isHidden()]
+        check(
+            len(listed) == shared[0].recipe_count,
+            f"the panel lists all {shared[0].recipe_count} recipes of that colour, got {len(listed)}",
+        )
+        window._detail.clear()
     check(window._catalog.engine.id == ENGINE_MIXER, "the Bambu 2.8 mixer engine is the default")
     check(
         ENGINES[ENGINE_MIXER].mix_rgb_pair((0, 33, 133), (252, 211, 0), 50) == (47, 141, 56),
@@ -176,7 +201,7 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     )
     window._refresh_grid()
     app.processEvents()
-    check(len(window._recipes) == 810, "the full catalogue comes back after clearing")
+    check(len(window._recipes) == merged, "the full catalogue comes back after clearing")
 
     # 「全部颜色」 — the raw spools join the grid so two inputs give 83 colours.
     from .core.mixes import expected_recipe_count
@@ -188,7 +213,7 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     window._all_colours.setChecked(True)
     app.processEvents()
     check(
-        len(window._recipes) == 810 + spool_count,
+        len(window._recipes) == merged + spool_count,
         f"ticking 「全部颜色」 adds one row per spool, got {len(window._recipes)}",
     )
     spool_rows = [c for c in window._recipes if getattr(c, "pair_index", 0) < 0]
@@ -209,7 +234,7 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     check(window._detail.filament() is not None, "the detail panel shows the raw spool itself")
     window._all_colours.setChecked(False)
     app.processEvents()
-    check(len(window._recipes) == 810, "un-ticking 「全部颜色」 restores the mixes-only grid")
+    check(len(window._recipes) == merged, "un-ticking 「全部颜色」 restores the mixes-only grid")
     window._detail.clear()
 
     # A new spool has no colour until the user picks one, and the dialog refuses
@@ -322,7 +347,10 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     image.save(picture)
 
     palette = build_palette(library, window._catalog)
-    check(len(palette) == 5 + 810, f"the candidate palette has every spool and mix ({len(palette)})")
+    check(
+        len(palette) == 5 + merged,
+        f"the candidate palette has every spool and every distinct mix ({len(palette)})",
+    )
 
     result = match_image(picture, palette, MatchSettings(max_colours=12))
     check(result.printed_pixels > 0, f"the picture matched ({result.printed_pixels} solid pixels)")
