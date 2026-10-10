@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,12 +12,15 @@ import numpy as np
 from app.core.engines import ENGINE_BAMBU, ENGINE_MIXER
 from app.core.library import Filament, FilamentLibrary
 from app.core.triples import (
+    TRIPLE_CACHE_KEEP,
+    TRIPLE_CACHE_PREFIX,
     TRIPLE_RATIO_COUNT,
     OrderedTripleColours,
     TripleCatalog,
     TripleColours,
     load_triple_cache,
     mix_sidecar_path,
+    prune_triple_caches,
     save_triple_cache,
     triple_cache_key,
     triple_pair_count,
@@ -203,6 +207,60 @@ class TripleCacheTests(unittest.TestCase):
                 str(data["key"].item()),
                 triple_cache_key(self.library.filaments, ENGINE_MIXER),
             )
+
+    def test_a_cache_from_another_library_is_refused(self):
+        # 指纹对不上就当作没有缓存——颜色绝不会张冠李戴。
+        path = Path(self.tmp.name) / "cache" / "triples.npz"
+        save_triple_cache(self.catalog, path)
+        self.assertIsNotNone(
+            load_triple_cache(path, self.library.filaments, ENGINE_MIXER)
+        )
+        other = _library(*SIX[:4])
+        other.filaments[0].color_hex = "#010203"
+        self.assertIsNone(load_triple_cache(path, other.filaments, ENGINE_MIXER))
+        self.assertIsNone(load_triple_cache(path, self.library.filaments, ENGINE_BAMBU))
+
+    def test_old_caches_are_pruned_so_the_disk_does_not_fill_up(self):
+        folder = Path(self.tmp.name) / "cache"
+        folder.mkdir()
+        for index in range(5):
+            item = folder / f"{TRIPLE_CACHE_PREFIX}aaaaaaa{index}.npz"
+            item.write_bytes(b"x")
+            os.utime(item, (1_700_000_000 + index, 1_700_000_000 + index))
+        (folder / f"{TRIPLE_CACHE_PREFIX}bbbbbbbb.npz.tmp").write_bytes(b"x")
+        (folder / "unrelated.npz").write_bytes(b"x")
+
+        removed = prune_triple_caches(folder, keep=2)
+
+        left = sorted(item.name for item in folder.glob("*.npz"))
+        self.assertEqual(
+            left,
+            [
+                f"{TRIPLE_CACHE_PREFIX}aaaaaaa3.npz",
+                f"{TRIPLE_CACHE_PREFIX}aaaaaaa4.npz",
+                "unrelated.npz",
+            ],
+        )
+        self.assertIn(f"{TRIPLE_CACHE_PREFIX}aaaaaaa0.npz", removed)
+        self.assertEqual(list(folder.glob("*.tmp")), [])
+
+    def test_saving_a_cache_prunes_the_siblings(self):
+        folder = Path(self.tmp.name) / "cache"
+        folder.mkdir()
+        for index in range(5):
+            (folder / f"{TRIPLE_CACHE_PREFIX}stale{index}.npz").write_bytes(b"x")
+        target = folder / f"{TRIPLE_CACHE_PREFIX}live.npz"
+        save_triple_cache(self.catalog, target)
+        names = sorted(item.name for item in folder.glob("*.npz"))
+        self.assertIn(target.name, names)
+        self.assertLessEqual(len(names), TRIPLE_CACHE_KEEP)
+        # 导出用的 sidecar 是另一个前缀，不该顺手删掉别人的缓存。
+        sidecar_folder = Path(self.tmp.name) / "export"
+        sidecar_folder.mkdir()
+        for index in range(4):
+            (sidecar_folder / f"{TRIPLE_CACHE_PREFIX}keep{index}.npz").write_bytes(b"x")
+        save_triple_cache(self.catalog, sidecar_folder / "档案.mixes.npz")
+        self.assertEqual(len(list(sidecar_folder.glob("*.npz"))), 5)
 
 
 class SidecarPathTests(unittest.TestCase):

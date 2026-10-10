@@ -436,6 +436,36 @@ def main() -> int:
     check(cache_file.is_file(), f"the triple table is cached at {cache_file.name}")
     check(not window._search.isEnabled(), "search is off while 三色混色 is on")
     check(not window._all_colours.isEnabled(), "全部颜色 is off while 三色混色 is on")
+
+    # Adding a spool while the triple table is on must throw the old table away
+    # and start over — otherwise the stale colours would be cached under the new
+    # library's file name and every later launch would show the wrong mixes.
+    before_colours = len(window._triple_view)
+    spare = Filament(brand="大简", material_type="PETG HF", color_hex="#123456")
+    window.library.add(spare)
+    window._reload_library()
+    app.processEvents()
+    deadline = time.time() + 60
+    while window._triple_view is None and time.time() < deadline:
+        app.processEvents()
+        time.sleep(0.01)
+    check(
+        window._triples_box.isChecked() and window._triple_view is not None,
+        "editing the library rebuilds the triple table instead of keeping stale colours",
+    )
+    check(
+        len(window._triple_view) != before_colours,
+        f"the rebuilt table covers the new spool too ({before_colours:,} -> "
+        f"{len(window._triple_view):,} colours)",
+    )
+    window.library.remove(spare.id)
+    window._reload_library()
+    app.processEvents()
+    deadline = time.time() + 60
+    while window._triple_view is None and time.time() < deadline:
+        app.processEvents()
+        time.sleep(0.01)
+
     window._triples_box.setChecked(False)
     app.processEvents()
     check(window._triple_view is None, "unticking 三色混色 goes back to the pair table")

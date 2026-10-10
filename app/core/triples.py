@@ -36,6 +36,9 @@ TRIPLE_MIN_PERCENT = 10
 TRIPLE_RATIO_COUNT = 2556
 # 每次丢给混色引擎的三卷组数。24 x 2556 = 61,344 行，够快也够省内存。
 TRIPLE_CHUNK = 24
+# 磁盘缓存的文件名前缀，以及最多保留几份。
+TRIPLE_CACHE_PREFIX = "triples-"
+TRIPLE_CACHE_KEEP = 3
 
 
 def triple_ratios(minimum: int = TRIPLE_MIN_PERCENT) -> np.ndarray:
@@ -655,10 +658,53 @@ def save_triple_cache(catalog: "TripleCatalog", path) -> None:
     with temporary.open("wb") as handle:
         np.savez(handle, **payload)
     os.replace(temporary, target)
+    if target.name.startswith(TRIPLE_CACHE_PREFIX):
+        prune_triple_caches(target.parent)
+
+
+def prune_triple_caches(directory, keep: int = TRIPLE_CACHE_KEEP) -> "list[str]":
+    """只留最近的 ``keep`` 份三色缓存，其余的删掉。
+
+    41 卷一份缓存约 153 MB，而缓存名是「耗材库 + 引擎」的指纹：加一卷或
+    改一个颜色就换一个键，旧文件再也没人读得到。不清理的话每编辑一次
+    就多占 153 MB，所以每存一份新的就顺手扫一遍目录。
+    """
+    from pathlib import Path
+
+    folder = Path(directory)
+    if not folder.is_dir():
+        return []
+    removed: list[str] = []
+    for stale in folder.glob(f"{TRIPLE_CACHE_PREFIX}*.tmp"):
+        try:
+            stale.unlink()
+            removed.append(stale.name)
+        except OSError:  # pragma: no cover - another process may hold it
+            pass
+    caches = sorted(
+        (
+            item
+            for item in folder.glob(f"{TRIPLE_CACHE_PREFIX}*.npz")
+            if item.is_file()
+        ),
+        key=lambda item: item.stat().st_mtime,
+        reverse=True,
+    )
+    for old in caches[max(int(keep), 1):]:
+        try:
+            old.unlink()
+            removed.append(old.name)
+        except OSError:  # pragma: no cover - another process may hold it
+            pass
+    return removed
 
 
 def load_triple_cache(path, filaments: Sequence, engine: str = DEFAULT_ENGINE):
-    """读缓存；文件不存在或损坏时安静地返回 ``None``。"""
+    """读缓存；文件不存在、损坏或不属于这套耗材时安静地返回 ``None``。
+
+    一定要核对指纹：加一卷耗材之后缓存文件名虽然变了，但旧文件还在，
+    万一被搬到新名字上（比如边算边改耗材库），颜色就会张冠李戴。
+    """
     from pathlib import Path
 
     target = Path(path)
@@ -666,6 +712,9 @@ def load_triple_cache(path, filaments: Sequence, engine: str = DEFAULT_ENGINE):
         return None
     try:
         with np.load(target) as data:
+            if "key" in data.files:
+                if str(data["key"].item()) != triple_cache_key(filaments, engine):
+                    return None
             return TripleCatalog.loads(filaments, data, engine=engine)
     except Exception:
         return None

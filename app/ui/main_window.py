@@ -57,9 +57,11 @@ from ..core.mixes import (
 )
 from ..spectral import color as _color
 from ..core.triples import (
+    TRIPLE_CACHE_PREFIX,
     TripleCatalog,
     load_triple_cache,
     mix_sidecar_path,
+    prune_triple_caches,
     save_triple_cache,
     triple_cache_key,
 )
@@ -713,6 +715,7 @@ class MainWindow(QMainWindow):
             # rebuild is 66,420 recipes and ~3 s at 41 spools.
             catalog.sync(self.library.filaments)
         self._build_seconds = time.perf_counter() - started
+        self._invalidate_triples()
         self._end_build_notice()
         self._detail.setContext(self.library, self._catalog.engine)
         if getattr(self, "_picture_page", None) is not None:
@@ -809,7 +812,22 @@ class MainWindow(QMainWindow):
         """三色混色缓存在哪：一个耗材库 + 一个引擎一个文件。"""
         engine_id = self._catalog.engine.id if self._catalog is not None else DEFAULT_ENGINE
         key = triple_cache_key(self.library.filaments, engine_id)
-        return paths.data_dir() / "cache" / f"triples-{key}.npz"
+        return paths.data_dir() / "cache" / f"{TRIPLE_CACHE_PREFIX}{key}.npz"
+
+    def _invalidate_triples(self) -> None:
+        """耗材库或引擎变了，三色表就过期了：正在算的停掉，算好的丢掉。
+
+        否则一边算一边改耗材，算完的那张表还是旧配方，却会被当成新耗材库的
+        缓存写下去（文件名按新库取，内容按旧库算），下次打开就全是错颜色。
+        """
+        if self._triples is None and self._triple_timer is None:
+            return
+        self._stop_triple_timer()
+        self._triples = None
+        self._triple_view = None
+        self._end_build_notice()
+        if self._triples_box.isChecked():
+            self._on_triples_toggled(True)
 
     def _set_search_enabled(self, enabled: bool) -> None:
         """三色混色时关掉搜索框：4.3 M 个颜色没法逐个套名字。"""
@@ -849,6 +867,8 @@ class MainWindow(QMainWindow):
         if cached is not None and cached.colour_count:
             self._triples = cached
             self._triple_view = cached.colours()
+            # 命中缓存就顺手清掉旧耗材库留下的那几份（一份约 153 MB）。
+            prune_triple_caches(self._triples_path().parent)
             self._refresh_grid()
             return
         self._start_triple_build()
