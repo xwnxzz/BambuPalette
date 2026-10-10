@@ -224,6 +224,10 @@ samples/      示例图片、界面截图、示例模型
 
 ![启动时先出窗口](samples/startup-calculating.png)
 
+「图片转模型」页载入图片后，改动耗材库不会再把时间花在你**看不见**的
+那张结果上 —— 在「混色配方」页改一次耗材只要 0.22 秒（原来 1.34 秒），
+切回「图片转模型」页时它才补做匹配（见 §17）。
+
 ![大简 PETG HF 色卡](presets/大简-PETG-HF-预览.png)
 
 这张表也写在 `tools/make_dajian_preset.py` 里，改完重跑就能重新生成 JSON。

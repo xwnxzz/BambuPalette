@@ -361,6 +361,9 @@ class PicturePage(QWidget):
         # re-running the match, and so the export follows the user's choice.
         self._auto_palette: list[PaletteEntry] = []
         self._overrides: dict[int, PaletteEntry] = {}
+        # Set when the library changed while this page was off screen; the
+        # re-match is then done in showEvent instead of in setLibrary.
+        self._stale = False
         self._build_ui()
         self._set_controls_enabled(False)
 
@@ -534,7 +537,21 @@ class PicturePage(QWidget):
         """Called whenever the filament library or the mix catalogue changes."""
         self._library = library
         self._catalog = catalog
-        if self._image is not None:
+        if self._image is None:
+            return
+        if not self.isVisible():
+            # The 混色配方 tab is showing, so nobody can see the picture.  A
+            # re-match against 66,461 candidates costs ~0.7 s and would be spent
+            # on a result that is not on screen; remember that it is owed and
+            # do it when the tab comes back.
+            self._stale = True
+            return
+        self._on_rematch()
+
+    def showEvent(self, event) -> None:  # noqa: N802 (Qt naming)
+        super().showEvent(event)
+        if self._stale:
+            self._stale = False
             self._on_rematch()
 
     @property

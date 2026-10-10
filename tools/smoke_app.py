@@ -959,6 +959,32 @@ def main() -> int:
                 _picture_page.QFileDialog = original_dialog
                 _picture_page.QMessageBox = original_box
 
+    # --- the picture page only re-matches when it is on screen -----------------
+    # At 41 spools a re-match is ~0.7 s against 66,461 candidates; spending it
+    # while the 混色配方 tab is showing buys the user nothing.
+    page._stale = False
+    window._tabs.setCurrentIndex(0)
+    app.processEvents()
+    check(not page.isVisible(), "the 混色配方 tab is the one on screen")
+    before_result = page.result
+    spare = Filament(brand="大简", material_type="PETG HF", color_hex="#123456")
+    library.add(spare)
+    window._reload_library()
+    app.processEvents()
+    check(page._stale, "a library change while the picture tab is hidden defers the re-match")
+    check(page.result is before_result, "the deferred re-match leaves the result alone")
+    window._tabs.setCurrentIndex(1)
+    app.processEvents()
+    check(not page._stale, "coming back to the picture tab clears the deferred flag")
+    check(
+        page.result is not None and page.result is not before_result,
+        "the picture is re-matched on the way back to the tab",
+    )
+    window._tabs.setCurrentIndex(0)
+    library.remove(spare.id)
+    window._reload_library()
+    app.processEvents()
+
     # --- persistence round trip ------------------------------------------------
     window._save_library()
     check(paths.library_path().is_file(), "the library was written to disk")
