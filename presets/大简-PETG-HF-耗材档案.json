@@ -1,0 +1,417 @@
+{
+  "formatVersion": 2,
+  "savedAt": "2026-10-10T07:10:42+00:00",
+  "note": "大简 PETG HF 官方色卡，共 41 色",
+  "filaments": [
+    {
+      "id": "dajian-petg-hf-01",
+      "name": "白色",
+      "brand": "大简",
+      "materialType": "PETG HF",
+      "colorHex": "#F7F3F3",
+      "note": "",
+      "createdAt": "2026-10-10T07:10:42+00:00",
+      "updatedAt": "2026-10-10T07:10:42+00:00"
+    },
+    {
+      "id": "dajian-petg-hf-02",
+      "name": "黑色",
+      "brand": "大简",
+      "materialType": "PETG HF",
+      "colorHex": "#2C2A2C",
+      "note": "",
+      "createdAt": "2026-10-10T07:10:42+00:00",
+      "updatedAt": "2026-10-10T07:10:42+00:00"
+    },
+    {
+      "id": "dajian-petg-hf-03",
+      "name": "灰色",
+      "brand": "大简",
+      "materialType": "PETG HF",
+      "colorHex": "#A4A3A3",
+      "note": "",
+      "createdAt": "2026-10-10T07:10:42+00:00",
+      "updatedAt": "2026-10-10T07:10:42+00:00"
+    },
+    {
+      "id": "dajian-petg-hf-04",
+      "name": "天蓝色",
+      "brand": "大简",
+      "materialType": "PETG HF",
+      "colorHex": "#60B2DE",
+      "note": "",
+      "createdAt": "2026-10-10T07:10:42+00:00",
+      "updatedAt": "2026-10-10T07:10:42+00:00"
+    },
+    {
+      "id": "dajian-petg-hf-05",
+      "name": "橙色",
+      "brand": "大简",
+      "materialType": "PETG HF",
+      "colorHex": "#FF6C2B",
+      "note": "",
+      "createdAt": "2026-10-10T07:10:42+00:00",
+      "updatedAt": "2026-10-10T07:10:42+00:00"
+    },
+    {
+      "id": "dajian-petg-hf-06",
+      "name": "透明",
+      "brand": "大简",
+      "materialType": "PETG HF",
+      "colorHex": "#969696",
+      "note": "",
+      "createdAt": "2026-10-10T07:10:42+00:00",
+      "updatedAt": "2026-10-10T07:10:42+00:00"
+    },
+    {
+      "id": "dajian-petg-hf-07",
+      "name": "透明紫",
+      "brand": "大简",
+      "materialType": "PETG HF",
+      "colorHex": "#887D95",
+      "note": "色值待确认：原始清单里带问号",
+      "createdAt": "2026-10-10T07:10:42+00:00",
+      "updatedAt": "2026-10-10T07:10:42+00:00"
+    },
+    {
+      "id": "dajian-petg-hf-08",
+      "name": "透明绿",
+      "brand": "大简",
+      "materialType": "PETG HF",
+      "colorHex": "#98B159",
+      "note": "",
+      "createdAt": "2026-10-10T07:10:42+00:00",
+      "updatedAt": "2026-10-10T07:10:42+00:00"
+    },
+    {
+      "id": "dajian-petg-hf-09",
+      "name": "透明蓝",
+      "brand": "大简",
+      "materialType": "PETG HF",
+      "colorHex": "#527896",
+      "note": "",
+      "createdAt": "2026-10-10T07:10:42+00:00",
+      "updatedAt": "2026-10-10T07:10:42+00:00"
+    },
+    {
+      "id": "dajian-petg-hf-10",
+      "name": "绿色",
+      "brand": "大简",
+      "materialType": "PETG HF",
+      "colorHex": "#6DC72B",
+      "note": "",
+      "createdAt": "2026-10-10T07:10:42+00:00",
+      "updatedAt": "2026-10-10T07:10:42+00:00"
+    },
+    {
+      "id": "dajian-petg-hf-11",
+      "name": "松石绿",
+      "brand": "大简",
+      "materialType": "PETG HF",
+      "colorHex": "#0AA2A4",
+      "note": "",
+      "createdAt": "2026-10-10T07:10:42+00:00",
+      "updatedAt": "2026-10-10T07:10:42+00:00"
+    },
+    {
+      "id": "dajian-petg-hf-12",
+      "name": "苹果绿",
+      "brand": "大简",
+      "materialType": "PETG HF",
+      "colorHex": "#C1CC00",
+      "note": "",
+      "createdAt": "2026-10-10T07:10:42+00:00",
+      "updatedAt": "2026-10-10T07:10:42+00:00"
+    },
+    {
+      "id": "dajian-petg-hf-13",
+      "name": "青色",
+      "brand": "大简",
+      "materialType": "PETG HF",
+      "colorHex": "#047EBA",
+      "note": "",
+      "createdAt": "2026-10-10T07:10:42+00:00",
+      "updatedAt": "2026-10-10T07:10:42+00:00"
+    },
+    {
+      "id": "dajian-petg-hf-14",
+      "name": "蓝色",
+      "brand": "大简",
+      "materialType": "PETG HF",
+      "colorHex": "#2171B8",
+      "note": "",
+      "createdAt": "2026-10-10T07:10:42+00:00",
+      "updatedAt": "2026-10-10T07:10:42+00:00"
+    },
+    {
+      "id": "dajian-petg-hf-15",
+      "name": "深蓝色",
+      "brand": "大简",
+      "materialType": "PETG HF",
+      "colorHex": "#2A3B80",
+      "note": "",
+      "createdAt": "2026-10-10T07:10:42+00:00",
+      "updatedAt": "2026-10-10T07:10:42+00:00"
+    },
+    {
+      "id": "dajian-petg-hf-16",
+      "name": "樱花粉",
+      "brand": "大简",
+      "materialType": "PETG HF",
+      "colorHex": "#E5B7BF",
+      "note": "色值待确认：原始清单里带问号",
+      "createdAt": "2026-10-10T07:10:42+00:00",
+      "updatedAt": "2026-10-10T07:10:42+00:00"
+    },
+    {
+      "id": "dajian-petg-hf-17",
+      "name": "柠檬黄",
+      "brand": "大简",
+      "materialType": "PETG HF",
+      "colorHex": "#BAB137",
+      "note": "",
+      "createdAt": "2026-10-10T07:10:42+00:00",
+      "updatedAt": "2026-10-10T07:10:42+00:00"
+    },
+    {
+      "id": "dajian-petg-hf-18",
+      "name": "玫瑰红",
+      "brand": "大简",
+      "materialType": "PETG HF",
+      "colorHex": "#D84B83",
+      "note": "",
+      "createdAt": "2026-10-10T07:10:42+00:00",
+      "updatedAt": "2026-10-10T07:10:42+00:00"
+    },
+    {
+      "id": "dajian-petg-hf-19",
+      "name": "红色",
+      "brand": "大简",
+      "materialType": "PETG HF",
+      "colorHex": "#C52A36",
+      "note": "",
+      "createdAt": "2026-10-10T07:10:42+00:00",
+      "updatedAt": "2026-10-10T07:10:42+00:00"
+    },
+    {
+      "id": "dajian-petg-hf-20",
+      "name": "香芋紫",
+      "brand": "大简",
+      "materialType": "PETG HF",
+      "colorHex": "#CFB1DB",
+      "note": "",
+      "createdAt": "2026-10-10T07:10:42+00:00",
+      "updatedAt": "2026-10-10T07:10:42+00:00"
+    },
+    {
+      "id": "dajian-petg-hf-21",
+      "name": "紫罗兰",
+      "brand": "大简",
+      "materialType": "PETG HF",
+      "colorHex": "#545AA5",
+      "note": "",
+      "createdAt": "2026-10-10T07:10:42+00:00",
+      "updatedAt": "2026-10-10T07:10:42+00:00"
+    },
+    {
+      "id": "dajian-petg-hf-22",
+      "name": "绀紫色",
+      "brand": "大简",
+      "materialType": "PETG HF",
+      "colorHex": "#3A2B52",
+      "note": "",
+      "createdAt": "2026-10-10T07:10:42+00:00",
+      "updatedAt": "2026-10-10T07:10:42+00:00"
+    },
+    {
+      "id": "dajian-petg-hf-23",
+      "name": "紫色",
+      "brand": "大简",
+      "materialType": "PETG HF",
+      "colorHex": "#6B68B7",
+      "note": "",
+      "createdAt": "2026-10-10T07:10:42+00:00",
+      "updatedAt": "2026-10-10T07:10:42+00:00"
+    },
+    {
+      "id": "dajian-petg-hf-24",
+      "name": "肤色",
+      "brand": "大简",
+      "materialType": "PETG HF",
+      "colorHex": "#F5D2B8",
+      "note": "",
+      "createdAt": "2026-10-10T07:10:42+00:00",
+      "updatedAt": "2026-10-10T07:10:42+00:00"
+    },
+    {
+      "id": "dajian-petg-hf-25",
+      "name": "暗金色",
+      "brand": "大简",
+      "materialType": "PETG HF",
+      "colorHex": "#A68258",
+      "note": "",
+      "createdAt": "2026-10-10T07:10:42+00:00",
+      "updatedAt": "2026-10-10T07:10:42+00:00"
+    },
+    {
+      "id": "dajian-petg-hf-26",
+      "name": "拿铁色",
+      "brand": "大简",
+      "materialType": "PETG HF",
+      "colorHex": "#B09275",
+      "note": "",
+      "createdAt": "2026-10-10T07:10:42+00:00",
+      "updatedAt": "2026-10-10T07:10:42+00:00"
+    },
+    {
+      "id": "dajian-petg-hf-27",
+      "name": "粉红色",
+      "brand": "大简",
+      "materialType": "PETG HF",
+      "colorHex": "#806180",
+      "note": "",
+      "createdAt": "2026-10-10T07:10:42+00:00",
+      "updatedAt": "2026-10-10T07:10:42+00:00"
+    },
+    {
+      "id": "dajian-petg-hf-28",
+      "name": "棕色",
+      "brand": "大简",
+      "materialType": "PETG HF",
+      "colorHex": "#834B42",
+      "note": "",
+      "createdAt": "2026-10-10T07:10:42+00:00",
+      "updatedAt": "2026-10-10T07:10:42+00:00"
+    },
+    {
+      "id": "dajian-petg-hf-29",
+      "name": "青铜色",
+      "brand": "大简",
+      "materialType": "PETG HF",
+      "colorHex": "#7A6745",
+      "note": "",
+      "createdAt": "2026-10-10T07:10:42+00:00",
+      "updatedAt": "2026-10-10T07:10:42+00:00"
+    },
+    {
+      "id": "dajian-petg-hf-30",
+      "name": "金色",
+      "brand": "大简",
+      "materialType": "PETG HF",
+      "colorHex": "#C4964B",
+      "note": "",
+      "createdAt": "2026-10-10T07:10:42+00:00",
+      "updatedAt": "2026-10-10T07:10:42+00:00"
+    },
+    {
+      "id": "dajian-petg-hf-31",
+      "name": "米白色",
+      "brand": "大简",
+      "materialType": "PETG HF",
+      "colorHex": "#E7DFD1",
+      "note": "",
+      "createdAt": "2026-10-10T07:10:42+00:00",
+      "updatedAt": "2026-10-10T07:10:42+00:00"
+    },
+    {
+      "id": "dajian-petg-hf-32",
+      "name": "玫紫色",
+      "brand": "大简",
+      "materialType": "PETG HF",
+      "colorHex": "#B63C8A",
+      "note": "",
+      "createdAt": "2026-10-10T07:10:42+00:00",
+      "updatedAt": "2026-10-10T07:10:42+00:00"
+    },
+    {
+      "id": "dajian-petg-hf-33",
+      "name": "桃红色",
+      "brand": "大简",
+      "materialType": "PETG HF",
+      "colorHex": "#D6518B",
+      "note": "",
+      "createdAt": "2026-10-10T07:10:42+00:00",
+      "updatedAt": "2026-10-10T07:10:42+00:00"
+    },
+    {
+      "id": "dajian-petg-hf-34",
+      "name": "黄色",
+      "brand": "大简",
+      "materialType": "PETG HF",
+      "colorHex": "#F2D02E",
+      "note": "",
+      "createdAt": "2026-10-10T07:10:42+00:00",
+      "updatedAt": "2026-10-10T07:10:42+00:00"
+    },
+    {
+      "id": "dajian-petg-hf-35",
+      "name": "杏色",
+      "brand": "大简",
+      "materialType": "PETG HF",
+      "colorHex": "#DFC8C1",
+      "note": "",
+      "createdAt": "2026-10-10T07:10:42+00:00",
+      "updatedAt": "2026-10-10T07:10:42+00:00"
+    },
+    {
+      "id": "dajian-petg-hf-36",
+      "name": "深灰色",
+      "brand": "大简",
+      "materialType": "PETG HF",
+      "colorHex": "#5E5D5E",
+      "note": "",
+      "createdAt": "2026-10-10T07:10:42+00:00",
+      "updatedAt": "2026-10-10T07:10:42+00:00"
+    },
+    {
+      "id": "dajian-petg-hf-37",
+      "name": "银色",
+      "brand": "大简",
+      "materialType": "PETG HF",
+      "colorHex": "#8A888A",
+      "note": "",
+      "createdAt": "2026-10-10T07:10:42+00:00",
+      "updatedAt": "2026-10-10T07:10:42+00:00"
+    },
+    {
+      "id": "dajian-petg-hf-38",
+      "name": "透明粉",
+      "brand": "大简",
+      "materialType": "PETG HF",
+      "colorHex": "#AC9398",
+      "note": "",
+      "createdAt": "2026-10-10T07:10:42+00:00",
+      "updatedAt": "2026-10-10T07:10:42+00:00"
+    },
+    {
+      "id": "dajian-petg-hf-39",
+      "name": "薄荷蓝",
+      "brand": "大简",
+      "materialType": "PETG HF",
+      "colorHex": "#BCDADB",
+      "note": "",
+      "createdAt": "2026-10-10T07:10:42+00:00",
+      "updatedAt": "2026-10-10T07:10:42+00:00"
+    },
+    {
+      "id": "dajian-petg-hf-40",
+      "name": "蓝灰色",
+      "brand": "大简",
+      "materialType": "PETG HF",
+      "colorHex": "#616B78",
+      "note": "",
+      "createdAt": "2026-10-10T07:10:42+00:00",
+      "updatedAt": "2026-10-10T07:10:42+00:00"
+    },
+    {
+      "id": "dajian-petg-hf-41",
+      "name": "草绿色",
+      "brand": "大简",
+      "materialType": "PETG HF",
+      "colorHex": "#96BB2A",
+      "note": "",
+      "createdAt": "2026-10-10T07:10:42+00:00",
+      "updatedAt": "2026-10-10T07:10:42+00:00"
+    }
+  ]
+}
