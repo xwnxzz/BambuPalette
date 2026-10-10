@@ -22,6 +22,7 @@ from PIL import Image
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -364,6 +365,10 @@ class PicturePage(QWidget):
         # Set when the library changed while this page was off screen; the
         # re-match is then done in showEvent instead of in setLibrary.
         self._stale = False
+        # Cache for _candidate_palette: the 全部颜色 list and the checkbox flag
+        # it was built for.
+        self._candidates: list[PaletteEntry] | None = None
+        self._candidates_for: bool | None = None
         self._build_ui()
         self._set_controls_enabled(False)
 
@@ -537,6 +542,7 @@ class PicturePage(QWidget):
         """Called whenever the filament library or the mix catalogue changes."""
         self._library = library
         self._catalog = catalog
+        self._candidates = None
         if self._image is None:
             return
         if not self.isVisible():
@@ -600,15 +606,28 @@ class PicturePage(QWidget):
             dither=bool(self._dither.isChecked()),
         ).clamped()
 
+    def _candidate_palette(self) -> list[PaletteEntry]:
+        """The full 全部颜色 list, built once per library / checkbox state.
+
+        At 41 spools this is 66,461 ``PaletteEntry`` objects and ~0.5 s to
+        build.  It is needed both by the match and by the 「更换颜色…」 menu, and
+        that menu is opened once per colour the user swaps — so rebuilding it
+        every time was pure waste.  ``setLibrary`` drops the cache, and the
+        checkbox flag is part of the key, so it can never go stale.
+        """
+        wanted = bool(self._include_mixes.isChecked())
+        if self._candidates is None or self._candidates_for != wanted:
+            self._candidates = build_palette(self._library, self._catalog, include_mixes=wanted)
+            self._candidates_for = wanted
+        return self._candidates
+
     def _on_rematch(self) -> None:
         if self._image is None:
             return
         if self._library is None or len(self._library) == 0:
             self._status.setText("请先在「混色配方」页添加耗材，再匹配图片。")
             return
-        palette = build_palette(
-            self._library, self._catalog, include_mixes=bool(self._include_mixes.isChecked())
-        )
+        palette = self._candidate_palette()
         if not palette:
             self._status.setText("调色板是空的，请先添加耗材。")
             return
@@ -728,11 +747,7 @@ class PicturePage(QWidget):
         index = self._current_index()
         if index < 0 or self._result is None or self._library is None:
             return
-        entries = build_palette(
-            self._library,
-            self._catalog,
-            include_mixes=bool(self._include_mixes.isChecked()),
-        )
+        entries = self._candidate_palette()
         if not entries:
             self._status.setText("调色板是空的，请先添加耗材。")
             return
@@ -781,11 +796,20 @@ class PicturePage(QWidget):
         return self._plate
 
     def _on_export(self, kind: str) -> None:
+        # Building the plate for a 512×512 picture with 12 colours takes ~2 s and
+        # writing the 3MF another ~0.4 s.  Without a wait cursor and a line of
+        # text the window simply stops answering, which is the whole 「未响应」
+        # complaint; the cursor is popped again on every exit path.
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        self._status.setText("正在生成模型…")
+        QApplication.processEvents()
         try:
             plate = self.buildPlate()
         except Exception as error:
+            QApplication.restoreOverrideCursor()
             QMessageBox.warning(self, "无法生成模型", str(error))
             return
+        QApplication.restoreOverrideCursor()
         suffix = ".3mf" if kind == "3mf" else ".obj"
         label = "3MF 模型" if kind == "3mf" else "OBJ 模型"
         suggested = f"{self._image_name}_{datetime.now():%Y%m%d-%H%M%S}{suffix}"
@@ -794,6 +818,9 @@ class PicturePage(QWidget):
         if not name:
             return
         target = Path(name)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        self._status.setText(f"正在写入 {target.name}…")
+        QApplication.processEvents()
         try:
             if kind == "3mf":
                 # The filament list travels inside the project so Bambu Studio
@@ -809,8 +836,10 @@ class PicturePage(QWidget):
             else:
                 written = write_obj(plate, target)
         except Exception as error:
+            QApplication.restoreOverrideCursor()
             QMessageBox.warning(self, "保存失败", str(error))
             return
+        QApplication.restoreOverrideCursor()
         self._status.setText(self._describe(plate, written))
         self._announce(plate, written)
 

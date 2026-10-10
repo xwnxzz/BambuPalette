@@ -810,6 +810,30 @@ def main() -> int:
 
             # The replacement menu is 「全部颜色」, ordered like the 混色配方 grid.
             entries = build_palette(library, window._catalog, include_mixes=True)
+            # At 41 spools this list is 66,461 entries and ~0.5 s to build.  The
+            # match and every 「更换颜色…」 have to share one copy of it.
+            cached = page._candidate_palette()
+            check(cached is page._candidate_palette(), "the 全部颜色 list is cached, not rebuilt")
+            check(
+                {candidate.key for candidate in cached} == {candidate.key for candidate in entries},
+                "the cached list is exactly the replacement menu's candidates",
+            )
+            page._include_mixes.setChecked(False)
+            without_mixes = page._candidate_palette()
+            check(
+                without_mixes is not cached and len(without_mixes) < len(cached),
+                "turning mixes off builds a smaller candidate list",
+            )
+            check(
+                page._candidate_palette() is without_mixes,
+                "and that smaller list is cached too",
+            )
+            page._include_mixes.setChecked(True)
+            check(
+                page._candidate_palette() is not cached
+                and len(page._candidate_palette()) == len(cached),
+                "turning mixes back on rebuilds the full list",
+            )
             picker = ColourPickerDialog(
                 entries,
                 page._result.region_colour(0),
@@ -955,6 +979,10 @@ def main() -> int:
 
                 check(zipfile.is_zipfile(TEMP / "plate.3mf"), "the 3MF is a real zip package")
                 check((TEMP / "plate.mtl").is_file(), "the OBJ export wrote its matching .mtl")
+                check(
+                    app.overrideCursor() is None,
+                    "the wait cursor is popped again after exporting",
+                )
             finally:
                 _picture_page.QFileDialog = original_dialog
                 _picture_page.QMessageBox = original_box

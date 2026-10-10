@@ -84,6 +84,9 @@ class MainWindow(QMainWindow):
         self._pair_filter: tuple[str, str] | None = None
         self._build_seconds = 0.0
         self._suppress_list_signal = False
+        # filament id -> the case-folded text the search box matches on; rebuilt
+        # whenever the library changes.  See _filament_haystack.
+        self._haystacks: dict[str, str] = {}
         # The real launcher asks for the first catalogue build to happen after the
         # window is on screen (see _rebuild_catalog).  Tests and the headless tools
         # keep the synchronous default, so nothing has to wait for a timer.
@@ -409,6 +412,9 @@ class MainWindow(QMainWindow):
     def _reload_library(self) -> None:
         self._suppress_list_signal = True
         self._list.clear()
+        # The spools are about to be replaced, so the search haystacks keyed by
+        # filament id are stale.
+        self._haystacks.clear()
         for filament in self.library:
             # An unnamed spool's display_name IS its hex, so printing both would
             # render "#000000   #000000". The one other thing the user needs is
@@ -653,6 +659,28 @@ class MainWindow(QMainWindow):
         filament = self.library.get(filament_id)
         return filament.display_name.casefold() if filament is not None else filament_id
 
+    def _filament_haystack(self, filament) -> str:
+        """The case-folded text a spool is searched by, built once per spool.
+
+        At 41 spools there are 66,420 mixes and every one of them asks for its
+        two parents' names, so rebuilding these four strings inside the search
+        loop cost ~0.1 s per keystroke.  The library is replaced wholesale on
+        every edit, so keying on the id and clearing the cache in
+        ``_reload_library`` is enough to stay correct.
+        """
+        cached = self._haystacks.get(filament.id)
+        if cached is None:
+            cached = " ".join(
+                (
+                    filament.display_name,
+                    filament.brand,
+                    filament.material_type,
+                    filament.note,
+                )
+            ).casefold()
+            self._haystacks[filament.id] = cached
+        return cached
+
     def _matches(self, cell, query: str) -> bool:
         """Does one grid cell survive the search box?
 
@@ -662,27 +690,14 @@ class MainWindow(QMainWindow):
         """
         if getattr(cell, "pair_index", 0) < 0:
             filament = cell.filament
-            haystack = " ".join(
-                (
-                    filament.display_name,
-                    filament.brand,
-                    filament.material_type,
-                    filament.note,
-                )
-            ).casefold()
             if _HEX_QUERY.match(query):
                 return query.lower() in filament.color_hex[1:].lower()
-            return query in haystack
+            return query in self._filament_haystack(filament)
         if _HEX_QUERY.match(query):
             return query.lower() in cell.color_hex[1:].lower()
         for filament_id in (cell.a_id, cell.b_id):
             filament = self.library.get(filament_id)
-            if filament is None:
-                continue
-            haystack = " ".join(
-                (filament.display_name, filament.brand, filament.material_type, filament.note)
-            ).casefold()
-            if query in haystack:
+            if filament is not None and query in self._filament_haystack(filament):
                 return True
         return False
 
