@@ -278,6 +278,31 @@ class TripleCatalog:
     def built(self) -> bool:
         return self._built
 
+    @property
+    def parents(self) -> np.ndarray:
+        """``(T, 3)`` 的三卷组合，值是耗材在 :attr:`filaments` 里的下标。"""
+        return self._parent_index
+
+    @property
+    def offsets(self) -> np.ndarray:
+        """CSR 分组边界，``(C + 1,)``。"""
+        return self._offsets
+
+    @property
+    def codes(self) -> np.ndarray:
+        """排好序的配方编号，``(M,)``。"""
+        return self._codes
+
+    def first_triple_index(self) -> np.ndarray:
+        """每个颜色第一条配方所属的三卷组合，``(C,)``。
+
+        「按母材组合」要一个能把颜色排起来的号码：颜色自己没有主材组合，
+        就用它第一组三卷的号码。空表返回空数组。
+        """
+        if self.colour_count == 0:
+            return np.empty(0, dtype=np.int64)
+        return (self._codes[self._offsets[:-1]] // len(self._ratios)).astype(np.int64)
+
     def triples(self) -> list[tuple[str, str, str]]:
         """所有三卷组合，按耗材 id 给出。"""
         return [
@@ -615,6 +640,491 @@ class OrderedTripleColours(Sequence):
             rank[self._order] = np.arange(len(self), dtype=np.int64)
             self._rank = rank
         return int(self._rank[found])
+
+
+def _pack(rgb: Sequence[int]) -> int:
+    """``(r, g, b)`` → ``(r << 16) | (g << 8) | b``。"""
+    return (int(rgb[0]) << 16) | (int(rgb[1]) << 8) | int(rgb[2])
+
+
+def _unpack(value: int) -> tuple[int, int, int]:
+    return ((value >> 16) & 0xFF, (value >> 8) & 0xFF, value & 0xFF)
+
+
+class CombinedColour:
+    """「全部颜色」里的一条：两色混色、三色混色、耗材本色都可能合到这里。
+
+    它把两张表能提供的属性都摆出来（``recipes`` / ``recipe_count`` /
+    ``color_hex`` / ``pair_index`` / ``lightness`` …），所以网格和详情面板
+    不需要知道这个颜色是怎么来的。
+    """
+
+    __slots__ = ("_store", "index")
+
+    def __init__(self, store: "CombinedColours", index: int) -> None:
+        self._store = store
+        self.index = int(index)
+
+    @property
+    def packed(self) -> int:
+        return int(self._store.packed[self.index])
+
+    @property
+    def rgb(self) -> tuple[int, int, int]:
+        return _unpack(self.packed)
+
+    @property
+    def color_hex(self) -> str:
+        return "#%06X" % self.packed
+
+    @property
+    def lab(self) -> tuple[float, float, float]:
+        return self._store.lab_at(self.index)
+
+    @property
+    def recipes(self):
+        return self._store.recipes_at(self.index)
+
+    @property
+    def recipe_count(self) -> int:
+        return self._store.recipe_count_at(self.index)
+
+    @property
+    def key(self) -> str:
+        return f"colour|{self.color_hex}"
+
+    @property
+    def pair_index(self) -> int:
+        """「按母材组合」的排序位；三色颜色用它第一组三卷的号码。"""
+        return self._store.pair_index_at(self.index)
+
+    @property
+    def first(self):
+        return self.recipes[0]
+
+    @property
+    def engine(self):
+        return self._store.engine
+
+    @property
+    def is_spool(self) -> bool:
+        return False
+
+    @property
+    def filaments(self) -> tuple:
+        """耗材丝本色正好等于这个颜色的那些耗材（通常是空的）。"""
+        return self._store.spools_at(self.index)
+
+    @property
+    def a_id(self) -> str:
+        return self.first.a_id
+
+    @property
+    def b_id(self) -> str:
+        return self.first.b_id
+
+    @property
+    def percent_a(self) -> int:
+        return self.first.percent_a
+
+    @property
+    def percent_b(self) -> int:
+        return self.first.percent_b
+
+    @property
+    def lightness(self) -> float:
+        return self.lab[0]
+
+    @property
+    def hue(self) -> float:
+        return hue_of(self.lab)
+
+    @property
+    def chroma(self) -> float:
+        return chroma_of(self.lab)
+
+    @property
+    def ratio_text(self) -> str:
+        count = self.recipe_count
+        if count == 0:
+            return "耗材本色"
+        if count == 1:
+            return self.first.ratio_text
+        return f"{count} 个配方"
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"CombinedColour({self.color_hex}, recipes={self.recipe_count})"
+
+
+class CombinedColours(Sequence):
+    """「全部颜色」：两色混色 + 三色混色 + 耗材本色，按 RGB 去重成一个列表。
+
+    两张表各自都已经把自己内部的重复颜色合并掉了，所以这里只需要**跨表**合并：
+    一个升序的 ``packed`` int32 数组就是全部颜色，某个颜色的配方按需从两张表
+    各查一次再拼起来。41 卷耗材时这是 400 多万个颜色，所以这里同样不建对象、
+    只在下标被真的要的时候才还原一个 :class:`CombinedColour`。
+    """
+
+    __slots__ = (
+        "_catalog",
+        "_triples",
+        "_spools",
+        "_engine",
+        "_pair_lookup",
+        "_pair_packed",
+        "_spool_map",
+        "_hits",
+        "_ranks",
+        "_labs",
+        "packed",
+    )
+
+    def __init__(self, catalog, triples=None, spools: Sequence = ()) -> None:
+        self._catalog = catalog
+        self._triples = triples if (triples is not None and triples.built) else None
+        self._spools = tuple(spools)
+        self._engine = catalog.engine.id
+        self._hits = None
+        self._ranks = None
+        self._labs = None
+
+        lookup: dict[int, object] = {}
+        for colour in catalog.colours:
+            lookup.setdefault(_pack(colour.rgb), colour)
+        self._pair_lookup = lookup
+        self._pair_packed = np.array(sorted(lookup), dtype=np.int32)
+
+        self._spool_map: dict[int, list] = {}
+        for filament in self._spools:
+            self._spool_map.setdefault(_pack(filament.rgb), []).append(filament)
+
+        parts = [self._pair_packed]
+        if self._triples is not None:
+            parts.append(np.asarray(self._triples.packed, dtype=np.int32))
+        if self._spool_map:
+            parts.append(np.array(sorted(self._spool_map), dtype=np.int32))
+        if len(parts) == 1:
+            self.packed = self._pair_packed
+        else:
+            self.packed = np.unique(np.concatenate(parts)).astype(np.int32)
+
+    # -- 基本信息 ---------------------------------------------------------
+
+    def __len__(self) -> int:
+        return int(self.packed.shape[0])
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return [self[i] for i in range(*index.indices(len(self)))]
+        index = int(index)
+        if index < 0:
+            index += len(self)
+        if not 0 <= index < len(self):
+            raise IndexError("combined colour index out of range")
+        return CombinedColour(self, index)
+
+    @property
+    def engine(self):
+        return self._engine
+
+    @property
+    def catalog(self):
+        return self._catalog
+
+    @property
+    def triples(self):
+        return self._triples
+
+    @property
+    def pair_count(self) -> int:
+        return int(len(self._pair_lookup))
+
+    @property
+    def colour_count(self) -> int:
+        return len(self)
+
+    # -- 查表 -------------------------------------------------------------
+
+    def _triple_hits(self) -> tuple[np.ndarray, np.ndarray]:
+        """``packed`` 里同时在两张表里的位置：``(combined, triple)`` 两组下标。"""
+        if self._hits is not None:
+            return self._hits
+        if self._triples is None or self._triples.colour_count == 0:
+            self._hits = (np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64))
+            return self._hits
+        table = np.asarray(self._triples.packed, dtype=np.int32)
+        found = np.searchsorted(table, self.packed, side="left")
+        inside = found < len(table)
+        safe = np.where(inside, found, 0)
+        mask = inside & (table[safe] == self.packed)
+        self._hits = (
+            np.flatnonzero(mask).astype(np.int64),
+            safe[mask].astype(np.int64),
+        )
+        return self._hits
+
+    def _triple_hit(self, value: int) -> int:
+        """这个颜色在三色表里的下标，没有就 -1。"""
+        if self._triples is None or self._triples.colour_count == 0:
+            return -1
+        table = np.asarray(self._triples.packed, dtype=np.int32)
+        found = int(np.searchsorted(table, value, side="left"))
+        if found < len(table) and int(table[found]) == int(value):
+            return found
+        return -1
+
+    def pair_colour_at(self, index: int):
+        """这个位置上的两色混色条目（如果有）。"""
+        return self._pair_lookup.get(int(self.packed[index]))
+
+    def spools_at(self, index: int) -> tuple:
+        return tuple(self._spool_map.get(int(self.packed[index]), ()))
+
+    def recipes_at(self, index: int) -> tuple:
+        out: list = []
+        value = int(self.packed[index])
+        colour = self._pair_lookup.get(value)
+        if colour is not None:
+            out.extend(colour.recipes)
+        hit = self._triple_hit(value)
+        if hit >= 0:
+            out.extend(self._triples.recipes_at(hit))
+        return tuple(out)
+
+    def recipe_count_at(self, index: int) -> int:
+        value = int(self.packed[index])
+        total = 0
+        colour = self._pair_lookup.get(value)
+        if colour is not None:
+            total += len(colour.recipes)
+        hit = self._triple_hit(value)
+        if hit >= 0:
+            total += self._triples.recipe_count_at(hit)
+        return total
+
+    def lab_at(self, index: int) -> tuple[float, float, float]:
+        """单个颜色的 Lab —— 只算这一个，不惊动几百万行的大表。"""
+        return _tuple_lab(_color.lab_from_rgb(_unpack(int(self.packed[index]))))
+
+    def lab_table(self) -> np.ndarray:
+        """所有颜色的 Lab，``(C, 3)``：排序时才用得上，算一次就缓存。"""
+        count = len(self)
+        if self._labs is not None and len(self._labs) == count:
+            return self._labs
+        labs = np.empty((count, 3), dtype=np.float64)
+        done = np.zeros(count, dtype=bool)
+        combined, triple = self._triple_hits()
+        if len(triple):
+            labs[combined] = np.asarray(self._triples.lab_table(), dtype=np.float64)[triple]
+            done[combined] = True
+        rest = ~done
+        if rest.any():
+            packed = self.packed[rest]
+            rgb = np.stack(
+                [(packed >> 16) & 0xFF, (packed >> 8) & 0xFF, packed & 0xFF], axis=1
+            ).astype(np.float64)
+            labs[rest] = np.asarray(_color.lab_from_rgb(rgb), dtype=np.float64)
+        self._labs = labs
+        return labs
+
+    def rank_table(self) -> np.ndarray:
+        """「按母材组合」的排序位：两色颜色用自己的 pair_index，三色颜色接在后面。"""
+        if self._ranks is not None:
+            return self._ranks
+        base = np.full(len(self), self._catalog.pair_count, dtype=np.int64)
+        if self._pair_lookup:
+            values = np.fromiter(self._pair_lookup.keys(), dtype=np.int32, count=len(self._pair_lookup))
+            positions = np.searchsorted(self.packed, values)
+            ranks = np.fromiter(
+                (int(colour.pair_index) for colour in self._pair_lookup.values()),
+                dtype=np.int64,
+                count=len(self._pair_lookup),
+            )
+            base[positions] = ranks
+        if self._triples is not None:
+            combined, triple = self._triple_hits()
+            if len(triple):
+                firsts = self._triples.first_triple_index()[triple]
+                fresh = base[combined] >= self._catalog.pair_count
+                base[combined] = np.where(
+                    fresh, self._catalog.pair_count + firsts, base[combined]
+                )
+        self._ranks = base
+        return base
+
+    def pair_index_at(self, index: int) -> int:
+        """This colour's place in the 母材组合 order, or -1 for a spool's own colour.
+
+        ``rank_table`` hands every colour that is neither a pair nor a triple a
+        sort position of ``pair_count``; a bare spool colour is still NOT a mix,
+        and a lot of the code says "is a mix" as ``pair_index >= 0``.
+        """
+        if not self.recipe_count_at(int(index)):
+            return -1
+        return int(self.rank_table()[index])
+
+    def index_of_key(self, key: str) -> int:
+        """``colour|#RRGGBB`` → 位置；不存在返回 -1（二分，不扫描）。"""
+        text = str(key)
+        if text.startswith("colour|"):
+            text = text[len("colour|"):]
+        try:
+            value = _pack(_color.hex_to_rgb(text))
+        except ValueError:
+            return -1
+        found = int(np.searchsorted(self.packed, value, side="left"))
+        if found < len(self.packed) and int(self.packed[found]) == value:
+            return found
+        return -1
+
+    # -- 排序与搜索 -------------------------------------------------------
+
+    def order(self, key: str = "rgb", target_rgb: Sequence[int] | None = None) -> np.ndarray:
+        """按 ``mixes.SORT_*`` 的某个键给出颜色下标数组。"""
+        from .mixes import (
+            SORT_HUE,
+            SORT_LABEL,
+            SORT_LIGHTNESS,
+            SORT_PAIR,
+            SORT_RGB,
+            SORT_SIMILARITY,
+        )
+
+        count = len(self)
+        if count == 0:
+            return np.empty(0, dtype=np.int64)
+        if key in (SORT_RGB, SORT_LABEL):
+            return np.arange(count, dtype=np.int64)
+        if key == SORT_PAIR:
+            return np.lexsort((self.packed, self.rank_table())).astype(np.int64)
+        lab = self.lab_table()
+        if key == SORT_LIGHTNESS:
+            return np.lexsort((self.packed, -lab[:, 0])).astype(np.int64)
+        if key == SORT_HUE:
+            hues = np.degrees(np.arctan2(lab[:, 2], lab[:, 1])) % 360.0
+            return np.lexsort((self.packed, hues)).astype(np.int64)
+        if key == SORT_SIMILARITY and target_rgb is not None:
+            target = np.asarray(_color.lab_from_rgb(tuple(target_rgb)), dtype=np.float64)
+            distance = np.asarray(_color.delta_e_2000(lab, target), dtype=np.float64)
+            return np.argsort(distance, kind="stable").astype(np.int64)
+        return np.arange(count, dtype=np.int64)
+
+    def ordered(self, key: str = "rgb", target_rgb: Sequence[int] | None = None) -> "OrderedCombinedColours":
+        return OrderedCombinedColours(self, self.order(key, target_rgb))
+
+    def search_hex(self, pattern: str) -> np.ndarray:
+        """``#RRGGBB`` 里含 ``pattern`` 的颜色下标，语义和搜索框原来的子串匹配一致。
+
+        四百万个颜色没法用 Python 逐个 ``in`` 判断，所以把六位十六进制拆成六个
+        nibble 数组，在每个可能的起点上做一次向量比较。
+        """
+        text = str(pattern).strip().lstrip("#").upper()
+        if not text or len(text) > 6:
+            return np.empty(0, dtype=np.int64)
+        digits_of = "0123456789ABCDEF"
+        if any(char not in digits_of for char in text):
+            return np.empty(0, dtype=np.int64)
+        packed = self.packed
+        if len(packed) == 0:
+            return np.empty(0, dtype=np.int64)
+        nibbles = tuple((packed >> shift) & 0xF for shift in (20, 16, 12, 8, 4, 0))
+        want = [digits_of.index(char) for char in text]
+        span = len(want)
+        hit = None
+        for start in range(0, 7 - span):
+            match = nibbles[start] == want[0]
+            for offset in range(1, span):
+                match = match & (nibbles[start + offset] == want[offset])
+            hit = match if hit is None else (hit | match)
+        if hit is None:
+            return np.empty(0, dtype=np.int64)
+        return np.flatnonzero(hit).astype(np.int64)
+
+    def search_spools(self, filament_ids) -> np.ndarray:
+        """参与过这些耗材的颜色的下标。
+
+        名字搜索走的是「先找出匹配的耗材，再取出它们参与过的颜色」这条路：
+        三色表里按配方编号反查是三百万次比较也不到一秒的向量运算，而逐个颜色
+        去问「你的配方里有这卷料吗」要扫描整个配方表。
+        """
+        wanted = {str(item) for item in filament_ids}
+        if not wanted or len(self) == 0:
+            return np.empty(0, dtype=np.int64)
+        flags = np.zeros(len(self), dtype=bool)
+        for value, colour in self._pair_lookup.items():
+            for recipe in colour.recipes:
+                if recipe.a_id in wanted or recipe.b_id in wanted:
+                    flags[int(np.searchsorted(self.packed, value))] = True
+                    break
+        for index, filament in enumerate(self._spools):
+            if filament.id in wanted:
+                flags[int(np.searchsorted(self.packed, _pack(filament.rgb)))] = True
+        if self._triples is not None:
+            parents = np.asarray(self._triples.parents, dtype=np.int64)
+            spool_ids = [filament.id for filament in self._triples.filaments]
+            chosen = [i for i, fid in enumerate(spool_ids) if fid in wanted]
+            if chosen and len(parents):
+                involved = np.isin(parents, np.asarray(chosen, dtype=np.int64)).any(axis=1)
+                if involved.any():
+                    codes = np.asarray(self._triples.codes, dtype=np.int64)
+                    selected = involved[codes // len(self._triples.ratios)]
+                    offsets = np.asarray(self._triples.offsets, dtype=np.int64)
+                    if len(selected):
+                        counts = np.add.reduceat(
+                            selected.astype(np.int64), offsets[:-1]
+                        )
+                        touched = np.flatnonzero(counts > 0)
+                        if len(touched):
+                            values = np.asarray(self._triples.packed, dtype=np.int32)[touched]
+                            positions = np.searchsorted(self.packed, values)
+                            flags[positions] = True
+        return np.flatnonzero(flags).astype(np.int64)
+
+
+class OrderedCombinedColours(Sequence):
+    """``CombinedColours`` 的一个排序视图，同样是懒加载。"""
+
+    __slots__ = ("_view", "_order", "_rank")
+
+    def __init__(self, view: CombinedColours, order: np.ndarray) -> None:
+        self._view = view
+        self._order = np.asarray(order, dtype=np.int64)
+        self._rank = None
+
+    def __len__(self) -> int:
+        return int(self._order.shape[0])
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return [self[i] for i in range(*index.indices(len(self)))]
+        index = int(index)
+        if index < 0:
+            index += len(self)
+        if not 0 <= index < len(self):
+            raise IndexError("ordered combined colour index out of range")
+        return self._view[int(self._order[index])]
+
+    def index_of_key(self, key: str) -> int:
+        found = self._view.index_of_key(key)
+        if found < 0:
+            return -1
+        if self._rank is None:
+            rank = np.empty(len(self), dtype=np.int64)
+            rank[self._order] = np.arange(len(self), dtype=np.int64)
+            self._rank = rank
+        return int(self._rank[found])
+
+    def restrict(self, mask) -> "OrderedCombinedColours":
+        """只留下 ``mask``（随便什么顺序的颜色下标）里的那些，顺序不变。
+
+        搜索结果就是这样套上来的：四百万个颜色不能先变成 Python 列表再过滤，
+        但「把排序数组里不在命中集合里的位置去掉」是一次向量运算。
+        """
+        wanted = np.asarray(mask, dtype=np.int64)
+        if wanted.size == 0:
+            return OrderedCombinedColours(self._view, np.empty(0, dtype=np.int64))
+        keep = np.isin(self._order, wanted)
+        return OrderedCombinedColours(self._view, self._order[keep])
 
 
 def triple_cache_key(

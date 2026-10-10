@@ -106,17 +106,20 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         Filament(name=name, brand="大简", material_type="PETG HF", color_hex=value)
         for name, value in SPOOLS
     ])
-    window = MainWindow(library=library)
+    # auto_triples=False keeps this window deterministic: the three-filament
+    # table is built on its own timer and would change every count below.
+    window = MainWindow(library=library, auto_triples=False)
     window.resize(1200, 760)
     window.show()
     app.processEvents()
 
     check(expected_recipe_count(5) == 810, "5 spools produce 810 mixes")
     merged = window._catalog.colour_count
+    everything = window._combined.colour_count
     check(merged <= 810, f"merging identical colours never adds any ({merged} <= 810)")
     check(
-        len(window._recipes) == merged,
-        f"the grid holds one card per distinct colour, got {len(window._recipes)} for {merged}",
+        len(window._recipes) == everything,
+        f"the grid holds one card per distinct colour, got {len(window._recipes)} for {everything}",
     )
     check(window._catalog.pair_count == 10, "5 spools produce 10 pairs")
 
@@ -201,41 +204,47 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     )
     window._refresh_grid()
     app.processEvents()
-    check(len(window._recipes) == merged, "the full catalogue comes back after clearing")
+    check(len(window._recipes) == everything, "the full catalogue comes back after clearing")
 
-    # 「全部颜色」 — the raw spools join the grid so two inputs give 83 colours.
+    # 「全部颜色」 — 两色混色、三色混色和耗材本色合成一张表，没有勾选框。
     from .core.mixes import expected_recipe_count
-    from .ui import mix_grid
 
     check(expected_recipe_count(2) + 2 == 83, "81 mixes + 2 raw spools = 83 colours")
-    check(not window._all_colours.isChecked(), "「全部颜色」 starts unticked")
-    spool_count = len(window.library.filaments)
-    window._all_colours.setChecked(True)
-    app.processEvents()
     check(
-        len(window._recipes) == merged + spool_count,
-        f"ticking 「全部颜色」 adds one row per spool, got {len(window._recipes)}",
+        not hasattr(window, "_all_colours") and not hasattr(window, "_triples_box"),
+        "the 全部颜色 / 三色混色 checkboxes are gone",
     )
-    spool_rows = [c for c in window._recipes if getattr(c, "pair_index", 0) < 0]
-    check(len(spool_rows) == spool_count, "one raw spool row per spool")
+    spool_count = len(window.library.filaments)
     check(
-        all(row.color_hex == row.filament.color_hex for row in spool_rows),
-        "a raw spool row shows the spool's own colour",
+        len(window._recipes) >= merged,
+        f"the grid carries at least the merged mixes, got {len(window._recipes)}",
+    )
+    check(
+        window._combined is not None and len(window._combined) >= merged,
+        "「全部颜色」 holds the mixes",
+    )
+    spool_rows = [
+        window._combined[i]
+        for i in range(len(window._combined))
+        if window._combined[i].filaments
+    ]
+    check(len(spool_rows) >= 1, "a spool's own colour is in the same list")
+    check(
+        all(row.color_hex == row.filaments[0].color_hex for row in spool_rows),
+        "a spool colour keeps the spool's own hex",
     )
     check(
         [cell.rgb for cell in window._recipes]
         == sorted(cell.rgb for cell in window._recipes),
-        "the spools obey the 排序 control instead of being pinned on top",
+        "the list follows the 排序 control",
     )
-    window._grid.selectRecipe(spool_rows[0])
-    window._on_grid_selected(spool_rows[0])
+    first_spool = spool_rows[0]
+    window._on_grid_selected(first_spool)
     app.processEvents()
-    check(window._detail.recipe() is None, "a raw spool is not presented as a mix")
-    check(window._detail.filament() is not None, "the detail panel shows the raw spool itself")
-    window._all_colours.setChecked(False)
-    app.processEvents()
-    check(len(window._recipes) == merged, "un-ticking 「全部颜色」 restores the mixes-only grid")
+    check(window._detail.colour() is first_spool, "the detail panel shows that colour")
     window._detail.clear()
+    app.processEvents()
+    check(len(window._recipes) >= merged, "the full list is still there")
 
     # A new spool has no colour until the user picks one, and the dialog refuses
     # to be confirmed until then — a made-up white default is a lie the user only
@@ -248,10 +257,15 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         None, [f.brand for f in window.library.filaments], [], window
     )
     check(not add_dialog._color.isSet(), "添加耗材 starts with NO preset colour")
-    check(add_dialog.values()["color_hex"] == "", "an unset dialog reports no colour")
-    check(not add_dialog._ok_button.isEnabled(), "确认 is disabled until a colour is chosen")
+    # m08102 item 1: the R/G/B spins start at 0, so 确认 must work right away and
+    # mean black — it used to sit disabled until a colour was picked.
+    check(
+        add_dialog.values()["color_hex"] == "#000000",
+        f"an untouched dialog means RGB 0,0,0, got {add_dialog.values()['color_hex']!r}",
+    )
+    check(add_dialog._ok_button.isEnabled(), "确认 is enabled on the default RGB 0,0,0")
     add_dialog._color.setValue("#123456")
-    check(add_dialog._ok_button.isEnabled(), "确认 wakes up once a colour is entered")
+    check(add_dialog._ok_button.isEnabled(), "确认 stays enabled once a colour is entered")
     check(add_dialog.values()["color_hex"] == "#123456", "the entered colour is reported")
     check(
         add_dialog.build_filament().color_hex == "#123456",
@@ -309,11 +323,10 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     lone_window.show()
     app.processEvents()
     check(lone_window._catalog.recipe_count == 0, "one spool makes zero mixes")
-    lone_window._all_colours.setChecked(True)
     app.processEvents()
     check(
         len(lone_window._recipes) == 1,
-        f"ticking 全部颜色 shows the lone spool's colour, got {len(lone_window._recipes)}",
+        f"a lone spool's colour still reaches the grid, got {len(lone_window._recipes)}",
     )
     if lone_window._recipes:
         check(lone_window._recipes[0].color_hex == "#0000FF", "the lone cell is the spool's own colour")
@@ -375,8 +388,14 @@ def run_selftest(*, report_path: Path | None = None) -> int:
 
         check(isinstance(page._detail, ColourDetail), "the picture page shows the selected colour")
         check(
-            page._auto_palette == list(page.result.palette) and page._overrides == {},
-            "a fresh match keeps the automatic palette and no replacements",
+            page._base is not None
+            and page._base.palette == page.result.palette
+            and not page._replaced
+            and not page._merged
+            and not page._deleted
+            and not page._undo_stack
+            and not page._redo_stack,
+            "a fresh match keeps the automatic palette and no edits",
         )
         check(MatchSettings().merge_delta_e == 2.0, "near-identical matches merge by default")
 
@@ -417,8 +436,8 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         picker.close()
 
         replacement = next(entry for entry in ordered if entry.key != auto.key)
-        page._overrides[0] = replacement
-        page._apply_overrides()
+        page._replaced[0] = replacement
+        page._apply_edits(keep=0)
         app.processEvents()
         check(
             page.result.palette[0].key == replacement.key,
@@ -428,10 +447,74 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         page._on_restore()
         app.processEvents()
         check(
-            page.result.palette[0].key == auto.key and page._overrides == {},
+            page.result.palette[0].key == auto.key and page._replaced == {},
             "undoing the replacement puts the automatic match back",
         )
         check(not page._detail.can_restore(), "there is nothing left to undo")
+
+        # 「删除」 makes the region transparent: no base plate, no prism. The mesh
+        # builder already treats -1 that way, so the check is that the index
+        # really becomes -1 and the plate loses exactly those pixels.
+        import numpy as np  # noqa: PLC0415
+
+        before_pixels = page.result.printed_pixels
+        before_colours = len(page.result.palette)
+        doomed = int(np.bincount(page.result.indices[page.result.indices >= 0].ravel()).argmax())
+        doomed_count = int((page.result.indices == doomed).sum())
+        page._list._picked = {doomed}
+        page._on_delete_colours()
+        app.processEvents()
+        check(doomed in page._deleted, "the deleted colour is remembered as an edit")
+        check(
+            len(page.result.palette) == before_colours - 1,
+            f"deleting one colour leaves {len(page.result.palette)}",
+        )
+        check(
+            page.result.printed_pixels == before_pixels - doomed_count,
+            "the deleted pixels are the ones that stop being printed",
+        )
+        check(bool((page.result.indices < 0).any()), "the deleted region is transparent")
+        check(page._undo_button.isEnabled(), "删除 can be undone")
+        page._undo()
+        app.processEvents()
+        check(
+            not page._deleted
+            and len(page.result.palette) == before_colours
+            and page.result.printed_pixels == before_pixels,
+            "Ctrl+Z brings the deleted colour back",
+        )
+        page._redo()
+        app.processEvents()
+        check(
+            len(page.result.palette) == before_colours - 1,
+            "Ctrl+Y deletes it again",
+        )
+        page._undo()
+        app.processEvents()
+
+        # 合并: only reachable through the dialog, so drive the non-UI half.
+        if len(page.result.palette) >= 2:
+            keep = page.result.palette[1].key
+            page._list._picked = {0, 1}
+            page._push()
+            page._merged[page._live_map[0]] = page._live_map[1]
+            page._apply_edits(keep=page._live_map[1])
+            app.processEvents()
+            check(
+                len(page.result.palette) == before_colours - 1
+                and page.result.palette[0].key == keep,
+                "merging two colours leaves the chosen one",
+            )
+            check(
+                page.result.printed_pixels == before_pixels,
+                "merging prints every pixel the two colours covered",
+            )
+            page._undo()
+            app.processEvents()
+            check(
+                not page._merged and len(page.result.palette) == before_colours,
+                "undoing the merge restores both colours",
+            )
 
         three_mf = write_3mf(
             plate,

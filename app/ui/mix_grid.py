@@ -13,7 +13,7 @@ from dataclasses import dataclass
 import numpy as np
 from PySide6.QtCore import QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPen
-from PySide6.QtWidgets import QAbstractScrollArea, QToolTip
+from PySide6.QtWidgets import QAbstractScrollArea
 
 from ..spectral import color as _spectral_color
 from . import theme
@@ -386,15 +386,14 @@ class MixGrid(QAbstractScrollArea):
             self.recipeActivated.emit(self._recipes[index])
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        # Hovering only highlights the cell.  The black pop-up this used to
+        # raise was wrong for merged colours (it named one recipe out of dozens)
+        # and the user asked for it to go — the detail panel is the place to
+        # read a colour.
         index = self._indexAt(event.position().toPoint())
         if index != self._hover:
             self._hover = index
             self.viewport().update()
-            if index >= 0:
-                recipe = self._recipes[index]
-                QToolTip.showText(event.globalPosition().toPoint(), self._tooltip(recipe))
-            else:
-                QToolTip.hideText()
 
     def leaveEvent(self, event) -> None:  # noqa: N802
         if self._hover != -1:
@@ -443,24 +442,6 @@ class MixGrid(QAbstractScrollArea):
         self._hover = -1
 
     # -- helpers -----------------------------------------------------------------
-    def _tooltip(self, recipe) -> str:
-        if getattr(recipe, "pair_index", 0) < 0 and hasattr(recipe, "label"):
-            return (
-                f"{recipe.label}\n"
-                f"{recipe.color_hex}\n"
-                "这是耗材丝本身的颜色（不是混色）"
-            )
-        if hasattr(recipe, "percent_c"):
-            detail = f"{recipe.percent_a}% + {recipe.percent_b}% + {recipe.percent_c}%"
-            hint = "单击查看合成这个颜色的所有配方（三色混色）"
-        elif hasattr(recipe, "percent_a"):
-            detail = f"{recipe.percent_a}% + {recipe.percent_b}%"
-            hint = "单击查看是哪两种耗材丝"
-        else:
-            detail = getattr(recipe, "ratio_text", "")
-            hint = "单击查看合成这个颜色的所有配方"
-        return f"{recipe.color_hex}\n{detail}\n{hint}"
-
     def _scrollToIndex(self, index: int) -> None:
         viewport_h = self.viewport().height()
         value = self.verticalScrollBar().value()

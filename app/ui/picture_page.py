@@ -20,12 +20,14 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QImage, QPainter, QPixmap
+from PySide6.QtGui import QColor, QImage, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
     QFrame,
@@ -76,6 +78,15 @@ def _to_qimage(image: Image.Image) -> QImage:
     data = rgba.tobytes("raw", "RGBA")
     qimage = QImage(data, rgba.width, rgba.height, QImage.Format.Format_RGBA8888)
     return qimage.copy()
+
+
+def _scrollable(widget: QWidget) -> QScrollArea:
+    """Put a widget in a frameless, resizable scroll area — the house style."""
+    area = QScrollArea()
+    area.setWidgetResizable(True)
+    area.setFrameShape(QFrame.Shape.NoFrame)
+    area.setWidget(widget)
+    return area
 
 
 class PictureView(QWidget):
@@ -154,11 +165,13 @@ class PictureView(QWidget):
             return self._highlight
         height, width = result.indices.shape
         canvas = np.zeros((height, width, 4), dtype=np.uint8)
-        canvas[..., 3] = 255
         keep = result.indices == self._selected
+        printed = result.indices >= 0
         # A wash rather than a solid fill: the rest of the picture stays legible
         # as context, so a small highlighted region is not floating in a void.
-        canvas[~keep] = (246, 247, 249, 168)
+        canvas[printed & ~keep] = (246, 247, 249, 168)
+        # Deleted pixels stay fully transparent even while a colour is
+        # highlighted: nothing is printed there, and the preview has to say so.
         canvas[keep] = (0, 0, 0, 0)
         overlay = _to_qimage(Image.fromarray(canvas, "RGBA"))
         pixmap = QPixmap.fromImage(overlay)
@@ -232,6 +245,8 @@ class ColourList(QWidget):
 
     colourSelected = Signal(int)
     colourActivated = Signal(int)
+    #: The SET of selected rows changed — the page re-reads ``selected_indices``.
+    selectionChanged = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -240,6 +255,10 @@ class ColourList(QWidget):
         self._pinned = -1
         self._suppress = False
         self._library: FilamentLibrary | None = None
+        #: The rows the user has selected.  Kept here rather than read back from
+        #: the widget because ``_refresh`` clears the list on every pin, and the
+        #: selection has to survive that.
+        self._picked: set[int] = set()
 
         self._list = QListWidget()
         self._list.setIconSize(compare_pixmap("#FFFFFF", "#000000").size())
@@ -248,7 +267,11 @@ class ColourList(QWidget):
         self._list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._list.setTextElideMode(Qt.TextElideMode.ElideRight)
         self._list.setWordWrap(False)
+        # 「删除」 and 「合并」 both work on several colours at once, so the list
+        # has to allow a multi-selection; a plain click still selects just one.
+        self._list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self._list.currentRowChanged.connect(self._on_row_changed)
+        self._list.itemSelectionChanged.connect(self._on_selection_changed)
         self._list.itemDoubleClicked.connect(self._on_row_double_clicked)
 
         self._summary = QLabel("")
@@ -264,6 +287,7 @@ class ColourList(QWidget):
     def setResult(self, result: MatchResult | None) -> None:
         self._result = result
         self._pinned = -1
+        self._picked = set()
         self._order = list(range(len(result.palette))) if result is not None else []
         self.refresh()
 
@@ -279,6 +303,14 @@ class ColourList(QWidget):
 
     def current(self) -> int:
         return self._pinned
+
+    def selected_indices(self) -> list[int]:
+        """Every selected colour, in list order — the input to 删除 / 合并."""
+        result = self._result
+        if result is None:
+            return []
+        live = {int(self._list.item(row).data(Qt.ItemDataRole.UserRole)) for row in range(self._list.count())}
+        return sorted(index for index in self._picked if index in live)
 
     def entries(self) -> list[PaletteEntry]:
         return list(self._result.palette) if self._result is not None else []
@@ -312,14 +344,25 @@ class ColourList(QWidget):
                     f"{entry_recipe_text(entry, self._library, compact=True)}",
                 )
                 row.setData(Qt.ItemDataRole.UserRole, int(index))
-                row.setToolTip(
-                    f"图片里的颜色：{image_hex}（{count} 像素 · {share:.1f}%）\n"
-                    f"匹配到的颜色：{entry.color_hex}\n"
-                    f"{entry_recipe_text(entry, self._library)}"
-                )
+                # No hover tooltip here: the row already prints the picture's
+                # own colour, the matched colour, the share and the recipe, so
+                # the black pop-up only repeated it.
                 self._list.addItem(row)
+            # Deleting or merging rebuilds the rows, and the user's selection has
+            # to come back with them; a colour that is gone simply drops out.
+            live = {
+                int(self._list.item(row).data(Qt.ItemDataRole.UserRole))
+                for row in range(self._list.count())
+            }
+            self._picked &= live
+            for row in range(self._list.count()):
+                item = self._list.item(row)
+                if int(item.data(Qt.ItemDataRole.UserRole)) in self._picked:
+                    item.setSelected(True)
             if self._pinned >= 0 and self._list.count():
                 self._list.setCurrentRow(0)
+        else:
+            self._picked = set()
         self._suppress = False
 
     def _update_summary(self) -> None:
@@ -327,9 +370,11 @@ class ColourList(QWidget):
         if result is None:
             self._summary.setText("导入图片后，这里列出打印需要的颜色。")
             return
+        selected = len(self.selected_indices())
+        extra = f" · 选中 {selected} 种" if selected else ""
         self._summary.setText(
             f"{result.width}×{result.height} 像素 · 实心 {result.printed_pixels} 像素"
-            f" · 共 {len(result.palette)} 种颜色"
+            f" · 共 {len(result.palette)} 种颜色{extra}"
         )
 
     def _on_row_changed(self, row: int) -> None:
@@ -341,8 +386,68 @@ class ColourList(QWidget):
         index = int(item.data(Qt.ItemDataRole.UserRole))
         self.colourSelected.emit(index)
 
+    def _on_selection_changed(self) -> None:
+        if self._suppress:
+            return
+        self._picked = set(self.selected_indices())
+        self._update_summary()
+        self.selectionChanged.emit()
+
     def _on_row_double_clicked(self, item: QListWidgetItem) -> None:
         self.colourActivated.emit(int(item.data(Qt.ItemDataRole.UserRole)))
+
+
+class MergeDialog(QDialog):
+    """Ask which of the selected colours the merged region should become.
+
+    The user's requirement is explicit: 「合并后弹出窗口，从多选的颜色里选择一个
+    颜色作为合并后的整体颜色」 — so the dialog lists exactly the selected colours
+    and nothing else.
+    """
+
+    def __init__(self, entries, *, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("合并颜色")
+        self._list = QListWidget()
+        self._list.setIconSize(swatch_pixmap("#FFFFFF", 44, 20).size())
+        for index, entry in enumerate(entries):
+            row = QListWidgetItem(
+                swatch_pixmap(entry.color_hex, 44, 20),
+                f"{entry.color_hex}    {entry.short_label}",
+            )
+            row.setData(Qt.ItemDataRole.UserRole, index)
+            self._list.addItem(row)
+        self._list.setCurrentRow(0)
+        self._list.itemDoubleClicked.connect(lambda _item: self.accept())
+
+        hint = QLabel("这些颜色会并成一种，整块区域都用你选中的这个颜色打印。")
+        hint.setProperty("role", "hint")
+        hint.setWordWrap(True)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        ok = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        ok.setText("合并")
+        ok.setProperty("accent", "true")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        box = QVBoxLayout(self)
+        box.setContentsMargins(14, 14, 14, 14)
+        box.setSpacing(10)
+        box.addWidget(hint)
+        box.addWidget(self._list, 1)
+        box.addWidget(buttons)
+        self.resize(430, 340)
+
+    def chosen(self) -> int:
+        """Position inside the list this dialog was opened with, or -1."""
+        item = self._list.currentItem()
+        if item is None:
+            return -1
+        return int(item.data(Qt.ItemDataRole.UserRole))
 
 
 class PicturePage(QWidget):
@@ -355,13 +460,26 @@ class PicturePage(QWidget):
         self._image: Image.Image | None = None
         self._image_name: str = "混色底板"
         self._source_qimage: QImage | None = None
+        # ``_base`` is the untouched match; ``_result`` is the base plus whatever
+        # the user did to it.  Everything the user does is stored as an edit
+        # against the ORIGINAL palette indices, never by mutating the pixels, so
+        # undo and redo are a snapshot of three small dictionaries rather than a
+        # megabyte of image data.
+        self._base: MatchResult | None = None
         self._result: MatchResult | None = None
         self._plate: PlateModel | None = None
-        # What the matcher decided, and what the USER decided on top of it. The
-        # two are kept apart so 「恢复自动匹配」 can undo a replacement without
-        # re-running the match, and so the export follows the user's choice.
-        self._auto_palette: list[PaletteEntry] = []
-        self._overrides: dict[int, PaletteEntry] = {}
+        #: Original indices the user deleted — those pixels become transparent,
+        #: which means no base plate and nothing printed there.
+        self._deleted: set[int] = set()
+        #: ``source -> target``, original indices: the source's pixels are
+        #: printed with the target's colour.
+        self._merged: dict[int, int] = {}
+        #: ``original index -> PaletteEntry``, the 「更换颜色…」 replacements.
+        self._replaced: dict[int, PaletteEntry] = {}
+        self._undo_stack: list[tuple] = []
+        self._redo_stack: list[tuple] = []
+        #: Live palette index -> original index, rebuilt by ``_compose``.
+        self._live_map: list[int] = []
         # Set when the library changed while this page was off screen; the
         # re-match is then done in showEvent instead of in setLibrary.
         self._stale = False
@@ -371,6 +489,7 @@ class PicturePage(QWidget):
         self._candidates_for: bool | None = None
         self._build_ui()
         self._set_controls_enabled(False)
+        self._update_actions()
 
     # -- construction -----------------------------------------------------
     def _build_ui(self) -> None:
@@ -401,10 +520,6 @@ class PicturePage(QWidget):
         self._dither = QCheckBox("抖动")
         self._dither.setToolTip("用误差扩散让渐变更平滑，但会牺牲色块的纯净度")
 
-        self._show_matched = QCheckBox("显示匹配结果")
-        self._show_matched.setChecked(True)
-        self._show_matched.toggled.connect(self._on_show_matched)
-
         top = QHBoxLayout()
         top.setSpacing(8)
         top.addWidget(self._import_button)
@@ -415,7 +530,6 @@ class PicturePage(QWidget):
         top.addWidget(self._include_mixes)
         top.addWidget(self._dither)
         top.addWidget(self._rematch_button)
-        top.addWidget(self._show_matched)
         top.addStretch(1)
 
         self._width_spin = QDoubleSpinBox()
@@ -463,9 +577,61 @@ class PicturePage(QWidget):
         self._view = PictureView()
         self._view.regionClicked.connect(self._on_region_clicked)
 
+        # 原图 and 预览 sit side by side so the user can compare what they
+        # imported with what the printer will actually lay down.  The original
+        # never shows the matched render, so it stays a true reference.
+        self._original_view = PictureView()
+        self._original_view.setShowMatched(False)
+        self._original_view.regionClicked.connect(self._on_region_clicked)
+
         self._list = ColourList()
         self._list.colourSelected.connect(self._on_colour_selected)
         self._list.colourActivated.connect(self._on_colour_activated)
+        self._list.selectionChanged.connect(self._update_actions)
+
+        # 「删除 / 合并 / 撤销 / 恢复」 sit right under the colour list, because
+        # they are all about the selection in it.
+        self._delete_button = QPushButton("删除")
+        self._delete_button.setToolTip(
+            "删掉选中的颜色：这些地方留空、变成透明，不打底板也不打印。可以多选。"
+        )
+        self._delete_button.clicked.connect(self._on_delete_colours)
+
+        self._merge_button = QPushButton("合并")
+        self._merge_button.setToolTip(
+            "把选中的几种颜色并成一种，并成哪一种由你在弹窗里挑。至少要选两种。"
+        )
+        self._merge_button.clicked.connect(self._on_merge_colours)
+
+        self._undo_button = QPushButton("撤销")
+        self._undo_button.setToolTip("撤销上一步：删除、合并或更换颜色（Ctrl+Z）")
+        self._undo_button.clicked.connect(self._undo)
+
+        self._redo_button = QPushButton("恢复")
+        self._redo_button.setToolTip("把撤销掉的一步再做回来（Ctrl+Y）")
+        self._redo_button.clicked.connect(self._redo)
+
+        actions = QHBoxLayout()
+        actions.setSpacing(6)
+        actions.addWidget(self._delete_button)
+        actions.addWidget(self._merge_button)
+        actions.addStretch(1)
+        actions.addWidget(self._undo_button)
+        actions.addWidget(self._redo_button)
+
+        # The shortcuts are on the page, so Ctrl+Z works whichever of the two
+        # panels has the focus.
+        self._undo_shortcut = QShortcut(QKeySequence("Ctrl+Z"), self)
+        self._undo_shortcut.activated.connect(self._undo)
+        self._redo_shortcut = QShortcut(QKeySequence("Ctrl+Y"), self)
+        self._redo_shortcut.activated.connect(self._redo)
+
+        list_box = QWidget()
+        list_layout = QVBoxLayout(list_box)
+        list_layout.setContentsMargins(0, 0, 0, 0)
+        list_layout.setSpacing(6)
+        list_layout.addWidget(self._list, 1)
+        list_layout.addLayout(actions)
 
         self._detail = ColourDetail()
         self._detail.replaceRequested.connect(self._on_replace)
@@ -486,15 +652,23 @@ class PicturePage(QWidget):
         detail_scroll.setWidget(self._detail)
 
         right = QSplitter(Qt.Orientation.Vertical)
-        right.addWidget(self._wrap(self._list, "这个模型需要的颜色"))
+        right.addWidget(self._wrap(list_box, "这个模型需要的颜色"))
         right.addWidget(self._wrap(detail_scroll, "选中的颜色"))
         right.setStretchFactor(0, 3)
         right.setStretchFactor(1, 2)
         right.setCollapsible(1, False)
         right.setSizes([420, 340])
 
+        pictures = QSplitter(Qt.Orientation.Horizontal)
+        pictures.addWidget(self._wrap(_scrollable(self._original_view), "原图"))
+        pictures.addWidget(self._wrap(_scrollable(self._view), "预览"))
+        # 预览 is the one the user works in, so it gets the extra room.
+        pictures.setStretchFactor(0, 1)
+        pictures.setStretchFactor(1, 1)
+        pictures.setSizes([340, 420])
+
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(self._wrap(self._view, "图片"))
+        splitter.addWidget(pictures)
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 1)
@@ -533,7 +707,6 @@ class PicturePage(QWidget):
             self._base_combo,
             self._export_3mf,
             self._export_obj,
-            self._show_matched,
         ):
             widget.setEnabled(enabled)
 
@@ -636,22 +809,17 @@ class PicturePage(QWidget):
         except Exception as error:  # pragma: no cover - defensive
             QMessageBox.warning(self, "匹配失败", str(error))
             return
-        self._result = result
+        self._base = result
+        self._deleted = set()
+        self._merged = {}
+        self._replaced = {}
+        self._undo_stack = []
+        self._redo_stack = []
         self._plate = None
-        self._auto_palette = list(result.palette)
-        self._overrides = {}
         self._list.setLibrary(self._library)
-        self._view.setResult(result, self._source_qimage)
-        self._list.setResult(result)
-        self._refresh_base_combo()
-        self._detail.clear()
+        self._apply_edits()
         self._set_controls_enabled(True)
-        self._status.setText(
-            "匹配完成：{0}×{1} 像素，{2} 种颜色。点击右侧颜色看图片高光，"
-            "点击图片看它属于哪种颜色；点「更换颜色…」可以手动换掉不合适的颜色。".format(
-                result.width, result.height, len(result.palette)
-            )
-        )
+        self._announce_edits()
 
     def _refresh_base_combo(self) -> None:
         result = self._result
@@ -666,24 +834,28 @@ class PicturePage(QWidget):
             self._base_combo.setCurrentIndex(previous)
         self._base_combo.blockSignals(False)
 
-    def _on_show_matched(self, checked: bool) -> None:
-        self._view.setShowMatched(bool(checked))
-
     # -- two-way selection ------------------------------------------------
     def _select(self, index: int) -> None:
         """Show one colour everywhere it appears: picture, list and detail."""
         self._view.setSelected(index)
+        self._original_view.setSelected(index)
         self._list.pin(index)
         if self._result is None:
             return
         if not 0 <= index < len(self._result.palette):
             return
-        original = self._auto_palette[index] if index < len(self._auto_palette) else None
+        original = None
+        changed = False
+        if index < len(self._live_map):
+            source = self._live_map[index]
+            if self._base is not None and source < len(self._base.palette):
+                original = self._base.palette[source]
+            changed = source in self._replaced
         self._detail.setSelection(
             self._result,
             index,
             library=self._library,
-            changed=index in self._overrides,
+            changed=changed,
             original=original,
         )
 
@@ -696,7 +868,7 @@ class PicturePage(QWidget):
     def _on_colour_activated(self, index: int) -> None:
         self._select(index)
 
-    # -- manual replacement ------------------------------------------------
+    # -- the user's edits: 删除 / 合并 / 更换颜色 / 撤销 / 恢复 ---------------
     def _current_index(self) -> int:
         index = self._list.current()
         if index < 0:
@@ -705,43 +877,230 @@ class PicturePage(QWidget):
             return -1
         return index
 
-    def _apply_overrides(self) -> None:
-        """Fold the user's replacements into the palette the print uses.
+    def _snapshot(self) -> tuple:
+        return (set(self._deleted), dict(self._merged), dict(self._replaced))
 
-        Always rebuilt from ``_auto_palette`` rather than from the live palette:
-        the live one already carries the previous replacements, so folding a
-        removal into it would leave the removed colour stuck in place.
+    def _restore(self, snapshot: tuple) -> None:
+        deleted, merged, replaced = snapshot
+        self._deleted = set(deleted)
+        self._merged = dict(merged)
+        self._replaced = dict(replaced)
+
+    def _push(self) -> None:
+        """Remember the state before an edit, and drop the redo history."""
+        self._undo_stack.append(self._snapshot())
+        # A long session should not grow without bound; 64 steps is far more
+        # than anyone retraces by hand.
+        del self._undo_stack[:-64]
+        self._redo_stack.clear()
+
+    def _resolve(self) -> tuple[dict[int, int], set[int]]:
+        """``(index remap, indices that vanish)`` after the merges and deletions.
+
+        Chains are followed — merging A into B and then B into C prints both as
+        C — and a colour that was deleted takes everything merged into it with
+        it, because those pixels are already printed as the deleted colour.
         """
-        if self._result is None:
-            return
-        palette = list(self._auto_palette) if self._auto_palette else list(self._result.palette)
-        for index, entry in self._overrides.items():
-            if 0 <= index < len(palette):
-                palette[index] = entry
-        self._result = replace(self._result, palette=palette)
-        self._plate = None
-        self._view.setResult(self._result, self._source_qimage)
-        self._list.refresh()
-        self._refresh_base_combo()
-        index = self._current_index()
-        if index >= 0:
-            self._select(index)
-        self._announce_overrides()
+        merged = dict(self._merged)
+        for source in list(merged):
+            target = merged[source]
+            seen = {source}
+            while target in merged and target not in seen:
+                seen.add(target)
+                target = merged[target]
+            merged[source] = target
+        gone = set(self._deleted)
+        for source, target in merged.items():
+            if target in gone:
+                gone.add(source)
+        return merged, gone
 
-    def _announce_overrides(self) -> None:
-        if not self._overrides:
+    def _compose(self) -> MatchResult | None:
+        """Rebuild the live result from ``_base`` and the edit state.
+
+        Always from the pristine match, never from the live result: the live one
+        already carries the previous edits, so folding a new deletion into it
+        would leave the deleted pixels behind.  Deleted pixels become ``-1``,
+        which is exactly the transparent index the matcher already uses — so
+        ``build_plate`` gives them no base plate and no colour prism.
+        """
+        base = self._base
+        if base is None:
+            return None
+        merged, gone = self._resolve()
+        indices = np.array(base.indices, dtype=np.int32, copy=True)
+        for source, target in merged.items():
+            if source in gone or source == target:
+                continue
+            mask = indices == source
+            if mask.any():
+                indices[mask] = target
+        for index in gone:
+            indices[indices == index] = -1
+
+        # A colour survives when it was not deleted and nothing was merged into
+        # it... rather: when it was not deleted and is not itself a merge source.
+        alive = [
+            index
+            for index in range(len(base.palette))
+            if index not in gone and index not in merged
+        ]
+        palette = [self._replaced.get(index, base.palette[index]) for index in alive]
+        if alive:
+            totals = np.bincount(
+                indices[indices >= 0].ravel(), minlength=len(base.palette)
+            )
+            counts = np.asarray([totals[index] for index in alive], dtype=base.counts.dtype)
+        else:
+            counts = np.zeros(0, dtype=base.counts.dtype)
+        means = None
+        if base.means is not None and len(base.means) == len(base.palette):
+            means = np.asarray([base.means[index] for index in alive], dtype=base.means.dtype)
+
+        live = np.full(indices.shape, -1, dtype=np.int32)
+        for position, original in enumerate(alive):
+            mask = indices == original
+            if mask.any():
+                live[mask] = position
+        self._live_map = alive
+        return replace(
+            base,
+            palette=palette,
+            indices=live,
+            counts=counts,
+            means=means,
+        )
+
+    def _apply_edits(self, keep: int | None = None) -> None:
+        """Recompose the live result and show it everywhere.
+
+        ``keep`` is an ORIGINAL palette index to keep selected across the
+        rebuild; without it the colour that is currently selected is followed
+        through the edit, so 「更换颜色…」 and 撤销 both leave the user where they
+        were instead of jumping back to the top of the list.
+        """
+        anchor = keep
+        if anchor is None:
+            index = self._list.current()
+            if 0 <= index < len(self._live_map):
+                anchor = self._live_map[index]
+        self._result = self._compose()
+        self._plate = None
+        result = self._result
+        if result is None:
+            self._view.setResult(None, self._source_qimage)
+            self._original_view.setResult(None, self._source_qimage)
+            self._list.setResult(None)
+            self._refresh_base_combo()
+            self._detail.clear()
+            self._update_actions()
+            self._announce_edits()
+            return
+        self._view.setResult(result, self._source_qimage)
+        self._original_view.setResult(result, self._source_qimage)
+        self._list.setResult(result)
+        self._refresh_base_combo()
+        target = self._live_map.index(anchor) if anchor in self._live_map else -1
+        if target < 0 and len(result.palette):
+            target = 0
+        if 0 <= target < len(result.palette):
+            self._select(target)
+        else:
+            self._detail.clear()
+        self._update_actions()
+        self._announce_edits()
+
+    def _update_actions(self) -> None:
+        """ 删除 needs one colour, 合并 needs two, and the history drives the rest."""
+        picked = self._list.selected_indices() if self._result is not None else []
+        live = bool(self._result is not None and len(self._result.palette))
+        self._delete_button.setEnabled(live and len(picked) >= 1)
+        self._merge_button.setEnabled(live and len(picked) >= 2)
+        self._undo_button.setEnabled(bool(self._undo_stack))
+        self._redo_button.setEnabled(bool(self._redo_stack))
+
+    def _announce_edits(self) -> None:
+        result = self._result
+        if result is None:
+            return
+        parts = []
+        if self._deleted:
+            parts.append(f"删除 {len(self._deleted)} 种颜色（留空不打印）")
+        if self._merged:
+            parts.append(f"合并 {len(self._merged)} 种颜色")
+        if self._replaced:
+            parts.append(f"手动更换 {len(self._replaced)} 种颜色")
+        if not parts:
             self._status.setText(
                 "匹配完成：{0}×{1} 像素，{2} 种颜色。点击右侧颜色看图片高光，"
-                "点击图片看它属于哪种颜色；点「更换颜色…」可以手动换掉不合适的颜色。".format(
-                    self._result.width, self._result.height, len(self._result.palette)
+                "点击图片看它属于哪种颜色；点「更换颜色…」可以手动换掉不合适的颜色，"
+                "多选颜色后可以「删除」（留空不打印）或「合并」。".format(
+                    result.width, result.height, len(result.palette)
                 )
-                if self._result is not None
-                else ""
             )
             return
+        printed = result.printed_pixels
+        total = max(1, result.total_pixels)
         self._status.setText(
-            f"已手动更换 {len(self._overrides)} 种颜色，导出的 3MF / OBJ 会用你选的颜色。"
+            "、".join(parts)
+            + f"，现在打 {len(result.palette)} 种颜色，实心 {printed} 像素"
+            f"（占 {printed / total * 100:.1f}%）。导出的 3MF / OBJ 就照这样切，"
+            "Ctrl+Z 撤销、Ctrl+Y 恢复。"
         )
+
+    def _on_delete_colours(self) -> None:
+        picked = self._list.selected_indices()
+        if not picked:
+            return
+        originals = [self._live_map[i] for i in picked if 0 <= i < len(self._live_map)]
+        if not originals:
+            return
+        self._push()
+        self._deleted.update(originals)
+        self._apply_edits()
+        self._status.setText(
+            f"已删除 {len(originals)} 种颜色：这些地方留空、变成透明，"
+            "不打印也没有底板。Ctrl+Z 可以撤销。"
+        )
+
+    def _on_merge_colours(self) -> None:
+        picked = self._list.selected_indices()
+        if len(picked) < 2 or self._result is None:
+            return
+        entries = [self._result.palette[index] for index in picked]
+        dialog = MergeDialog(entries, parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        choice = dialog.chosen()
+        if not 0 <= choice < len(picked):
+            return
+        target = self._live_map[picked[choice]]
+        originals = [self._live_map[index] for index in picked]
+        self._push()
+        for original in originals:
+            if original != target:
+                self._merged[original] = target
+        self._apply_edits(keep=target)
+        self._status.setText(
+            f"已把 {len(originals)} 种颜色合并成 {entries[choice].color_hex}，"
+            "整块区域都用它打印。Ctrl+Z 可以撤销。"
+        )
+
+    def _undo(self) -> None:
+        if not self._undo_stack:
+            return
+        self._redo_stack.append(self._snapshot())
+        self._restore(self._undo_stack.pop())
+        self._apply_edits()
+        self._status.setText("已撤销上一步。Ctrl+Y 可以再做回来。")
+
+    def _redo(self) -> None:
+        if not self._redo_stack:
+            return
+        self._undo_stack.append(self._snapshot())
+        self._restore(self._redo_stack.pop())
+        self._apply_edits()
+        self._status.setText("已恢复刚才撤销的那一步。")
 
     def _on_replace(self) -> None:
         index = self._current_index()
@@ -763,15 +1122,21 @@ class PicturePage(QWidget):
         chosen = dialog.chosen()
         if chosen is None:
             return
-        self._overrides[index] = chosen
-        self._apply_overrides()
+        original = self._live_map[index]
+        self._push()
+        self._replaced[original] = chosen
+        self._apply_edits(keep=original)
 
     def _on_restore(self) -> None:
         index = self._current_index()
-        if index < 0 or index not in self._overrides:
+        if index < 0 or index >= len(self._live_map):
             return
-        self._overrides.pop(index, None)
-        self._apply_overrides()
+        original = self._live_map[index]
+        if original not in self._replaced:
+            return
+        self._push()
+        self._replaced.pop(original, None)
+        self._apply_edits(keep=original)
 
     def _on_actions_changed(self) -> None:
         if self._result is not None:

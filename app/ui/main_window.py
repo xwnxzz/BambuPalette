@@ -51,13 +51,14 @@ from ..core.mixes import (
     SORT_CHOICES,
     SORT_PAIR,
     SORT_RGB,
+    SORT_SIMILARITY,
     MixCatalog,
     merge_recipes,
-    sorted_cells,
 )
 from ..spectral import color as _color
 from ..core.triples import (
     TRIPLE_CACHE_PREFIX,
+    CombinedColours,
     TripleCatalog,
     load_triple_cache,
     mix_sidecar_path,
@@ -68,7 +69,7 @@ from ..core.triples import (
 from . import theme
 from .filament_dialog import FilamentDialog
 from .mix_detail import MixDetail
-from .mix_grid import MixGrid, spool_cell
+from .mix_grid import MixGrid
 from .picture_page import PicturePage
 from .swatch import ColorField, swatch_icon
 
@@ -87,6 +88,7 @@ class MainWindow(QMainWindow):
         parent=None,
         *,
         defer_build: bool = False,
+        auto_triples: bool = True,
     ) -> None:
         super().__init__(parent)
         self.library = library if library is not None else self._load_library()
@@ -98,15 +100,25 @@ class MainWindow(QMainWindow):
         # filament id -> the case-folded text the search box matches on; rebuilt
         # whenever the library changes.  See _filament_haystack.
         self._haystacks: dict[str, str] = {}
-        # Three-filament mixing: the built table, the lazy view handed to the
-        # grid, and the QTimer that advances the sliced build.
+        # 「全部颜色」: one store holding the two-filament mixes, the three-filament
+        # mixes and the spool colours, deduplicated across all three.  It is built
+        # even while the triple table is still being computed, so the page stays
+        # usable instead of blanking out for the minutes a big library takes.
+        self._combined = None
+        self._combined_view = None
+        self._combined_key = None
+        # Three-filament mixing: the built table and the QTimer that advances the
+        # sliced build.  There is no checkbox — see _ensure_triples.
         self._triples = None
-        self._triple_view = None
         self._triple_timer = None
         # The real launcher asks for the first catalogue build to happen after the
         # window is on screen (see _rebuild_catalog).  Tests and the headless tools
         # keep the synchronous default, so nothing has to wait for a timer.
         self._defer_build = defer_build
+        # 三色混色在这台机器上要按百万条配方算，窗口自己会切成小片算并显示
+        # 进度，所以默认就开着（用户要的就是「不用勾选」）。测试和工具要的是
+        # 确定的网格内容，可以把它关掉。
+        self._auto_triples = auto_triples
         self._build_notice = False
 
         self.setWindowTitle("BambuPalette — 混色耗材色彩管理器")
@@ -180,7 +192,7 @@ class MainWindow(QMainWindow):
         self._search.setClearButtonEnabled(True)
         self._search.textChanged.connect(lambda *_: self._refresh_grid())
 
-        self._show_all_button = QPushButton("显示全部混色")
+        self._show_all_button = QPushButton("显示全部颜色")
         self._show_all_button.clicked.connect(self._clear_filters)
         self._show_all_button.setEnabled(False)
 
@@ -193,7 +205,7 @@ class MainWindow(QMainWindow):
         )
         self._target_color.colorChanged.connect(self._on_target_color_changed)
         self._find_button = QPushButton("找最接近的混色")
-        self._find_button.setToolTip("先选一个目标颜色；再按 CIEDE2000 在当前显示的全部混色里找最接近的配方")
+        self._find_button.setToolTip("先选一个目标颜色；再按 CIEDE2000 在当前显示的全部颜色里找最接近的配方")
         self._find_button.setEnabled(False)
         self._find_button.clicked.connect(self._on_find_nearest)
 
@@ -255,7 +267,7 @@ class MainWindow(QMainWindow):
 
         tabs = QTabWidget()
         tabs.addTab(mix_page, "混色配方")
-        tabs.addTab(self._picture_page, "图片转模型")
+        tabs.addTab(self._picture_page, "图像转换")
         self._tabs = tabs
 
         body = QWidget()
@@ -365,46 +377,15 @@ class MainWindow(QMainWindow):
         self._grid_info = QLabel("")
         self._grid_info.setProperty("role", "hint")
 
-        # The spool colours are a separate, optional half of the same list: in
-        # Bambu Studio a mixed filament and the plain spool it is made from sit
-        # side by side in the same picker, so a user choosing what to load needs
-        # to see both. Off by default keeps the page about the mixes.
-        self._all_colours = QCheckBox("全部颜色")
-        self._all_colours.setToolTip(
-            "把每种耗材丝本身的颜色也列进来。\n"
-            "两种耗材时：81 个混色 + 2 个耗材本色 = 83 个颜色。\n"
-            "列表顺序与左边的「排序」一致。"
-        )
-        self._all_colours.toggled.connect(lambda *_: self._refresh_grid())
-
-        # Three-filament mixes: every (a, b, c) of whole percents with each ≥ 10
-        # and a+b+c = 100, i.e. 2556 ratios per triple.  At 41 spools that is
-        # 27,246,960 recipes, so this is built in slices (the window keeps
-        # painting), written to a cache, and only then shown.
-        self._triples_box = QCheckBox("三色混色")
-        self._triples_box.setToolTip(
-            "把三种耗材混合的颜色也算出来。\n"
-            "每种三卷组合有 2556 个配比（每种至少 10%，合计 100%，按 1% 递增）。\n"
-            "颜色完全相同的配方会合成一个颜色，点开可以看它所有的配方。\n"
-            "第一次算要几分钟，算完会存进缓存，以后打开就很快。"
-        )
-        self._triples_box.toggled.connect(self._on_triples_toggled)
-        header_extra = QWidget()
-        header_row = QHBoxLayout(header_extra)
-        header_row.setContentsMargins(0, 0, 0, 0)
-        header_row.setSpacing(10)
-        header_row.addWidget(self._triples_box)
-        header_row.addWidget(self._all_colours)
-
-        # Double-clicking a mix narrows the grid to that one parent pair. That
-        # used to be signalled only by a line of small print under the grid, so
-        # the panel looked like it had lost every other colour with no way back.
-        # The banner says what is hidden and carries its own way out.
+        # 「全部颜色」: the two-filament mixes, the three-filament mixes and the
+        # spool colours themselves are one list, deduplicated across all of them.
+        # There is deliberately no checkbox for any of the three parts — see
+        # CombinedColours.
         self._filter_bar = QFrame()
         self._filter_bar.setObjectName("filterBar")
         self._filter_label = QLabel("")
         self._filter_label.setWordWrap(True)
-        self._filter_back = QPushButton("显示全部混色")
+        self._filter_back = QPushButton("显示全部颜色")
         self._filter_back.setProperty("accent", "true")
         self._filter_back.clicked.connect(self._clear_filters)
         bar_row = QHBoxLayout(self._filter_bar)
@@ -421,7 +402,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._filter_bar)
         layout.addWidget(self._grid, 1)
         layout.addWidget(self._grid_info)
-        return self._wrap(panel, "全部混色", header_extra=header_extra)
+        return self._wrap(panel, "全部颜色")
 
     def _build_menus(self) -> None:
         file_menu = self.menuBar().addMenu("文件(&F)")
@@ -442,7 +423,7 @@ class MainWindow(QMainWindow):
         file_menu.addAction(quit_action)
 
         view_menu = self.menuBar().addMenu("视图(&V)")
-        clear_action = QAction("显示全部混色", self)
+        clear_action = QAction("显示全部颜色", self)
         clear_action.setShortcut(QKeySequence("Ctrl+0"))
         clear_action.triggered.connect(self._clear_filters)
         view_menu.addAction(clear_action)
@@ -671,15 +652,8 @@ class MainWindow(QMainWindow):
             return False
         if not catalog.built:
             return False
-        # Wire the checkbox without letting it kick off the build we just skipped.
-        self._triples_box.blockSignals(True)
-        self._triples_box.setChecked(True)
-        self._triples_box.blockSignals(False)
-        self._set_search_enabled(False)
-        self._all_colours.setChecked(False)
-        self._all_colours.setEnabled(False)
         self._triples = catalog
-        self._triple_view = catalog.colours()
+        self._rebuild_combined()
         try:
             save_triple_cache(catalog, self._triples_path())
         except Exception:
@@ -725,6 +699,9 @@ class MainWindow(QMainWindow):
             if self.library.get(a_id) is None or self.library.get(b_id) is None:
                 self._pair_filter = None
         self._refresh_grid()
+        # 三色混色是这一页的一部分，不是可选功能：先把两色和耗材本色画出来，
+        # 再去拿缓存 / 开始算三色（见 _ensure_triples）。
+        self._ensure_triples()
 
     def _announce_build(self) -> None:
         """Say what the pending catalogue build is about to do."""
@@ -800,7 +777,12 @@ class MainWindow(QMainWindow):
         if _HEX_QUERY.match(query):
             return query.lower() in cell.color_hex[1:].lower()
         for recipe in getattr(cell, "recipes", (cell,)):
-            for filament_id in (recipe.a_id, recipe.b_id):
+            # MixRecipe carries a_id/b_id; TripleRecipe carries parent_ids.
+            parents = getattr(recipe, "parent_ids", None) or (
+                recipe.a_id,
+                recipe.b_id,
+            )
+            for filament_id in parents:
                 filament = self.library.get(filament_id)
                 if filament is not None and query in self._filament_haystack(filament):
                     return True
@@ -820,53 +802,77 @@ class MainWindow(QMainWindow):
         否则一边算一边改耗材，算完的那张表还是旧配方，却会被当成新耗材库的
         缓存写下去（文件名按新库取，内容按旧库算），下次打开就全是错颜色。
         """
-        if self._triples is None and self._triple_timer is None:
-            return
-        self._stop_triple_timer()
-        self._triples = None
-        self._triple_view = None
-        self._end_build_notice()
-        if self._triples_box.isChecked():
-            self._on_triples_toggled(True)
-
-    def _set_search_enabled(self, enabled: bool) -> None:
-        """三色混色时关掉搜索框：4.3 M 个颜色没法逐个套名字。"""
-        if not hasattr(self, "_search"):
-            return
-        if not enabled and not getattr(self, "_search_tip", None):
-            self._search_tip = self._search.toolTip()
-        self._search.setEnabled(enabled)
-        if enabled:
-            self._search.setToolTip(getattr(self, "_search_tip", ""))
-        else:
-            self._search.setToolTip("三色混色的颜色太多，暂时不能按名称搜索；取消勾选就可以搜两色混色。")
-
-    def _on_triples_toggled(self, checked: bool) -> None:
-        self._set_search_enabled(not checked)
-        # The spool colours cannot be folded into a four-million-cell colour
-        # order without materialising it, so 全部颜色 sits this one out.
-        self._all_colours.setEnabled(not checked)
-        if checked:
-            self._all_colours.setChecked(False)
-        if not checked:
+        if self._triples is not None or self._triple_timer is not None:
             self._stop_triple_timer()
             self._triples = None
-            self._triple_view = None
             self._end_build_notice()
-            self._refresh_grid()
+        self._rebuild_combined()
+
+    def _rebuild_combined(self) -> None:
+        """「全部颜色」= 两色混色 + 三色混色 + 耗材本色，跨表去重成一张表。
+
+        三色表还在算的时候也先建一份（只有两色和耗材本色）：正在算三色混色
+        不该让这一页先空上几分钟。
+        """
+        if self._catalog is None:
+            self._combined = None
+        else:
+            self._combined = CombinedColours(
+                self._catalog, self._triples, self.library.filaments
+            )
+        self._combined_view = None
+        self._combined_key = None
+
+    def _ordered_combined(self, sort_key: str):
+        """当前排序下的懒视图；排好的那一次留着，来回切设置不再重排。"""
+        target = tuple(self._target_color.rgb())
+        signature = (sort_key, target, len(self.library))
+        if self._combined_key == signature and self._combined_view is not None:
+            return self._combined_view
+        self._combined_view = self._combined.ordered(sort_key, target)
+        self._combined_key = signature
+        return self._combined_view
+
+    def _search_mask(self, query: str):
+        """搜索框 → 命中的颜色下标（numpy 数组，可能是几百万个）。
+
+        十六进制片段用 nibble 比较在所有颜色上一次性跑完；文字先找出名字匹配
+        的耗材，再取它们参与过的每一种颜色。
+        """
+        text = query.strip().lstrip("#")
+        if _HEX_QUERY.match(text):
+            return self._combined.search_hex(text)
+        wanted = [
+            filament.id
+            for filament in self.library.filaments
+            if query.casefold() in self._filament_haystack(filament)
+        ]
+        if not wanted:
+            return np.empty(0, dtype=np.int64)
+        return self._combined.search_spools(wanted)
+
+    # -- three-filament mixes ---------------------------------------------------
+
+    def _triples_path(self):
+        """三色混色缓存在哪：一个耗材库 + 一个引擎一个文件。"""
+        engine_id = self._catalog.engine.id if self._catalog is not None else DEFAULT_ENGINE
+        key = triple_cache_key(self.library.filaments, engine_id)
+        return paths.data_dir() / "cache" / f"{TRIPLE_CACHE_PREFIX}{key}.npz"
+
+    def _ensure_triples(self) -> None:
+        """三色混色不用谁去勾选：有 3 卷料就该有它，先看缓存，没有就算。"""
+        if not self._auto_triples:
             return
         if self._catalog is None or len(self.library) < 3:
-            self._triples = None
-            self._triple_view = None
-            self._refresh_grid()
-            self._grid_info.setText("三色混色至少需要 3 种耗材。")
+            return
+        if self._triples is not None or self._triple_timer is not None:
             return
         cached = load_triple_cache(
             self._triples_path(), self.library.filaments, self._catalog.engine.id
         )
         if cached is not None and cached.colour_count:
             self._triples = cached
-            self._triple_view = cached.colours()
+            self._rebuild_combined()
             # 命中缓存就顺手清掉旧耗材库留下的那几份（一份约 153 MB）。
             prune_triple_caches(self._triples_path().parent)
             self._refresh_grid()
@@ -875,13 +881,9 @@ class MainWindow(QMainWindow):
 
     def _start_triple_build(self) -> None:
         catalog = TripleCatalog(self.library.filaments, engine=self._catalog.engine.id)
-        self._triples = catalog
         if not catalog.triple_count:
-            self._triple_view = None
-            self._refresh_grid()
-            self._grid_info.setText("三色混色至少需要 3 种耗材。")
             return
-        self._triple_view = None
+        self._triples = catalog
         catalog.begin()
         self._announce_triples()
         self._triple_timer = QTimer(self)
@@ -917,7 +919,7 @@ class MainWindow(QMainWindow):
         self._grid_info.setText("正在排序去重…")
         QApplication.processEvents()
         catalog.finish()
-        self._triple_view = catalog.colours()
+        self._rebuild_combined()
         try:
             save_triple_cache(catalog, self._triples_path())
         except Exception:  # a cache we cannot write is only a slow next launch
@@ -937,55 +939,32 @@ class MainWindow(QMainWindow):
             return
 
         sort_key = self._sort_combo.currentData() or SORT_RGB
+        query = self._search.text().strip()
         if self._pair_filter is not None:
             # One pair still has to be merged: its 81 recipes can repeat a colour.
-            recipes = self._catalog.pair_recipes(*self._pair_filter)
-            cells_source = merge_recipes(recipes)
-            grouped = False
-        elif self._triple_view is not None:
-            # Millions of colours: the order stays a numpy permutation and the
+            cells_source = merge_recipes(self._catalog.pair_recipes(*self._pair_filter))
+            if query:
+                needle = query.lstrip("#").casefold()
+                cells_source = [
+                    colour for colour in cells_source if self._matches(colour, needle)
+                ]
+        elif self._combined is not None and len(self._combined):
+            # 「全部颜色」 is one list: 两色混色 + 三色混色 + 耗材本色, deduplicated
+            # across all three by CombinedColours.  Millions of entries means the
+            # order stays a numpy permutation and a search is a mask over it; the
             # grid only ever materialises the cells it is drawing.
-            cells_source = self._triples.ordered_colours(sort_key)
-            grouped = False
-        elif self._catalog.recipe_count:
-            cells_source = self._catalog.sorted_colours(sort_key)
-            grouped = sort_key == SORT_PAIR
+            view = self._ordered_combined(sort_key)
+            if query:
+                view = view.restrict(self._search_mask(query))
+            cells_source = view
         else:
-            # Fewer than two spools: there are no mixes, but 「全部颜色」 can still
-            # have something to show.  Bailing out here was why a single spool
-            # left the middle panel empty while the footer counted its colour.
+            # Fewer than two spools: there are no mixes, but a lone spool's own
+            # colour is still something to show rather than an empty panel.
             cells_source = []
-            grouped = False
-
-        # 「全部颜色」 adds the spools themselves, so a two-spool library offers
-        # 81 mixes + 2 raw colours = 83 entries. The spools are NOT pinned on top:
-        # they are folded into the very same order the 排序 control just gave the
-        # mixes, because a colour list that breaks its own colour order the moment
-        # the checkbox is ticked is not sorted at all.
-        spools = []
-        if self._all_colours.isChecked():
-            spools = [spool_cell(f) for f in self.library.filaments]
-
-        query = self._search.text().strip().lstrip("#").casefold()
-        if self._triple_view is not None:
-            # The search box is disabled while 三色混色 is on, but text left over
-            # from before must not filter a four-million-cell lazy sequence.
-            query = ""
-        if query:
-            cells_source = [
-                colour for colour in cells_source if self._matches(colour, query)
-            ]
-            spools = [cell for cell in spools if self._matches(cell, query)]
-            grouped = False
-
-        if spools:
-            cells = sorted_cells(spools + cells_source, sort_key, label_of=self._label_of)
-        else:
-            cells = cells_source
 
         # Truly nothing to show — an empty library, or a search that matched
         # nothing. The grid has to say so instead of rendering zero rows.
-        if not cells:
+        if not cells_source:
             self._recipes = []
             self._grid.setRecipes([], grouped=False)
             # A search that matched nothing is exactly when the way back to the
@@ -994,8 +973,8 @@ class MainWindow(QMainWindow):
             self._update_status()
             return
 
-        self._recipes = cells
-        self._grid.setRecipes(cells, grouped=grouped)
+        self._recipes = cells_source
+        self._grid.setRecipes(cells_source, grouped=False)
         self._show_all_button.setEnabled(self._pair_filter is not None or bool(query))
         selected = self._detail.selectionKey()
         if selected:
@@ -1008,35 +987,36 @@ class MainWindow(QMainWindow):
         count = len(self.library)
         pairs = count * (count - 1) // 2
         shown = len(self._recipes)
-        total = pairs * len(MIX_RATIOS)
+        double_recipes = pairs * len(MIX_RATIOS)
         colours = self._catalog.colour_count if self._catalog is not None else 0
-        everything = colours + (count if self._all_colours.isChecked() else 0)
-        parts = [f"耗材 {count} 种", f"母材组合 {pairs} 对", f"混色 {total} 个"]
-        if colours and colours != total:
+        triples = self._triples if (self._triples is not None and self._triples.built) else None
+        everything = self._combined.colour_count if self._combined is not None else colours
+        parts = [f"耗材 {count} 种", f"母材组合 {pairs} 对", f"混色 {double_recipes} 个"]
+        if colours and colours != double_recipes:
             parts.append(f"去掉重复后 {colours} 个颜色")
+        if triples is not None:
+            parts.append(f"三色混色 {triples.recipe_count:,} 个配比")
+            parts.append(f"全部颜色 {everything:,} 个")
+        elif self._triple_timer is not None:
+            parts.append("正在计算三色混色")
         if shown != everything:
             parts.append(f"当前显示 {shown} 个")
         if self._build_seconds:
             parts.append(f"计算用时 {self._build_seconds * 1000:.0f} ms")
         self._status.setText(" · ".join(parts))
-        if self._triple_view is not None and self._triples is not None:
-            self._grid_info.setText(
-                f"三色混色：每三卷 2556 个配比（每种 10%–80%，按 1% 递增）"
-                f" · {self._triples.recipe_count:,} 条配方去重后共 "
-                f"{self._triples.colour_count:,} 个颜色"
-                f" · 已按「{self._sort_combo.currentText()}」排列"
-            )
-            self._update_filter_bar(shown, self._triples.colour_count, count)
-            return
-        self._grid_info.setText(
-            f"每两种耗材 81 个配比（10%–90%）"
-            + (
-                f" · 含 {count} 种耗材本色，共 {colours + count} 个颜色"
-                if self._all_colours.isChecked()
-                else f" · 去重后共 {colours} 个颜色" if colours else ""
-            )
-            + (f" · 已按「{self._sort_combo.currentText()}」排列" if self._pair_filter is None else "")
-        )
+
+        note = "每两种耗材 81 个配比（10%–90%）"
+        made = double_recipes
+        if triples is not None:
+            note += " · 三色混色：每三卷 2556 个配比（每种 10%–80%，按 1% 递增）"
+            made += triples.recipe_count
+        note += f" · 共 {made:,} 个配比"
+        if count:
+            note += f" · 含 {count} 种耗材本色"
+        note += f" · 去重后共 {everything:,} 个颜色"
+        if self._pair_filter is None:
+            note += f" · 已按「{self._sort_combo.currentText()}」排列"
+        self._grid_info.setText(note)
         self._update_filter_bar(shown, everything, count)
 
     def _update_filter_bar(self, shown: int, everything: int, count: int) -> None:
@@ -1060,7 +1040,7 @@ class MainWindow(QMainWindow):
             hidden = max(everything - shown, 0)
             self._filter_label.setText(
                 f"{'、'.join(reasons)}：现在显示 {shown} 个，另外 {hidden} 个没有显示。"
-                "点右边的按钮可以回到全部混色。"
+                "点右边的按钮可以回到全部颜色。"
             )
             self._filter_bar.setVisible(True)
         self._set_accent(self._show_all_button, bool(reasons))
@@ -1107,7 +1087,18 @@ class MainWindow(QMainWindow):
             )
             return
         self._detail.showColour(cell)
-        first = cell.recipes[0] if getattr(cell, "recipes", None) else cell
+        first = cell.recipes[0] if getattr(cell, "recipes", None) else None
+        if first is None:
+            # A spool's own colour is produced by no mixture at all, so there is
+            # no pair to name — say whose colour it is instead of indexing into
+            # an empty recipe tuple.
+            names = "、".join(f.display_name for f in getattr(cell, "filaments", ()))
+            self._status.setText(
+                f"{cell.color_hex}  =  {names}（耗材本色，不是混色）"
+                if names
+                else f"{cell.color_hex}（没有可复现的配方）"
+            )
+            return
         filament_a = self.library.get(first.a_id)
         filament_b = self.library.get(first.b_id)
         if filament_a and filament_b:
@@ -1122,7 +1113,10 @@ class MainWindow(QMainWindow):
         if getattr(cell, "pair_index", 0) < 0 and hasattr(cell, "filament"):
             self._detail.showFilament(cell.filament)
             return
-        first = cell.recipes[0] if getattr(cell, "recipes", None) else cell
+        first = cell.recipes[0] if getattr(cell, "recipes", None) else None
+        if first is None:
+            self._detail.showColour(cell)
+            return
         self._show_pair(first.a_id, first.b_id)
 
     def _on_grid_cleared(self) -> None:
@@ -1135,20 +1129,33 @@ class MainWindow(QMainWindow):
         """The catalogue entry whose predicted colour is closest to ``target_hex``."""
         if self._catalog is None or not self._recipes:
             return None
+        target = _color.hex_to_rgb(target_hex)
+        # Millions of colours: the store's own Lab table and its vectorised
+        # CIEDE2000 sort are the only affordable way to answer this.  Walking a
+        # Python list of four million colours here would hang the window.
+        if self._combined is not None and len(self._recipes) == len(self._combined):
+            order = self._combined.order(SORT_SIMILARITY, target)
+            for position in order[:16]:
+                cell = self._combined[int(position)]
+                # Spool cells carry no ratio at all, so they are skipped: this
+                # button answers "which mix should I dial in".
+                if cell.recipe_count:
+                    return cell
+            return None
         # Spool cells carry no predicted Lab (they have no ratio), so they are
         # skipped: this button answers "which mix should I dial in".
         mixes = [cell for cell in self._recipes if getattr(cell, "pair_index", 0) >= 0]
         if not mixes:
             return None
-        target = _color.lab_from_rgb(_color.hex_to_rgb(target_hex))
+        lab_target = _color.lab_from_rgb(target)
         labs = np.array([recipe.lab for recipe in mixes], dtype=np.float64)
-        rough = np.linalg.norm(labs - target, axis=1)
+        rough = np.linalg.norm(labs - lab_target, axis=1)
         shortlist = np.argsort(rough)[:64]
         best = None
         best_distance = float("inf")
         for index in shortlist:
             recipe = mixes[int(index)]
-            distance = _color.delta_e_2000(recipe.lab, tuple(target))
+            distance = _color.delta_e_2000(recipe.lab, tuple(lab_target))
             if distance < best_distance:
                 best_distance = distance
                 best = recipe
@@ -1161,11 +1168,11 @@ class MainWindow(QMainWindow):
         self._find_button.setEnabled(chosen)
         if not chosen:
             self._find_button.setToolTip(
-                "先选一个目标颜色；再按 CIEDE2000 在当前显示的全部混色里找最接近的配方"
+                "先选一个目标颜色；再按 CIEDE2000 在当前显示的全部颜色里找最接近的配方"
             )
         else:
             self._find_button.setToolTip(
-                f"在当前显示的全部混色里，按 CIEDE2000 找出最接近 {value} 的配方"
+                f"在当前显示的全部颜色里，按 CIEDE2000 找出最接近 {value} 的配方"
             )
 
     def _on_find_nearest(self) -> None:

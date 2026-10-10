@@ -309,7 +309,15 @@ class MixDetail(QWidget):
             return
         recipes = list(getattr(colour, "recipes", ()))
         if not recipes:
-            self.clear()
+            # A spool's own colour is produced by no mixture at all.  There is no
+            # recipe to explain, so show it the way a plain spool is shown — but
+            # keep the COLOUR, so the grid can still restore the selection.
+            spools = tuple(getattr(colour, "filaments", ()))
+            if not spools:
+                self.clear()
+                return
+            self.showFilament(spools[0])
+            self._colour = colour
             return
         self.showRecipe(recipes[0])
         self._fill_formulas(colour, recipes)
@@ -508,10 +516,10 @@ class MixDetail(QWidget):
             return
         self._pair_filtered = active
         self._pair_button.setText(
-            "显示全部混色" if active else "只看这一对耗材的全部混色"
+            "显示全部颜色" if active else "只看这一对耗材的全部混色"
         )
         self._pair_button.setToolTip(
-            "取消筛选，回到全部混色"
+            "取消筛选，回到全部颜色"
             if active
             else "把中间网格缩小到这两种耗材的 81 个配比"
         )

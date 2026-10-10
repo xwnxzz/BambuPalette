@@ -114,11 +114,26 @@ class FilamentDialog(QDialog):
         self._preview.setValue(value or None)
         self._update_hint()
 
+    def _resolved_hex(self) -> str:
+        """The colour this dialog means right now.
+
+        The three spin boxes start at 0 / 0 / 0 and the user reasonably reads
+        that as the colour they are about to add, so typing nothing at all and
+        pressing 「确认」 has to work and has to mean black.  The hex box stays
+        authoritative whenever it holds something.
+        """
+        typed = self._color.hex()
+        if not is_unset(typed):
+            return typed
+        return _color.rgb_to_hex(self._color.rgb())
+
     def _update_hint(self) -> None:
-        self._ok_button.setEnabled(self._color.isSet())
+        self._ok_button.setEnabled(True)
         if not self._color.isSet():
+            r, g, b = self._color.rgb()
             self._hint.setText(
-                "请填写颜色：可以直接输入 #RRGGBB，也可以填 R / G / B 三个数字。"
+                "请填写颜色：可以直接输入 #RRGGBB，也可以填 R / G / B 三个数字。\n"
+                f"什么都没填就按三个数字框里的值算，现在是 RGB {r}, {g}, {b}。"
             )
             return
         r, g, b = _color.hex_to_rgb(self._color.hex())
@@ -135,12 +150,13 @@ class FilamentDialog(QDialog):
             "name": self._name.text().strip(),
             "brand": self._brand.currentText().strip(),
             "material_type": self._type.currentText().strip(),
-            "color_hex": self._color.hex(),
+            "color_hex": self._resolved_hex(),
             "note": self._note.text().strip(),
         }
 
     def build_filament(self) -> Filament:
-        if is_unset(self._color.hex()):
+        value = self._resolved_hex()
+        if is_unset(value):
             raise ValueError("请先选择颜色")
         if self._filament is None:
             return Filament(**self.values())
