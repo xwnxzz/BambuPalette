@@ -498,6 +498,44 @@ class LargePaletteTests(unittest.TestCase):
             self.assertGreater(int(result.counts[index]), 0, colour)
 
 
+class SimilaritySortScaleTests(unittest.TestCase):
+    """「按跟图片目标颜色最相似排序」 over a whole 35,265-entry palette.
+
+    Regression: the 更换颜色 dialog listed every candidate as its own widget and
+    called ``delta_e_2000`` once per candidate in a Python loop, so on the bundled
+    41-spool preset it took 26 seconds to open and Windows greyed it out as
+    「(未响应)」.  The sort is now one vectorised CIEDE2000 call; this pins that it
+    is still a *global* sort, not just a sorted prefix of the first candidates.
+    """
+
+    def test_the_similarity_order_is_the_global_minimum_first(self):
+        library = LargePaletteTests._wide_library()
+        catalog = MixCatalog(library.filaments, engine=ENGINE_BAMBU).build()
+        palette = build_palette(library, catalog)
+        target = (250, 212, 181)
+
+        ordered = sort_palette(palette, SORT_SIMILARITY, target_rgb=target)
+        self.assertEqual(len(ordered), len(palette))
+
+        labs = np.asarray([entry.lab for entry in palette], dtype=np.float64)
+        target_lab = _color.lab_from_rgb(target)
+        every = np.asarray(_color.delta_e_2000(labs, target_lab), dtype=np.float64)
+
+        by_key = {entry.key: position for position, entry in enumerate(palette)}
+        self.assertEqual(
+            [by_key[entry.key] for entry in ordered[:20]],
+            [int(position) for position in np.argsort(every, kind="stable")[:20]],
+        )
+        self.assertAlmostEqual(
+            float(_color.delta_e_2000(ordered[0].lab, target_lab)),
+            float(every.min()),
+            places=9,
+        )
+
+    def test_an_empty_palette_sorts_to_nothing(self):
+        self.assertEqual(sort_palette([], SORT_SIMILARITY, target_rgb=(1, 2, 3)), [])
+
+
 class SmallDistinctRegionTests(unittest.TestCase):
     """A tiny distinct region must survive a big flat field.
 

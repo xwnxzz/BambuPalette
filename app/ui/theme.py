@@ -74,6 +74,16 @@ QFrame#panel {{
     border: 1px solid {BORDER};
     border-radius: {RADIUS_CARD};
 }}
+/* Says 「你正在只看一对耗材」 and carries the way back out. */
+QFrame#filterBar {{
+    background: {ACCENT_SOFT};
+    border: 1px solid {ACCENT};
+    border-radius: {RADIUS_INPUT};
+}}
+QFrame#filterBar QLabel {{
+    color: {ACCENT_DARK};
+    font-size: 12px;
+}}
 QStatusBar {{
     background: {PANEL};
     border-top: 1px solid {BORDER};

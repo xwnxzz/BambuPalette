@@ -75,6 +75,9 @@ class MixDetail(QWidget):
 
     engineChanged = Signal()
     pairRequested = Signal(str, str)
+    #: Emitted when the grid is already narrowed to one pair and the user wants
+    #: every mix back. The button below the ratio bar becomes the way out.
+    showAllRequested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -82,6 +85,7 @@ class MixDetail(QWidget):
         self._engine = None
         self._recipe = None
         self._filament = None
+        self._pair_filtered = False
 
         self.setMinimumWidth(320)
         self.setAutoFillBackground(True)
@@ -182,7 +186,6 @@ class MixDetail(QWidget):
         self._pair_button = QPushButton("只看这一对耗材的全部混色", self)
         self._pair_button.setToolTip("把中间网格缩小到这两种耗材的 81 个配比")
         self._pair_button.clicked.connect(self._on_pair)
-
         self._steps = QLabel("", self)
         self._steps.setProperty("role", "hint")
         self._steps.setWordWrap(True)
@@ -368,7 +371,28 @@ class MixDetail(QWidget):
         self._copy.setEnabled(True)
 
     # -- actions -----------------------------------------------------------------
+    def setPairFilter(self, active: bool) -> None:
+        """Turn the pair button into the way back out once a filter is on."""
+        active = bool(active)
+        if active == self._pair_filtered:
+            return
+        self._pair_filtered = active
+        self._pair_button.setText(
+            "显示全部混色" if active else "只看这一对耗材的全部混色"
+        )
+        self._pair_button.setToolTip(
+            "取消筛选，回到全部混色"
+            if active
+            else "把中间网格缩小到这两种耗材的 81 个配比"
+        )
+        self._pair_button.setProperty("accent", "true" if active else "false")
+        self._pair_button.style().unpolish(self._pair_button)
+        self._pair_button.style().polish(self._pair_button)
+
     def _on_pair(self) -> None:
+        if self._pair_filtered:
+            self.showAllRequested.emit()
+            return
         if self._recipe is not None:
             self.pairRequested.emit(self._recipe.a_id, self._recipe.b_id)
 

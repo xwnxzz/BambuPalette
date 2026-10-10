@@ -25,6 +25,7 @@ from .mixes import (
     SORT_LABEL,
     SORT_PAIR,
     SORT_RGB,
+    SORT_SIMILARITY,
     MixCatalog,
     MixRecipe,
     filament_sort_key,
@@ -152,6 +153,21 @@ def sort_palette(
     those two group the spools first and compare inside each group.
     """
     items = list(entries)
+    if key == SORT_SIMILARITY:
+        # A 41-spool library is 66,461 entries, and this runs on every keystroke
+        # of the picker's search box, so the distances are computed in one
+        # vectorised CIEDE2000 call instead of 66,461 scalar ones.
+        if target_rgb is None:
+            raise ValueError(
+                f"sort key {SORT_SIMILARITY!r} needs a target colour; pass target_rgb="
+            )
+        if not items:
+            return []
+        target_lab = _color.lab_from_rgb(tuple(target_rgb))
+        labs = np.asarray([entry.lab for entry in items], dtype=np.float64)
+        distances = np.asarray(_color.delta_e_2000(labs, target_lab), dtype=np.float64)
+        order = np.argsort(distances, kind="stable")
+        return [items[int(index)] for index in order]
     if key == SORT_LABEL:
         return sorted(
             items,

@@ -255,9 +255,46 @@ def main() -> int:
         sorted(r.percent_a for r in window._recipes) == list(range(10, 91)),
         "pair filter spans 10%..90% exactly once each",
     )
+    # --- a filter must announce itself and offer the way back -----------------
+    check(
+        not window._filter_bar.isHidden(),
+        "the pair filter raises a banner above the grid",
+    )
+    check(
+        a.display_name in window._filter_label.text() or b.display_name in window._filter_label.text(),
+        f"the banner names the filtered spools, got {window._filter_label.text()!r}",
+    )
+    check(
+        "现在显示 81 个" in window._filter_label.text()
+        and "另外 729 个没有显示" in window._filter_label.text(),
+        "the banner says how many are shown and how many are hidden, "
+        f"got {window._filter_label.text()!r}",
+    )
+    check(
+        window._filter_back.text() == "显示全部混色",
+        "the banner carries a 显示全部混色 button",
+    )
+    check(
+        window._show_all_button.property("accent") == "true",
+        "the toolbar's 显示全部混色 button is highlighted while a filter is on",
+    )
+    check(
+        window._detail._pair_button.text() == "显示全部混色",
+        "the detail panel's pair button becomes a way out",
+    )
+
     window._clear_filters()
     app.processEvents()
     check(len(window._recipes) == 810, "clear filters restores the full catalogue")
+    check(window._filter_bar.isHidden(), "clearing the filter hides the banner")
+    check(
+        window._show_all_button.property("accent") == "false",
+        "clearing the filter drops the toolbar highlight",
+    )
+    check(
+        window._detail._pair_button.text() == "只看这一对耗材的全部混色",
+        "the pair button goes back to narrowing",
+    )
 
     # --- selection drives the detail panel ------------------------------------
     target = window._recipes[123]
@@ -643,7 +680,7 @@ def main() -> int:
                 SORT_SIMILARITY,
             )
             from app.spectral import color as _spectral_color
-            from app.ui.colour_picker import ColourDetail, ColourPickerDialog
+            from app.ui.colour_picker import ColourDetail, ColourPickerDialog, LIST_CHUNK
 
             check(isinstance(page._detail, ColourDetail), "the picture page has a 选中的颜色 panel")
             check(
@@ -693,6 +730,64 @@ def main() -> int:
             )
             ordered = picker.ordered()
             check(len(ordered) == len(entries), "the replacement menu lists 全部颜色 in full")
+
+            # 41 spools makes 66,461 candidates; building a widget per candidate
+            # took 26 s and Windows greyed the dialog out as 「(未响应)」.  Only
+            # the first screenful is materialised, the rest arrive as you scroll.
+            check(
+                picker._list.count() == min(len(entries), LIST_CHUNK),
+                f"the menu materialises one batch of rows, got {picker._list.count()}",
+            )
+            check(
+                len(picker.visible_rows()) == len(entries),
+                "but every candidate is still reachable in the menu",
+            )
+            check(
+                picker._rows[0].key == ordered[0].key,
+                "the materialised rows keep the similarity order",
+            )
+            picker._extend()
+            check(
+                picker._list.count() == min(len(entries), 2 * LIST_CHUNK),
+                f"scrolling a screenful adds the next batch, got {picker._list.count()}",
+            )
+            check(
+                picker._list.item(picker._list.count() - 1).text().startswith(
+                    ordered[picker._list.count() - 1].color_hex.upper()
+                )
+                and picker._list.item(LIST_CHUNK).text().startswith(
+                    ordered[LIST_CHUNK].color_hex.upper()
+                ),
+                "the appended batch continues where the first one stopped",
+            )
+
+            # Searching must not put the whole palette back into the list.
+            picker._search.setText("白")
+            picker._rebuild()
+            found = picker.visible_rows()
+            check(
+                0 < len(found) < len(entries),
+                f"a search narrows the list, got {len(found)} of {len(entries)}",
+            )
+            check(
+                picker._list.count() == min(len(found), LIST_CHUNK),
+                f"the hits are materialised a batch at a time, got {picker._list.count()}",
+            )
+            table = picker._haystack_table()
+            check(
+                all("白" in table[candidate.key] for candidate in found),
+                "every search hit mentions 白",
+            )
+            check(
+                any(candidate.is_mix for candidate in found),
+                "searching a spool's name also finds the mixes it is part of",
+            )
+            picker._search.clear()
+            picker._rebuild()
+            check(
+                len(picker.visible_rows()) == len(entries),
+                "clearing the search brings 全部颜色 back",
+            )
             differences = [
                 float(
                     _spectral_color.delta_e_2000(

@@ -184,6 +184,7 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self._build_grid_panel())
         self._detail = MixDetail()
         self._detail.pairRequested.connect(self._show_pair)
+        self._detail.showAllRequested.connect(self._clear_filters)
         splitter.addWidget(self._wrap(self._detail, ""))
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
@@ -332,10 +333,29 @@ class MainWindow(QMainWindow):
         )
         self._all_colours.toggled.connect(lambda *_: self._refresh_grid())
 
+        # Double-clicking a mix narrows the grid to that one parent pair. That
+        # used to be signalled only by a line of small print under the grid, so
+        # the panel looked like it had lost every other colour with no way back.
+        # The banner says what is hidden and carries its own way out.
+        self._filter_bar = QFrame()
+        self._filter_bar.setObjectName("filterBar")
+        self._filter_label = QLabel("")
+        self._filter_label.setWordWrap(True)
+        self._filter_back = QPushButton("显示全部混色")
+        self._filter_back.setProperty("accent", "true")
+        self._filter_back.clicked.connect(self._clear_filters)
+        bar_row = QHBoxLayout(self._filter_bar)
+        bar_row.setContentsMargins(10, 6, 10, 6)
+        bar_row.setSpacing(10)
+        bar_row.addWidget(self._filter_label, 1)
+        bar_row.addWidget(self._filter_back)
+        self._filter_bar.setVisible(False)
+
         panel = QWidget()
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
+        layout.addWidget(self._filter_bar)
         layout.addWidget(self._grid, 1)
         layout.addWidget(self._grid_info)
         return self._wrap(panel, "全部混色", header_extra=self._all_colours)
@@ -650,7 +670,9 @@ class MainWindow(QMainWindow):
         if not cells:
             self._recipes = []
             self._grid.setRecipes([], grouped=False)
-            self._show_all_button.setEnabled(False)
+            # A search that matched nothing is exactly when the way back to the
+            # full list matters most, so the button stays live.
+            self._show_all_button.setEnabled(self._pair_filter is not None or bool(query))
             self._update_status()
             return
 
@@ -684,9 +706,54 @@ class MainWindow(QMainWindow):
                 if self._all_colours.isChecked()
                 else ""
             )
-            + (f" · 当前只显示 1 对耗材的混色" if self._pair_filter else "")
             + (f" · 已按「{self._sort_combo.currentText()}」排列" if self._pair_filter is None else "")
         )
+        self._update_filter_bar(shown, total, count)
+
+    def _update_filter_bar(self, shown: int, total: int, count: int) -> None:
+        """Show why the grid is short, and offer the way back to everything."""
+        reasons = []
+        if self._pair_filter is not None:
+            left = self.library.get(self._pair_filter[0])
+            right = self.library.get(self._pair_filter[1])
+            names = " × ".join(
+                f"{f.display_name}（{f.color_hex}）" if f is not None else "（已删除）"
+                for f in (left, right)
+            )
+            reasons.append(f"只看 {names} 的 81 个配比")
+        query = self._search.text().strip()
+        if query:
+            reasons.append(f"搜索结果「{query}」")
+
+        if not reasons:
+            self._filter_bar.setVisible(False)
+        else:
+            everything = total + (count if self._all_colours.isChecked() else 0)
+            hidden = max(everything - shown, 0)
+            self._filter_label.setText(
+                f"{'、'.join(reasons)}：现在显示 {shown} 个，另外 {hidden} 个没有显示。"
+                "点右边的按钮可以回到全部混色。"
+            )
+            self._filter_bar.setVisible(True)
+        self._set_accent(self._show_all_button, bool(reasons))
+        detail = getattr(self, "_detail", None)
+        if detail is not None:
+            detail.setPairFilter(self._pair_filter is not None)
+
+    @staticmethod
+    def _set_accent(button: QPushButton, on: bool) -> None:
+        """Flip a button between the plain and the accent style.
+
+        A dynamic property only repaints after Qt re-reads the stylesheet, which
+        it does not do by itself when the property changes.
+        """
+        value = "true" if on else "false"
+        if button.property("accent") == value:
+            return
+        button.setProperty("accent", value)
+        button.style().unpolish(button)
+        button.style().polish(button)
+        button.update()
 
     def _clear_filters(self) -> None:
         self._pair_filter = None
@@ -696,14 +763,10 @@ class MainWindow(QMainWindow):
     def _show_pair(self, a_id: str, b_id: str) -> None:
         self._pair_filter = (a_id, b_id)
         self._search.clear()
+        # ``_reload_library`` reaches ``_update_status``, which names the pair in
+        # the filter banner; overwriting ``_grid_info`` here as well would leave
+        # two different explanations of the same filter on screen.
         self._reload_library()
-        filament_a = self.library.get(a_id)
-        filament_b = self.library.get(b_id)
-        if filament_a and filament_b:
-            self._grid_info.setText(
-                f"{filament_a.display_name}（{filament_a.color_hex}）"
-                f" × {filament_b.display_name}（{filament_b.color_hex}）的 81 个配比"
-            )
 
     # -- selection ---------------------------------------------------------------
     def _on_grid_selected(self, cell) -> None:
