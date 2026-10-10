@@ -17,11 +17,18 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+
+def _key_parts(key: str) -> tuple[str, str, int]:
+    """Split a MixRecipe.key back into find_recipe() arguments."""
+    a_id, b_id, percent = key.split("|")
+    return a_id, b_id, int(percent)
 
 # Redirect storage before anything imports it, both ways: the environment
 # variable is the documented hook, the patch keeps this tool correct even if a
@@ -452,6 +459,43 @@ def main() -> int:
     app.processEvents()
     check(len(window._recipes) == 810, "un-ticking 全部颜色 restores the mixes-only grid")
     window._detail.clear()
+
+    # --- a one-spool edit reuses the catalogue instead of rebuilding it --------
+    before_catalog = window._catalog
+    before_recipes = {m.key: m for m in before_catalog.recipes}
+    extra = library.create(brand="大简", material_type="PETG HF", color_hex="#7F3FBF", name="测试紫")
+    started = time.perf_counter()
+    window._reload_library()
+    add_seconds = time.perf_counter() - started
+    check(
+        window._catalog is before_catalog,
+        "adding a spool reuses the catalogue object instead of replacing it",
+    )
+    check(
+        window._catalog.recipe_count == expected_recipe_count(6),
+        f"the new spool's pairs are folded in, got {window._catalog.recipe_count}",
+    )
+    reused = sum(1 for key, recipe in before_recipes.items()
+                 if window._catalog.find_recipe(*_key_parts(key)) is recipe)
+    check(reused == 810, f"every pre-existing recipe object survives the add, got {reused}")
+    check(
+        add_seconds < 1.0,
+        f"a one-spool add is not a full rebuild, took {add_seconds:.3f}s",
+    )
+
+    library.remove(extra.id)
+    started = time.perf_counter()
+    window._reload_library()
+    remove_seconds = time.perf_counter() - started
+    check(
+        window._catalog.recipe_count == expected_recipe_count(5),
+        f"deleting the spool takes its pairs back out, got {window._catalog.recipe_count}",
+    )
+    check(
+        remove_seconds < 1.0,
+        f"a one-spool delete is not a full rebuild, took {remove_seconds:.3f}s",
+    )
+    check(len(window._recipes) == 810, "the grid is back to 810 after the round trip")
 
     # --- no preset colour, no delete prompt, Del deletes -----------------------
     from PySide6.QtGui import QKeySequence  # noqa: E402

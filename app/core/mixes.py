@@ -257,7 +257,7 @@ class MixCatalog:
         return list(self._pairs)
 
     def build(self) -> "MixCatalog":
-        """(Re)compute every recipe. Cheap enough to call on each library edit."""
+        """(Re)compute every recipe from scratch."""
         self._recipes = []
         self._by_pair = {}
         self._by_id = {f.id: f for f in self._filaments}
@@ -268,23 +268,95 @@ class MixCatalog:
         if count < 2:
             return self
 
-        colours = np.array([f.rgb for f in self._filaments], dtype=np.float64)
+        self._compute_pairs(
+            [
+                (self._filaments[i], self._filaments[j])
+                for i in range(count)
+                for j in range(i + 1, count)
+            ]
+        )
+        return self
 
+    def sync(self, filaments: Sequence) -> "MixCatalog":
+        """Bring the catalogue up to date with ``filaments``, reusing what exists.
+
+        A full ``build()`` at 41 spools means 66,420 ``MixRecipe`` objects, which
+        costs about 3 s — and that froze the window for three seconds every time
+        one spool was added or deleted.  Adding only needs the pairs that mention
+        the new spool; deleting only needs the recipes that mention the removed
+        one dropped.  Both are a fraction of that.
+
+        ``pair_index`` is left with gaps after a deletion.  It is only ever used
+        to order or group recipes under 「按母材组合」, never as an index into
+        :attr:`pairs`, so a gap is harmless — and renumbering would mean
+        rebuilding every frozen ``MixRecipe``, which is the cost being avoided.
+        """
+        filaments = list(filaments)
+        if not self._built:
+            self._filaments = filaments
+            return self.build()
+
+        incoming = {f.id: f for f in filaments}
+
+        # A spool whose colour changed invalidates every pair it takes part in,
+        # and rebuilding by hand would just be a slower spelling of build().
+        moved = [
+            filament.id
+            for filament in filaments
+            if filament.id in self._by_id
+            and tuple(self._by_id[filament.id].rgb) != tuple(filament.rgb)
+        ]
+        if moved:
+            self._filaments = filaments
+            return self.build()
+
+        gone = {fid for fid in self._by_id if fid not in incoming}
+        if gone:
+            self._recipes = [
+                r for r in self._recipes if r.a_id not in gone and r.b_id not in gone
+            ]
+            self._pairs = [p for p in self._pairs if p[0] not in gone and p[1] not in gone]
+            self._by_pair = {
+                pair: group
+                for pair, group in self._by_pair.items()
+                if pair[0] not in gone and pair[1] not in gone
+            }
+            for filament_id in gone:
+                self._by_id.pop(filament_id, None)
+
+        existing = list(self._filaments)
+        added = [f for f in filaments if f.id not in self._by_id]
+        self._filaments = filaments
+        for filament in added:
+            self._by_id[filament.id] = filament
+        if added:
+            pairs = [(old, new) for old in existing for new in added]
+            pairs += [
+                (added[i], added[j])
+                for i in range(len(added))
+                for j in range(i + 1, len(added))
+            ]
+            self._compute_pairs(pairs)
+        return self
+
+    def _compute_pairs(self, pairs: Sequence[tuple]) -> None:
+        """Run the vectorised engine over parent pairs and append the recipes."""
         ratios = np.asarray(self._ratios, dtype=np.float64)
         weights_a = ratios / 100.0
         weights_b = 1.0 - weights_a
         steps = len(ratios)
+        pairs = list(pairs)
 
-        pair_list = [(i, j) for i in range(count) for j in range(i + 1, count)]
-        for start in range(0, len(pair_list), _PAIR_CHUNK):
-            block = pair_list[start:start + _PAIR_CHUNK]
-            parents = np.stack(
+        for start in range(0, len(pairs), _PAIR_CHUNK):
+            block = pairs[start:start + _PAIR_CHUNK]
+            parents = np.array(
                 [
-                    colours[[i for i, _ in block]],
-                    colours[[j for _, j in block]],
+                    [fa.rgb for fa, _ in block],
+                    [fb.rgb for _, fb in block],
                 ],
-                axis=1,
-            )                                                        # (P, 2, 3)
+                dtype=np.float64,
+            )                                                        # (2, P, 3)
+            parents = np.swapaxes(parents, 0, 1)                     # (P, 2, 3)
             weights = np.empty((len(block), steps, 2), dtype=np.float64)
             weights[:, :, 0] = weights_a
             weights[:, :, 1] = weights_b
@@ -292,9 +364,8 @@ class MixCatalog:
             rgbs = self._engine.mix_rgb(parents, weights)             # (P, R, 3)
             labs = _color.lab_from_rgb(rgbs)
 
-            for local, (i, j) in enumerate(block):
-                pair_index = start + local
-                fa, fb = self._filaments[i], self._filaments[j]
+            for local, (fa, fb) in enumerate(block):
+                pair_index = len(self._pairs)
                 self._pairs.append((fa.id, fb.id))
                 group: list[MixRecipe] = []
                 for r_index, percent_a in enumerate(self._ratios):

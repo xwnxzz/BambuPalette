@@ -729,6 +729,90 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(catalog.stats(),
                          {"filaments": 4, "pairs": 6, "recipes": 486, "ratios": 81})
 
+    # -- incremental sync --------------------------------------------------------
+    def test_sync_adding_a_spool_matches_a_full_rebuild(self):
+        library = self._library(4)
+        catalog = MixCatalog(library).build()
+        before = catalog.recipe_count
+
+        library.create(brand="大简", material_type="PETG HF", color_hex="#123456", name="Spool 5")
+        catalog.sync(library)
+
+        rebuilt = MixCatalog(library).build()
+        self.assertEqual(catalog.recipe_count, expected_recipe_count(5))
+        self.assertGreater(catalog.recipe_count, before)
+        self.assertEqual(catalog.recipe_count, rebuilt.recipe_count)
+        self.assertEqual(catalog.pair_count, rebuilt.pair_count)
+        self.assertEqual(
+            sorted((m.a_id, m.b_id, m.percent_a, m.color_hex) for m in catalog.recipes),
+            sorted((m.a_id, m.b_id, m.percent_a, m.color_hex) for m in rebuilt.recipes),
+        )
+
+    def test_sync_reuses_the_recipes_it_already_had(self):
+        """The point of sync: untouched recipes keep their identity, so the
+        window does not rebuild 66,420 frozen objects on a one-spool edit."""
+        library = self._library(4)
+        catalog = MixCatalog(library).build()
+        untouched = {m.key: m for m in catalog.recipes}
+
+        library.create(brand="大简", material_type="PETG HF", color_hex="#123456", name="Spool 5")
+        catalog.sync(library)
+
+        reused = 0
+        for recipe in catalog.recipes:
+            if recipe.key in untouched:
+                reused += 1
+                self.assertIs(recipe, untouched[recipe.key])
+        self.assertEqual(reused, expected_recipe_count(4))
+
+    def test_sync_deleting_a_spool_drops_only_its_pairs(self):
+        library = self._library(5)
+        catalog = MixCatalog(library).build()
+        victim = library[2]
+        survivors = {f.id for f in library if f.id != victim.id}
+
+        library.remove(victim.id)
+        catalog.sync(library)
+
+        self.assertEqual(catalog.recipe_count, expected_recipe_count(4))
+        self.assertEqual(catalog.pair_count, 6)
+        for recipe in catalog.recipes:
+            self.assertIn(recipe.a_id, survivors)
+            self.assertIn(recipe.b_id, survivors)
+        self.assertEqual(catalog.pair_recipes(library[0].id, library[1].id).__len__(), 81)
+
+    def test_sync_rebuilds_when_a_spool_changes_colour(self):
+        library = self._library(4)
+        catalog = MixCatalog(library).build()
+        edited = library[0]
+        library.update(edited.id, color_hex="#00FF00")
+        catalog.sync(library)
+
+        rebuilt = MixCatalog(library).build()
+        self.assertEqual(
+            sorted((m.a_id, m.b_id, m.percent_a, m.color_hex) for m in catalog.recipes),
+            sorted((m.a_id, m.b_id, m.percent_a, m.color_hex) for m in rebuilt.recipes),
+        )
+
+    def test_sync_on_a_brand_new_catalog_builds_it(self):
+        library = self._library(3)
+        catalog = MixCatalog(library)
+        catalog.sync(library)
+        self.assertEqual(catalog.recipe_count, 243)
+
+    def test_sync_handles_a_shrinking_then_growing_library(self):
+        library = self._library(3)
+        catalog = MixCatalog(library).build()
+        for filament in list(library):
+            library.remove(filament.id)
+        catalog.sync(library)
+        self.assertEqual(catalog.recipe_count, 0)
+
+        library.create(brand="大简", material_type="PETG HF", color_hex="#654321", name="New")
+        library.create(brand="大简", material_type="PETG HF", color_hex="#ABCDEF", name="Newer")
+        catalog.sync(library)
+        self.assertEqual(catalog.recipe_count, expected_recipe_count(2))
+
 
 class SortedFilamentTests(unittest.TestCase):
     """「全部颜色」 lists raw spools beside the mixes, under the same 排序 control.

@@ -565,8 +565,15 @@ class MainWindow(QMainWindow):
     # -- catalogue ---------------------------------------------------------------
     def _rebuild_catalog(self) -> None:
         started = time.perf_counter()
-        self._catalog = MixCatalog(self.library.filaments, MIX_RATIOS, engine=self._engine_combo.currentData())
-        self._catalog.build()
+        engine_id = self._engine_combo.currentData()
+        catalog = getattr(self, "_catalog", None)
+        if catalog is None or catalog.engine.id != engine_id:
+            self._catalog = MixCatalog(self.library.filaments, MIX_RATIOS, engine=engine_id)
+            self._catalog.build()
+        else:
+            # Adding or deleting one spool only needs that spool's pairs; a full
+            # rebuild is 66,420 recipes and ~3 s at 41 spools.
+            catalog.sync(self.library.filaments)
         self._build_seconds = time.perf_counter() - started
         self._detail.setContext(self.library, self._catalog.engine)
         if getattr(self, "_picture_page", None) is not None:
