@@ -7,7 +7,7 @@ This module answers the two questions the user then asks about one such match:
   is that match made of (the recipe)?
 * that match is not what I wanted — let me pick another one out of 「全部颜色」.
 
-The picker offers the very same ordering controls as the 混色配方 grid, plus
+The picker offers the very same ordering controls as the 颜色配方 grid, plus
 「按跟图片目标颜色最相似排序」, so the user can either scan the familiar RGB order
 or let the program put the closest candidates first.
 """
@@ -175,13 +175,18 @@ class _SwatchCard(QFrame):
 
 
 class ColourDetail(QWidget):
-    """Everything about the colour region the user clicked."""
+    """Everything about the colour region the user clicked.
 
-    replaceRequested = Signal()
-    restoreRequested = Signal()
+    There is deliberately NO 更换颜色 or 恢复自动匹配 button here any more.  Both
+    moved into the page's own action row, where 更换颜色 sits next to 删除 and
+    合并; 恢复自动匹配 is gone outright because 撤销 already takes a manual
+    replacement back (the replacement is part of the undo snapshot), so a
+    second, differently-named way back was one button too many.
+    """
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self._has_selection = False
         self._image_card = _SwatchCard("图片里的颜色")
         self._match_card = _SwatchCard("匹配到的颜色")
 
@@ -200,21 +205,6 @@ class ColourDetail(QWidget):
         self._hint.setProperty("role", "hint")
         self._hint.setWordWrap(True)
 
-        self._replace = QPushButton("更换颜色…")
-        self._replace.setProperty("accent", "true")
-        self._replace.setToolTip("从「全部颜色」里另选一个颜色替换这个色块")
-        self._replace.clicked.connect(self.replaceRequested.emit)
-
-        self._restore = QPushButton("恢复自动匹配")
-        self._restore.setToolTip("撤销手动更换，用程序匹配到的颜色")
-        self._restore.clicked.connect(self.restoreRequested.emit)
-
-        buttons = QHBoxLayout()
-        buttons.setSpacing(8)
-        buttons.addWidget(self._replace)
-        buttons.addWidget(self._restore)
-        buttons.addStretch(1)
-
         box = QVBoxLayout(self)
         box.setContentsMargins(0, 0, 0, 0)
         box.setSpacing(8)
@@ -222,7 +212,6 @@ class ColourDetail(QWidget):
         box.addWidget(self._recipe)
         box.addWidget(self._difference)
         box.addWidget(self._hint)
-        box.addLayout(buttons)
 
         self.clear()
 
@@ -234,9 +223,8 @@ class ColourDetail(QWidget):
         self._recipe.setText("")
         self._difference.setText("")
         self._hint.setVisible(True)
-        self._replace.setEnabled(False)
-        self._restore.setEnabled(False)
-        self._restore.setVisible(False)
+        self._replaced = False
+        self._has_selection = False
 
     def setSelection(
         self,
@@ -278,16 +266,15 @@ class ColourDetail(QWidget):
             self._difference.setText(
                 f"已手动更换：程序原本匹配到 {original_hex}（ΔE00 "
                 f"{float(_color.delta_e_2000(_color.lab_from_rgb(image_rgb), _color.lab_from_rgb(original.rgb))):.2f}）。"
-                "点「恢复自动匹配」可以撤销。"
+                "按 Ctrl+Z（或点「撤销」）可以退回来。"
             )
         else:
             level = "很接近" if difference < 2.0 else "接近" if difference < 6.0 else "偏差较大"
             self._difference.setText(
                 f"图片颜色与匹配颜色的差距 ΔE00 {difference:.2f}（{level}；ΔE00 越小越像）。"
             )
-        self._replace.setEnabled(True)
-        self._restore.setVisible(True)
-        self._restore.setEnabled(bool(changed))
+        self._replaced = bool(changed)
+        self._has_selection = True
 
     # -- read-back, for the smoke checks and the tests ---------------------
     def image_hex(self) -> str:
@@ -305,12 +292,16 @@ class ColourDetail(QWidget):
         return self._difference.text()
 
     def can_restore(self) -> bool:
-        # ``isVisible()`` is False whenever the page itself is not on screen, so
-        # ask about the widget's own hidden flag instead of the window state.
-        return not self._restore.isHidden() and self._restore.isEnabled()
+        """True when the shown colour was hand-picked instead of auto-matched.
+
+        There is no 恢复自动匹配 button any more — 撤销 undoes a replacement just
+        like it undoes a deletion — so this reports the state, not a button.
+        """
+        return self._replaced
 
     def can_replace(self) -> bool:
-        return self._replace.isEnabled()
+        """True when a colour is shown, i.e. there is something to swap out."""
+        return self._has_selection
 
 
 class ColourPickerDialog(QDialog):
@@ -345,7 +336,7 @@ class ColourPickerDialog(QDialog):
         self._sort.setCurrentIndex(
             self._sort.findData(SORT_SIMILARITY) if self._sort.findData(SORT_SIMILARITY) >= 0 else 0
         )
-        self._sort.setToolTip("和「混色配方」页一样的排序方式，外加按跟图片目标颜色最相似排序")
+        self._sort.setToolTip("和「颜色配方」页一样的排序方式，外加按跟图片目标颜色最相似排序")
         self._sort.currentIndexChanged.connect(lambda *_: self._rebuild())
 
         self._search = QLineEdit()

@@ -268,7 +268,7 @@ class RegionColourTests(unittest.TestCase):
 
 
 class SortPaletteTests(unittest.TestCase):
-    """「全部颜色」 in the replacement dialog, ordered like the 混色配方 grid."""
+    """「全部颜色」 in the replacement dialog, ordered like the 颜色配方 grid."""
 
     def setUp(self) -> None:
         library = _library()
@@ -294,7 +294,7 @@ class SortPaletteTests(unittest.TestCase):
             [key for key, _ in SORT_CHOICES_WITH_SIMILARITY],
             [key for key, _ in SORT_CHOICES] + [SORT_SIMILARITY],
         )
-        # The 混色配方 page keeps its five keys: similarity is meaningless there.
+        # The 颜色配方 page keeps its five keys: similarity is meaningless there.
         self.assertNotIn(SORT_SIMILARITY, [key for key, _ in SORT_CHOICES])
 
     def test_every_key_keeps_every_entry(self):

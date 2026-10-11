@@ -113,6 +113,16 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     window.show()
     app.processEvents()
 
+    # The app must open maximised: a windowed default made people maximise by
+    # hand on every start.  Exercised through the same helper main() calls.
+    from .main import show_main_window as _show_main_window
+
+    starter = MainWindow(library=FilamentLibrary(list(library.filaments)), auto_triples=False)
+    _show_main_window(starter)
+    app.processEvents()
+    check(starter.isMaximized(), "the main window opens maximised")
+    starter.close()
+
     check(expected_recipe_count(5) == 810, "5 spools produce 810 mixes")
     merged = window._catalog.colour_count
     everything = window._combined.colour_count
@@ -414,7 +424,9 @@ def run_selftest(*, report_path: Path | None = None) -> int:
             "the matched colour carries its recipe",
         )
         check(page._detail.can_replace(), "the colour can be replaced by hand")
-        check(not page._detail.can_restore(), "nothing to undo before a replacement")
+        check(not page._detail.can_restore(), "nothing is hand-picked before a replacement")
+        check(page._delete_button.isEnabled(), "a selected colour can be deleted")
+        check(not page._merge_button.isEnabled(), "合并 needs two colours, not one")
 
         menu = build_palette(page.library, page._catalog, include_mixes=True)
         picker = ColourPickerDialog(
@@ -436,6 +448,9 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         picker.close()
 
         replacement = next(entry for entry in ordered if entry.key != auto.key)
+        # Exactly what _on_replace does: snapshot FIRST, then record the change,
+        # which is why 撤销 covers a manual replacement with no extra button.
+        page._push()
         page._replaced[0] = replacement
         page._apply_edits(keep=0)
         app.processEvents()
@@ -443,8 +458,10 @@ def run_selftest(*, report_path: Path | None = None) -> int:
             page.result.palette[0].key == replacement.key,
             "the replacement is the colour the plate will print",
         )
-        check(page._detail.can_restore(), "a replaced colour can be undone")
-        page._on_restore()
+        check(page._detail.can_restore(), "the panel knows the colour was hand-picked")
+        check(page._undo_button.isEnabled(), "a replacement can be undone with 撤销")
+        check(page._replace_button.isEnabled(), "a selected colour can be swapped")
+        page._undo()
         app.processEvents()
         check(
             page.result.palette[0].key == auto.key and page._replaced == {},
@@ -461,7 +478,7 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         before_colours = len(page.result.palette)
         doomed = int(np.bincount(page.result.indices[page.result.indices >= 0].ravel()).argmax())
         doomed_count = int((page.result.indices == doomed).sum())
-        page._list._picked = {doomed}
+        page._list.select([doomed])
         page._on_delete_colours()
         app.processEvents()
         check(doomed in page._deleted, "the deleted colour is remembered as an edit")
@@ -495,7 +512,7 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         # 合并: only reachable through the dialog, so drive the non-UI half.
         if len(page.result.palette) >= 2:
             keep = page.result.palette[1].key
-            page._list._picked = {0, 1}
+            page._list.select([0, 1])
             page._push()
             page._merged[page._live_map[0]] = page._live_map[1]
             page._apply_edits(keep=page._live_map[1])
@@ -540,7 +557,7 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         else:
             check(False, "the 3MF is a zip package")
 
-    # 「混色配方」页面：长说明搬到状态栏，右边面板不再被那条文字钉死宽度。
+    # 「颜色配方」页面：长说明搬到状态栏，右边面板不再被那条文字钉死宽度。
     from PySide6.QtWidgets import QLabel as _QLabel
     from PySide6.QtWidgets import QSizePolicy as _QSizePolicy
     from PySide6.QtWidgets import QSplitter as _QSplitter
@@ -573,8 +590,42 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     app.processEvents()
     check(
         window._status.text() == tab_note,
-        "switching back to 混色配方 restores the colour-table sentence",
+        "switching back to 颜色配方 restores the colour-table sentence",
     )
+
+    # The first page is 「颜色配方」 everywhere: tab, panel title and the tooltip
+    # on the target colour must not disagree about what the page is called.
+    check(
+        window._tabs.tabText(0) == "颜色配方",
+        f"the first tab is 颜色配方, got {window._tabs.tabText(0)!r}",
+    )
+    check(
+        window._detail._title.text() == "颜色配方",
+        f"the right-hand panel is 颜色配方, got {window._detail._title.text()!r}",
+    )
+    check(
+        "颜色配方" in window._target_color.toolTip(),
+        "the target colour tooltip says 颜色配方 too",
+    )
+
+    # A spool's own colour has exactly ONE parent — itself.  Row 3 used to keep
+    # showing the previous three-colour recipe's 「耗材丝3 … 12%」, so a raw spool
+    # looked like it was mixed from two spools that had nothing to do with it.
+    spool_cell = next(
+        (cell for cell in window._recipes if cell.filaments and not cell.recipes), None
+    )
+    if spool_cell is not None:
+        window._on_grid_selected(spool_cell)
+        app.processEvents()
+        rows = window._detail._rows
+        check(
+            [row["frame"].isHidden() for row in rows] == [False] + [True] * (len(rows) - 1),
+            f"a spool colour shows exactly one parent row, hidden={[r['frame'].isHidden() for r in rows]}",
+        )
+        check(
+            rows[0]["percent"].text().startswith("100%"),
+            f"the one visible row is the 100% spool, got {rows[0]['percent'].text()!r}",
+        )
     recipe_splitter = window._tabs.widget(0).findChild(_QSplitter)
     if recipe_splitter is not None:
         pinned = [
@@ -583,7 +634,7 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         ]
         check(
             max(pinned) < 720,
-            f"every 混色配方 pane can still be dragged, pinned widths {pinned}",
+            f"every 颜色配方 pane can still be dragged, pinned widths {pinned}",
         )
 
     # 「找最接近的颜色」把耗材本色也算进去：问一个自己就有的颜色，答案就是它。

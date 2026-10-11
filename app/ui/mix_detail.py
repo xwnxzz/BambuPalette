@@ -100,7 +100,7 @@ class MixDetail(QWidget):
         palette.setColor(self.backgroundRole(), QColor(theme.PANEL))
         self.setPalette(palette)
 
-        title = QLabel("混色配方", self)
+        self._title = title = QLabel("颜色配方", self)
         title.setProperty("role", "sectionTitle")
 
         self._copy = QPushButton("复制配方", self)
@@ -499,7 +499,13 @@ class MixDetail(QWidget):
             f"{filament.display_name}\n{filament.color_hex}"
             + (f"\n备注：{filament.note}" if filament.note else "")
         )
-        self._rows[1]["frame"].setVisible(False)
+        # EVERY other row has to go, not just the second one.  A three-colour
+        # recipe fills all three, and hiding only row 2 left row 3 on screen
+        # still showing 「耗材丝3 … 12%」 from whatever was selected before —
+        # a spool's own colour appears to be mixed from two spools that have
+        # nothing to do with it.
+        for spare in self._rows[1:]:
+            spare["frame"].setVisible(False)
 
         # No pair, so no ratio bar and no "只看这一对耗材" jump.
         self._bar.setVisible(False)

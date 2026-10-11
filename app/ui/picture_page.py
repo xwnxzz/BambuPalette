@@ -325,12 +325,21 @@ class ColourList(QWidget):
         return self._pinned
 
     def selected_indices(self) -> list[int]:
-        """Every selected colour, in list order — the input to 删除 / 合并."""
-        result = self._result
-        if result is None:
+        """Every selected colour, in list order — the input to 删除 / 合并.
+
+        Read straight off the widget.  It used to filter the cached ``_picked``
+        set instead, and ``_on_selection_changed`` filled that cache FROM this
+        method — a closed loop in which a selection could never appear at all,
+        so 删除 / 合并 / 撤销 / 恢复 stayed greyed out no matter what was clicked.
+        """
+        if self._result is None:
             return []
-        live = {int(self._list.item(row).data(Qt.ItemDataRole.UserRole)) for row in range(self._list.count())}
-        return sorted(index for index in self._picked if index in live)
+        picked = []
+        for row in range(self._list.count()):
+            item = self._list.item(row)
+            if item is not None and item.isSelected():
+                picked.append(int(item.data(Qt.ItemDataRole.UserRole)))
+        return picked
 
     def entries(self) -> list[PaletteEntry]:
         return list(self._result.palette) if self._result is not None else []
@@ -343,6 +352,19 @@ class ColourList(QWidget):
         self._pinned = int(index)
         self._order = [self._pinned] + [i for i in range(len(result.palette)) if i != self._pinned]
         self._refresh()
+
+    def select(self, indices) -> None:
+        """Select these palette indices, exactly as clicking them would.
+
+        Used by the automatic checks to reach 删除 / 合并 without a mouse.  It
+        must go THROUGH the widget (not the ``_picked`` cache) so the same
+        ``itemSelectionChanged`` path runs as for a real selection.
+        """
+        wanted = {int(index) for index in indices}
+        for row in range(self._list.count()):
+            item = self._list.item(row)
+            if item is not None:
+                item.setSelected(int(item.data(Qt.ItemDataRole.UserRole)) in wanted)
 
     def _refresh(self) -> None:
         result = self._result
@@ -611,8 +633,9 @@ class PicturePage(QWidget):
         self._list.colourActivated.connect(self._on_colour_activated)
         self._list.selectionChanged.connect(self._update_actions)
 
-        # 「删除 / 合并 / 撤销 / 恢复」 sit right under the colour list, because
-        # they are all about the selection in it.
+        # 「删除 / 合并 / 更换颜色 / 撤销 / 恢复」 sit in ONE row right under the
+        # colour list, in that order: the first three all act on the selection
+        # in the list, and the last two act on whatever those three did.
         self._delete_button = QPushButton("删除")
         self._delete_button.setToolTip(
             "删掉选中的颜色：这些地方留空、变成透明，不打底板也不打印。可以多选。"
@@ -624,6 +647,13 @@ class PicturePage(QWidget):
             "把选中的几种颜色并成一种，并成哪一种由你在弹窗里挑。至少要选两种。"
         )
         self._merge_button.clicked.connect(self._on_merge_colours)
+
+        self._replace_button = QPushButton("更换颜色…")
+        self._replace_button.setProperty("accent", "true")
+        self._replace_button.setToolTip(
+            "从「全部颜色」里另选一个颜色替换选中的这个色块（撤销可以退回来）"
+        )
+        self._replace_button.clicked.connect(self._on_replace)
 
         self._undo_button = QPushButton("撤销")
         self._undo_button.setToolTip("撤销上一步：删除、合并或更换颜色（Ctrl+Z）")
@@ -637,6 +667,7 @@ class PicturePage(QWidget):
         actions.setSpacing(6)
         actions.addWidget(self._delete_button)
         actions.addWidget(self._merge_button)
+        actions.addWidget(self._replace_button)
         actions.addStretch(1)
         actions.addWidget(self._undo_button)
         actions.addWidget(self._redo_button)
@@ -656,8 +687,6 @@ class PicturePage(QWidget):
         list_layout.addLayout(actions)
 
         self._detail = ColourDetail()
-        self._detail.replaceRequested.connect(self._on_replace)
-        self._detail.restoreRequested.connect(self._on_restore)
 
         # The list tells the user which colours the print needs; the detail
         # panel explains the one they clicked. Stacked, because both matter and
@@ -741,7 +770,7 @@ class PicturePage(QWidget):
         if self._image is None:
             return
         if not self.isVisible():
-            # The 混色配方 tab is showing, so nobody can see the picture.  A
+            # The 颜色配方 tab is showing, so nobody can see the picture.  A
             # re-match against 66,461 candidates costs ~0.7 s and would be spent
             # on a result that is not on screen; remember that it is owed and
             # do it when the tab comes back.
@@ -820,7 +849,7 @@ class PicturePage(QWidget):
         if self._image is None:
             return
         if self._library is None or len(self._library) == 0:
-            self._status.setText("请先在「混色配方」页添加耗材，再匹配图片。")
+            self._status.setText("请先在「颜色配方」页添加耗材，再匹配图片。")
             return
         palette = self._candidate_palette()
         if not palette:
@@ -1038,6 +1067,7 @@ class PicturePage(QWidget):
         live = bool(self._result is not None and len(self._result.palette))
         self._delete_button.setEnabled(live and len(picked) >= 1)
         self._merge_button.setEnabled(live and len(picked) >= 2)
+        self._replace_button.setEnabled(live and len(picked) >= 1)
         self._undo_button.setEnabled(bool(self._undo_stack))
         self._redo_button.setEnabled(bool(self._redo_stack))
 
@@ -1147,17 +1177,6 @@ class PicturePage(QWidget):
         original = self._live_map[index]
         self._push()
         self._replaced[original] = chosen
-        self._apply_edits(keep=original)
-
-    def _on_restore(self) -> None:
-        index = self._current_index()
-        if index < 0 or index >= len(self._live_map):
-            return
-        original = self._live_map[index]
-        if original not in self._replaced:
-            return
-        self._push()
-        self._replaced.pop(original, None)
         self._apply_edits(keep=original)
 
     def _on_actions_changed(self) -> None:

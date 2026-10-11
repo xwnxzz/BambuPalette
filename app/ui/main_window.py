@@ -203,14 +203,17 @@ class MainWindow(QMainWindow):
         self._target_color = ColorField()
         self._target_color.setToolTip(
             "想打印出来的目标颜色：直接输入 #RRGGBB，或者填 R / G / B 三个数字，"
-            "程序会找出最接近的混色配方"
+            "程序会找出最接近的颜色配方"
         )
         self._target_color.colorChanged.connect(self._on_target_color_changed)
         self._find_button = QPushButton("找最接近的颜色")
         self._find_button.setToolTip(
-            "先选一个目标颜色；再按 CIEDE2000 在当前显示的全部颜色里找最接近的一个"
+            "先点「目标颜色」选好想打印的颜色，再按这里；"
+            "程序会按 CIEDE2000 在当前显示的全部颜色里找出最接近的一个"
         )
-        self._find_button.setEnabled(False)
+        # Deliberately always clickable — exactly like 确认 in the 添加耗材 dialog.
+        # Pressing it before choosing a colour is not an error, it just explains
+        # what is missing, so there is no reason to grey the button out.
         self._find_button.clicked.connect(self._on_find_nearest)
 
         controls = QHBoxLayout()
@@ -270,7 +273,7 @@ class MainWindow(QMainWindow):
         self._picture_page = PicturePage()
 
         tabs = QTabWidget()
-        tabs.addTab(mix_page, "混色配方")
+        tabs.addTab(mix_page, "颜色配方")
         tabs.addTab(self._picture_page, "图像转换")
         self._tabs = tabs
         # Connected only once _tabs exists: adding the first tab already emits
@@ -1003,7 +1006,7 @@ class MainWindow(QMainWindow):
         self._update_status()
 
     def _on_tab_changed(self, index: int) -> None:
-        """The colour-table note belongs to 混色配方, so re-evaluate it."""
+        """The colour-table note belongs to 颜色配方, so re-evaluate it."""
         self._update_status()
 
     def _set_status_text(self, text: str) -> None:
@@ -1194,12 +1197,12 @@ class MainWindow(QMainWindow):
 
     # -- misc --------------------------------------------------------------------
     def _on_target_color_changed(self, value: str) -> None:
-        """The 找最接近的颜色 button is only meaningful once a colour is chosen."""
+        """Only the tooltip follows the target colour; the button stays enabled."""
         chosen = bool(value) and self._target_color.isSet()
-        self._find_button.setEnabled(chosen)
         if not chosen:
             self._find_button.setToolTip(
-                "先选一个目标颜色；再按 CIEDE2000 在当前显示的全部颜色里找最接近的一个"
+                "先点「目标颜色」选好想打印的颜色，再按这里；"
+                "程序会按 CIEDE2000 在当前显示的全部颜色里找出最接近的一个"
             )
         else:
             self._find_button.setToolTip(

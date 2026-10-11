@@ -166,7 +166,7 @@ def _entry_sort_key(entry: PaletteEntry, key: str, target_rgb):
 def sort_palette(
     entries: Sequence[PaletteEntry], key: str = SORT_RGB, *, target_rgb=None
 ) -> list[PaletteEntry]:
-    """Order 「全部颜色」 by the same keys the 混色配方 grid offers.
+    """Order 「全部颜色」 by the same keys the 颜色配方 grid offers.
 
     The list mixes raw spools with mixes, so the shapes of the two underlying
     sort keys have to line up. RGB / lightness / hue / similarity already do;

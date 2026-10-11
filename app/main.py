@@ -72,6 +72,20 @@ def _report_startup_failure(message: str) -> None:
         print(message, file=sys.stderr)
 
 
+def show_main_window(window) -> None:
+    """Open the main window maximised.
+
+    The colour table wants every pixel it can get, and a windowed 1320x840
+    default forced people to maximise by hand on every start.  A
+    restored-maximised state is deliberately NOT honoured — the app is a
+    single-purpose tool, so it always opens full screen.
+
+    Kept as its own function so the automatic checks can assert the policy
+    without running the whole event loop.
+    """
+    window.showMaximized()
+
+
 def main(argv=None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if "--selftest" in args:
@@ -99,7 +113,7 @@ def main(argv=None) -> int:
         del exc
         return 1
 
-    window.show()
+    show_main_window(window)
     return app.exec()
 
 

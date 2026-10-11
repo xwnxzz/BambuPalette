@@ -44,7 +44,7 @@ paths.data_dir = lambda: TEMP  # type: ignore[assignment]
 from app.core.engines import ENGINES, ENGINE_BAMBU, ENGINE_MIXER, ENGINE_SPECTRAL  # noqa: E402
 from app.core.library import Filament, FilamentLibrary  # noqa: E402
 from app.core.mixes import SORT_CHOICES, expected_recipe_count  # noqa: E402
-from app.main import build_application  # noqa: E402
+from app.main import build_application, show_main_window as _show_main_window  # noqa: E402
 from app.ui.main_window import MainWindow  # noqa: E402
 
 SAMPLES = (
@@ -130,6 +130,14 @@ def main() -> int:
     window.resize(1460, 900)
     window.show()
     app.processEvents()
+
+    # The app must open maximised: the colour table wants every pixel, and a
+    # windowed default made people maximise by hand on every single start.
+    starter = MainWindow(library=FilamentLibrary(list(library.filaments)), auto_triples=False)
+    _show_main_window(starter)
+    app.processEvents()
+    check(starter.isMaximized(), "the main window opens maximised")
+    starter.close()
 
     total = expected_recipe_count(5)
     check(total == 810, f"expected_recipe_count(5) == 810, got {total}")
@@ -558,7 +566,7 @@ def main() -> int:
     from PySide6.QtWidgets import QSizePolicy, QSplitter, QStatusBar  # noqa: E402
 
     splitter = triple_window._tabs.widget(0).findChild(QSplitter)
-    check(splitter is not None, "the 混色配方 page still has its splitter")
+    check(splitter is not None, "the 颜色配方 page still has its splitter")
     if splitter is not None:
         pinned = [splitter.widget(i).minimumSizeHint().width() for i in range(splitter.count())]
         check(
@@ -595,8 +603,44 @@ def main() -> int:
     app.processEvents()
     check(
         triple_window._status.text() == tab_note,
-        "switching back to 混色配方 restores the colour-table sentence",
+        "switching back to 颜色配方 restores the colour-table sentence",
     )
+
+    # The first page is 「颜色配方」 now, all the way through: tab, panel title and
+    # the tooltip on the target colour all name the same thing.
+    check(
+        triple_window._tabs.tabText(0) == "颜色配方",
+        f"the first tab is 颜色配方, got {triple_window._tabs.tabText(0)!r}",
+    )
+    check(
+        triple_window._detail._title.text() == "颜色配方",
+        f"the right-hand panel is 颜色配方, got {triple_window._detail._title.text()!r}",
+    )
+    check(
+        "颜色配方" in triple_window._target_color.toolTip(),
+        "the target colour tooltip says 颜色配方 too",
+    )
+
+    # A spool's own colour must hide EVERY parent row, not just the second one:
+    # row 3 kept the 「耗材丝3 … 12%」 text from the previous three-colour recipe,
+    # so a raw spool looked like it was mixed from two unrelated spools.
+    spool_cell = next(
+        (cell for cell in triple_window._recipes if cell.filaments and not cell.recipes), None
+    )
+    if spool_cell is not None:
+        triple_window._on_grid_selected(spool_cell)
+        app.processEvents()
+        rows = triple_window._detail._rows
+        # isHidden(), not isVisible(): this window is never shown, so isVisible()
+        # is False for every row and would prove nothing.
+        check(
+            [row["frame"].isHidden() for row in rows] == [False] + [True] * (len(rows) - 1),
+            "a spool colour shows exactly one parent row",
+        )
+        check(
+            rows[0]["percent"].text().startswith("100%"),
+            f"the one visible row is the 100% spool, got {rows[0]['percent'].text()!r}",
+        )
     triple_window.close()
 
     # --- the grid's flat layout, exercised with a stub -------------------------
@@ -1106,9 +1150,17 @@ def main() -> int:
     # already aimed at something they never chose.
     check(window._target_color.hex() == "", "the 目标颜色 field starts with no preset colour")
     check(not window._target_color.isSet(), "the target colour reports itself unset")
-    check(not window._find_button.isEnabled(), "找最接近的颜色 is disabled until a colour is entered")
+    # Deliberately clickable with nothing chosen, exactly like 确认 in 添加耗材:
+    # pressing it early explains what is missing instead of being greyed out.
+    check(window._find_button.isEnabled(), "找最接近的颜色 can be pressed right away")
+    window._find_button.click()
+    app.processEvents()
+    check(
+        "目标颜色" in window._status.text(),
+        f"pressing it with no target explains what is missing: {window._status.text()!r}",
+    )
     window._target_color.setValue("#808080")
-    check(window._find_button.isEnabled(), "entering a colour enables 找最接近的颜色")
+    check(window._find_button.isEnabled(), "找最接近的颜色 stays enabled once a colour is entered")
     window._on_find_nearest()
     app.processEvents()
     check(window._detail.recipe() is not None, "找最接近的颜色 selects a recipe")
@@ -1330,9 +1382,14 @@ def main() -> int:
             if entry.is_mix:
                 check("%" in recipe, "a mix recipe carries its percentages")
             check(page._detail.can_replace(), "the selected colour can be replaced")
-            check(not page._detail.can_restore(), "there is nothing to restore before a change")
+            check(
+                not page._detail.can_restore(),
+                "nothing has been hand-picked before a change",
+            )
+            check(page._delete_button.isEnabled(), "删除 is live once a colour is picked")
+            check(not page._merge_button.isEnabled(), "合并 needs two colours, not one")
 
-            # The replacement menu is 「全部颜色」, ordered like the 混色配方 grid.
+            # The replacement menu is 「全部颜色」, ordered like the 颜色配方 grid.
             entries = build_palette(library, window._catalog, include_mixes=True)
             # At 41 spools this list is 66,461 entries and ~0.5 s to build.  The
             # match and every 「更换颜色…」 have to share one copy of it.
@@ -1454,6 +1511,9 @@ def main() -> int:
             replacement = next(
                 candidate for candidate in ordered if candidate.key != entry.key
             )
+            # Snapshot first, then record — exactly what _on_replace does, which
+            # is why 撤销 alone is enough to take a replacement back.
+            page._push()
             page._replaced[0] = replacement
             page._apply_edits(keep=0)
             app.processEvents()
@@ -1461,7 +1521,9 @@ def main() -> int:
                 page._result.palette[0].key == replacement.key,
                 "the replacement lands in the palette the print uses",
             )
-            check(page._detail.can_restore(), "a replaced colour can be restored")
+            check(page._detail.can_restore(), "the panel knows the colour was hand-picked")
+            check(page._undo_button.isEnabled(), "a replacement can be undone with 撤销")
+            check(page._replace_button.isEnabled(), "更换颜色 is live right next to 删除")
             check(
                 "手动更换" in page._status.text(),
                 f"the status line reports the manual replacement: {page._status.text()}",
@@ -1472,14 +1534,14 @@ def main() -> int:
                 "the plate really uses the replacement colour",
             )
 
-            page._on_restore()
+            page._undo()
             app.processEvents()
             check(
                 page._result.palette[0].key == entry.key,
-                "restoring puts the automatic match back",
+                "撤销 puts the automatic match back",
             )
-            check(page._replaced == {}, "restoring forgets the replacement")
-            check(not page._detail.can_restore(), "nothing left to restore")
+            check(page._replaced == {}, "undoing forgets the replacement")
+            check(not page._detail.can_restore(), "nothing hand-picked is left")
             check(
                 entry.color_hex.upper()
                 in {part.color_hex.upper() for part in page.buildPlate().parts},
@@ -1497,8 +1559,7 @@ def main() -> int:
             placed = _np.bincount(live[live >= 0].ravel())
             doomed = int(placed.argmax())
             doomed_pixels = int(placed[doomed])
-            page._list._picked = {doomed}
-            page._update_actions()
+            page._list.select([doomed])
             check(page._delete_button.isEnabled(), "删除 lights up once a colour is picked")
             page._on_delete_colours()
             app.processEvents()
@@ -1551,11 +1612,9 @@ def main() -> int:
             # 合并: the merge itself, then undo, then the dialog's own plumbing.
             if len(page._result.palette) >= 2:
                 keep_key = page._result.palette[1].key
-                page._list._picked = {0}
-                page._update_actions()
+                page._list.select([0])
                 check(not page._merge_button.isEnabled(), "合并 needs two colours, not one")
-                page._list._picked = {0, 1}
-                page._update_actions()
+                page._list.select([0, 1])
                 check(page._merge_button.isEnabled(), "合并 lights up with two colours picked")
                 page._push()
                 page._merged[page._live_map[0]] = page._live_map[1]
@@ -1638,11 +1697,11 @@ def main() -> int:
 
     # --- the picture page only re-matches when it is on screen -----------------
     # At 41 spools a re-match is ~0.7 s against 66,461 candidates; spending it
-    # while the 混色配方 tab is showing buys the user nothing.
+    # while the 颜色配方 tab is showing buys the user nothing.
     page._stale = False
     window._tabs.setCurrentIndex(0)
     app.processEvents()
-    check(not page.isVisible(), "the 混色配方 tab is the one on screen")
+    check(not page.isVisible(), "the 颜色配方 tab is the one on screen")
     before_result = page.result
     spare = Filament(brand="大简", material_type="PETG HF", color_hex="#123456")
     library.add(spare)
