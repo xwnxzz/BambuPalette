@@ -33,6 +33,7 @@ from app.mesh.plate import (  # noqa: E402
     PlateSettings,
     build_plate,
     edge_health,
+    merge_parts,
     plate_mesh,
     signed_volume,
 )
@@ -221,36 +222,57 @@ class ThreeMfTests(ExportTestCase):
         mesh = next(item for item in root.iter() if _local(item.tag) == "mesh")
         vertices = [item for item in mesh.iter() if _local(item.tag) == "vertex"]
         triangles = [item for item in mesh.iter() if _local(item.tag) == "triangle"]
-        self.assertEqual(len(vertices), sum(len(part.vertices) for part in self.plate.parts))
+        # The file carries the MERGED pool, not one block per part: coincident
+        # border vertices become a single index, which is what makes the written
+        # mesh closed when a reader counts edges by index.
+        merged, _per_part = merge_parts(self.plate.parts)
+        self.assertEqual(len(vertices), len(merged))
+        self.assertLess(len(vertices), sum(len(part.vertices) for part in self.plate.parts))
         self.assertEqual(len(triangles), self.plate.triangle_count)
         for triangle in triangles:
             for key in ("v1", "v2", "v3"):
                 self.assertLess(int(triangle.get(key)), len(vertices))
 
-    def test_the_merged_vertices_keep_each_part_contiguous(self):
-        """Concatenation must offset indices, not renumber them across parts."""
+    def test_the_parts_share_the_vertices_on_their_borders(self):
+        """Merging must reunite border corners, not just renumber the parts.
+
+        The 1.6.5 export concatenated the parts, so every border edge belonged to
+        two index pairs and Bambu Studio reported 14,650 open edges on a solid
+        that had none.  The written mesh has to reference a shared index instead.
+        """
         root = self._model()
         mesh = next(item for item in root.iter() if _local(item.tag) == "mesh")
+        vertices = [
+            (item.get("x"), item.get("y"), item.get("z"))
+            for item in mesh.iter()
+            if _local(item.tag) == "vertex"
+        ]
         triangles = [item for item in mesh.iter() if _local(item.tag) == "triangle"]
-        cursor = 0
-        offset = 0
-        for part in self.plate.parts:
-            window = triangles[cursor : cursor + part.triangle_count]
-            self.assertEqual(len(window), part.triangle_count)
-            for triangle in window:
-                for key in ("v1", "v2", "v3"):
-                    index = int(triangle.get(key))
-                    self.assertGreaterEqual(index, offset)
-                    self.assertLess(index, offset + len(part.vertices))
-            cursor += part.triangle_count
-            offset += len(part.vertices)
+        counts: dict[tuple[str, str, str], int] = {}
+        for triangle in triangles:
+            for key in ("v1", "v2", "v3"):
+                point = vertices[int(triangle.get(key))]
+                counts[point] = counts.get(point, 0) + 1
+        self.assertTrue(counts, "the mesh has no vertices")
+        shared = [point for point, seen in counts.items() if seen > 1]
+        self.assertTrue(
+            shared,
+            "no vertex is referenced by more than one triangle — the parts were "
+            "concatenated again instead of merged",
+        )
+        # The merge is what closes the mesh, so measure that directly.
+        points, _per_part = merge_parts(self.plate.parts)
+        self.assertEqual(len(vertices), len(points))
 
     def test_the_last_written_vertex_is_the_model_vertex_on_the_bed(self):
         root = self._model()
         mesh = next(item for item in root.iter() if _local(item.tag) == "mesh")
         vertices = [item for item in mesh.iter() if _local(item.tag) == "vertex"]
         last = vertices[-1]
-        expected = self.plate.parts[-1].vertices[-1]
+        # The merge keeps first-seen order, so the final vertex is the last point
+        # no earlier part had already contributed.
+        points, _per_part = merge_parts(self.plate.parts)
+        expected = points[-1]
         self.assertAlmostEqual(float(last.get("x")) - expected[0], (256.0 - self.plate.width_mm) / 2.0, places=4)
         self.assertAlmostEqual(float(last.get("y")) - expected[1], (256.0 - self.plate.depth_mm) / 2.0, places=4)
         self.assertAlmostEqual(float(last.get("z")) - expected[2], 0.0, places=6)
@@ -354,7 +376,9 @@ class ObjTests(ExportTestCase):
         lines = self._write().read_text(encoding="utf-8").splitlines()
         vertices = [line for line in lines if line.startswith("v ")]
         faces = [line for line in lines if line.startswith("f ")]
-        self.assertEqual(len(vertices), self.plate.vertex_count)
+        merged, _per_part = merge_parts(self.plate.parts)
+        self.assertEqual(len(vertices), len(merged))
+        self.assertLess(len(vertices), self.plate.vertex_count)
         self.assertEqual(len(faces), self.plate.triangle_count)
 
     def test_face_indices_stay_inside_the_vertex_list(self):

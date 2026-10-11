@@ -189,32 +189,47 @@ def _merged_mesh(
 ) -> tuple[str, str, int]:
     """Return ``(vertex_rows, triangle_rows, vertex_count)`` for the whole plate.
 
-    The base slab and every colour region end up in **one** object.  Their
-    vertices are concatenated with an index offset and each triangle is tagged
-    twice: with the core-3MF material it uses (``pid``/``p1`` into the
-    ``<basematerials>`` table) and with Bambu Studio's own ``paint_color`` code.
-    Carrying both means the plate is a single printable solid painted in several
-    colours, and whichever colour mechanism the reader understands is present.
+    The base slab and every colour region end up in **one** object.  Each
+    triangle is tagged twice: with the core-3MF material it uses (``pid``/``p1``
+    into the ``<basematerials>`` table) and with Bambu Studio's own
+    ``paint_color`` code.  Carrying both means the plate is a single printable
+    solid painted in several colours, and whichever colour mechanism the reader
+    understands is present.
+
+    Vertices are **shared**, not concatenated.  A part carries its own copy of
+    every corner on its border, so splicing the parts together verbatim hands
+    each border edge to two different index pairs; a reader that counts edges by
+    index — which is exactly what Bambu Studio's mesh statistics do — then
+    reports the whole part border as open edges instead of reading one closed
+    solid.  The index map is keyed on the formatted coordinates, so two vertices
+    share an index if and only if they are byte-identical in the file, which is
+    precisely the equality the reader sees.
     """
     dx, dy, dz = translate
     vertex_rows: list[str] = []
     triangle_rows: list[str] = []
-    offset = 0
+    index_of: dict[tuple[str, str, str], int] = {}
     for part in plate.parts:
         code = paint_code(part.extruder)
         material = part.extruder - 1
+        remap: list[int] = []
         for x, y, z in part.vertices:
-            vertex_rows.append(
-                f'          <vertex x="{_fmt(x + dx)}" y="{_fmt(y + dy)}" z="{_fmt(z + dz)}" />\n'
-            )
+            key = (_fmt(x + dx), _fmt(y + dy), _fmt(z + dz))
+            index = index_of.get(key)
+            if index is None:
+                index = len(vertex_rows)
+                index_of[key] = index
+                vertex_rows.append(
+                    f'          <vertex x="{key[0]}" y="{key[1]}" z="{key[2]}" />\n'
+                )
+            remap.append(index)
         for a, b, c in part.triangles:
             triangle_rows.append(
-                f'          <triangle v1="{int(a) + offset}" v2="{int(b) + offset}" '
-                f'v3="{int(c) + offset}" pid="{BASEMATERIALS_ID}" p1="{material}" '
+                f'          <triangle v1="{remap[int(a)]}" v2="{remap[int(b)]}" '
+                f'v3="{remap[int(c)]}" pid="{BASEMATERIALS_ID}" p1="{material}" '
                 f'paint_color="{code}" />\n'
             )
-        offset += int(len(part.vertices))
-    return "".join(vertex_rows), "".join(triangle_rows), offset
+    return "".join(vertex_rows), "".join(triangle_rows), len(vertex_rows)
 
 
 #: The single object id used by both the model document and the settings file.

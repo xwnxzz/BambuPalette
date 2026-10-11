@@ -152,12 +152,14 @@ def count_geometry(path: Path) -> dict:
 
 
 def mesh_health(path: Path) -> tuple[int, int]:
-    """Open / non-manifold edge counts of a 3MF, welded the way a slicer welds it.
+    """Open / non-manifold edge counts of a 3MF, exactly as a reader counts them.
 
     Bambu Studio reports these two numbers on the object panel, so they are the
-    numbers a user judges the file by.  Every part is written with its own vertex
-    block, so the positions have to be reunited before counting — otherwise each
-    part looks like a bag of open edges.
+    numbers a user judges the file by.  It counts by **vertex index**, not by
+    position: two coincident vertices that carry different indices leave their
+    shared edge open.  This used to reunite positions before counting, which
+    made every file look closed while Bambu Studio kept reporting 14,650 open
+    edges on the same plate.  It must stay index-level.
     """
     import numpy as np
 

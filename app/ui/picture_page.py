@@ -1340,20 +1340,32 @@ class PicturePage(QWidget):
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         self._status.setText(f"正在写入 {target.name}…")
         QApplication.processEvents()
+        written = None
         try:
-            if kind == "3mf":
-                # The filament list travels inside the project so Bambu Studio
-                # opens it with *our* colours instead of whatever is in the AMS.
-                filaments = (
-                    slots_from_palette(self._result.palette, self._library)
-                    if self._result is not None
-                    else None
+            written = self._write_model(plate, kind, target)
+        except OSError as error:
+            # The dialog opens where the user asked for it, which is 下载.  If
+            # the shell or a policy refuses that folder, losing the model is not
+            # an option: write it next to our own data and name the file that
+            # really exists.  (1.6.5 probed Downloads up front instead, so the
+            # dialog silently opened in a hidden folder.)
+            for alternative in self._alternative_targets(target):
+                try:
+                    written = self._write_model(plate, kind, alternative)
+                except OSError:
+                    continue
+                QApplication.restoreOverrideCursor()
+                QMessageBox.information(
+                    self,
+                    "已存到别的位置",
+                    f"{target.parent} 写不进去：{error.strerror or error}\n\n"
+                    f"模型已经存到：\n{written}",
                 )
-                written = write_3mf(
-                    plate, target, object_name=self._image_name, filaments=filaments
-                )
-            else:
-                written = write_obj(plate, target)
+                break
+            if written is None:
+                QApplication.restoreOverrideCursor()
+                QMessageBox.warning(self, "保存失败", str(error))
+                return
         except Exception as error:
             QApplication.restoreOverrideCursor()
             QMessageBox.warning(self, "保存失败", str(error))
@@ -1361,6 +1373,43 @@ class PicturePage(QWidget):
         QApplication.restoreOverrideCursor()
         self._status.setText(self._describe(plate, written))
         self._announce(plate, written)
+
+    def _write_model(self, plate: PlateModel, kind: str, target: Path) -> Path:
+        """Write *plate* to *target* in the requested format and return the path."""
+        if kind == "3mf":
+            # The filament list travels inside the project so Bambu Studio opens
+            # it with *our* colours instead of whatever is in the AMS.
+            filaments = (
+                slots_from_palette(self._result.palette, self._library)
+                if self._result is not None
+                else None
+            )
+            return write_3mf(plate, target, object_name=self._image_name, filaments=filaments)
+        return write_obj(plate, target)
+
+    @staticmethod
+    def _alternative_targets(target: Path) -> list[Path]:
+        """Where to retry a save the chosen folder refused, best first."""
+        options: list[Path] = []
+        homes: list[Path] = []
+        try:
+            homes.append(paths.data_dir() / "exports")
+        except OSError:  # pragma: no cover - defensive
+            pass
+        try:
+            homes.append(Path.home())
+        except (OSError, RuntimeError):  # pragma: no cover - defensive
+            pass
+        for directory in homes:
+            candidate = directory / target.name
+            if candidate.parent == target.parent or candidate in options:
+                continue
+            try:
+                candidate.parent.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                continue
+            options.append(candidate)
+        return options
 
     def _describe(self, plate: PlateModel, written: Path) -> str:
         stats = plate.stats()

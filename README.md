@@ -155,7 +155,7 @@ dist\BambuPalette\BambuPalette.exe
 
 - 默认：`%LOCALAPPDATA%\BambuPalette\filament-library.json`
 - 便携模式：在 exe 同目录放一个空的 `portable.txt`，数据就存在 exe 旁边的 `data\` 文件夹里（放 U 盘里带走很方便）。
-- 导出的 3MF / OBJ 默认保存到 `%LOCALAPPDATA%\BambuPalette\exports\`。
+- 导出的 3MF / OBJ 默认保存到**「下载」文件夹**（`%USERPROFILE%\Downloads`）。这里**不做写入探测**：探测回答的是「本进程能不能在这里建文件」，而你要的是「我想在哪儿找到它」，两个问题不一样——1.6.5 就是因为先探测，打包成 exe 后探测失败，导出的文件全落回了隐藏的私有目录。真写不进去时会在写入处兜底，改存到程序自己数据目录下的 `exports\` 或用户主目录，并弹窗告诉你文件到底在哪。
 - **程序一定放得下数据，也一定打得开。** 首选目录用不了时会依次退到 `%TEMP%\BambuPalette\`、用户主目录下的
   `.bambupalette\`，最后退到 **exe 旁边的 `data\`**，每一步都会把已有档案带过去；只有全部失败才弹出说明窗口。
   触发条件通常是杀毒软件临时锁目录、漫游配置重定向，或者 Windows 把刚删掉的目录留在 "delete pending" 状态。
@@ -297,7 +297,8 @@ samples/      示例图片、界面截图、示例模型
 
 ## 六、已知限制
 
-- **3MF 已经在真实的 Bambu Studio 里验证过了**（见下节），但只验证了「能被正确读入、几何与挤出机号完整保留、没有开放边/非流形边、打开不弹任何警告」；实际切片打印效果还需要你自己试一次。
+- **3MF 已经在真实的 Bambu Studio 里验证过了**（见下节），验证的是「能被正确读入、几何与挤出机号完整保留、**按顶点索引数**没有开放边/非流形边、顶点逐面颜色与往返前完全一致」；实际切片打印效果还需要你自己试一次。
+- 打开导出的 3MF 时，Bambu Studio 会弹一句「**3mf文件配置无效，仅加载几何数据**」。这是它对**任何没有完整 Bambu 工程配置的 3MF** 说的通告：手写的一个普通立方体也会弹同一句，所以它跟本程序生成的文件无关，也没法在文件里消掉（对照实验见 [docs/算法说明.md](docs/算法说明.md) 第 32 节）。它只影响**打印设置**（工艺 / 机器预设），**不影响颜色**——颜色是几何里逐三角面的 `paint_color`，点一下「确认」再选你要的预设即可。
 - 3MF 里**不带** `Metadata/project_settings.config`，所以 Bambu Studio 打开时用的是**它当前选中的**打印机/工艺预设，而不会把你在本程序里填的耗材名字、品牌带过去。颜色的对应关系是准的（每个色块就是程序里匹配到的那个颜色），但「这一格用哪一卷料」还是要你按程序里给的配方去 Bambu Studio 里对号入座。
 - 混色只在**同一种耗材种类**之间成立（Bambu Studio 本身也是如此，种类不同不允许混色）。程序不会阻止你给不同种类的耗材算混色，但去 Bambu Studio 里会发现混不了。
 - 图片匹配是逐像素取最接近的颜色，颜色数量上限 48；照片类图片建议 8–16 色，否则打印出来会非常碎。
@@ -316,17 +317,19 @@ samples/      示例图片、界面截图、示例模型
 
 不带参数时脚本会自己造一块小板；带上 `.3mf` 路径就验证那个现成文件。
 
-它把生成的 3MF 交给 `bambu-studio.exe --export-3mf <输出> <输入>`——Bambu Studio 会读入模型、建场景，再导出一份新的工程文件。然后逐项比对源文件与回读文件的顶点数、三角面数、部件数、逐面色编码，以及**这一块网格到底水密不水密**（把所有部件的顶点重新焊接之后数开放边和非流形边，也就是 Bambu Studio 对象面板上「信息 / 错误」那两行）。
+它把生成的 3MF 交给 `bambu-studio.exe --export-3mf <输出> <输入>`——Bambu Studio 会读入模型、建场景，再导出一份新的工程文件。然后逐项比对源文件与回读文件的顶点数、三角面数、部件数、逐面色编码，以及**这一块网格到底水密不水密**（**按顶点索引**数开放边和非流形边，也就是 Bambu Studio 对象面板上「信息 / 错误」那两行）。
+
+> 这里**故意不做顶点焊接**。1.6.5 及以前是先按坐标焊接再数，那一步把「同一条边被存成两个不同索引对」这个缺陷整个盖住了：焊接后是 0，Bambu Studio 数出来是 14,650。数的人怎么数，比数多少次重要。
 
 实测结果（示例文件 [samples/sample-plate.3mf](samples/sample-plate.3mf)）：
 
 ```
-source      :   24,117 B  1,833 vertices  2,012 triangles  1 parts  5 paint codes
+source      :   21,068 B  1,008 vertices  2,012 triangles  1 parts  5 paint codes
               part 1: extruder None  混色底板示例
               filaments: (none)
               paints: 0C×266  1C×472  2C×27  4×1,188  8×59
               mesh: 0 open edges  0 non-manifold edges
-round trip  :   43,948 B  1,833 vertices  2,012 triangles  1 parts  1 meshes
+round trip  :   41,207 B  1,008 vertices  2,012 triangles  1 parts  1 meshes
               part 1: extruder None  混色底板示例
               filaments: #00AE42
               paints: 0C×266  1C×472  2C×27  4×1,188  8×59
@@ -334,7 +337,7 @@ round trip  :   43,948 B  1,833 vertices  2,012 triangles  1 parts  1 meshes
 BAMBU ROUND TRIP OK
 ```
 
-源文件 `filaments: (none)` 是**故意的**：包里不带 `Metadata/project_settings.config`（原因见 §二第 8 条和 [docs/算法说明.md](docs/算法说明.md) 第 31 节）。颜色靠 `<basematerials>` + `paint_color`，五个编码和逐项计数在往返前后完全一致。开放边 / 非流形边这两项一旦不是 0，脚本会直接判 FAIL——它们是用户在 Bambu Studio 里一眼就能看见的两行红字。
+源文件 `filaments: (none)` 是**故意的**：包里不带 `Metadata/project_settings.config`（原因见 §二第 8 条和 [docs/算法说明.md](docs/算法说明.md) 第 31、32 节）。颜色靠 `<basematerials>` + `paint_color`，五个编码和逐项计数在往返前后完全一致。开放边 / 非流形边这两项一旦不是 0，脚本会直接判 FAIL——它们是用户在 Bambu Studio 里一眼就能看见的两行红字。
 
 > 这一步曾经抓出一个真实缺陷：最早的 3MF 是照抄 Bambu Studio 自己导出工程的布局（每个部件一个 `3D/Objects/object_N.model`，用 3MF production 扩展的 `<component p:path=…>` 跨文件引用）。Bambu Studio 2.8 会**保留元数据却把全部 component 丢掉**，回读出来 `face_count="0"`、几何全空。改成标准 core 3MF（网格全部内联在 `3D/3dmodel.model` 里，component 只按 `objectid` 引用）之后往返完全一致。现在 `tests/test_export.py` 里有专门的回归测试守着这条：不许出现 `3D/Objects/` 条目，且每个 `<component>` 必须能解析到真正带网格的对象。
 

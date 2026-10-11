@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .plate import PlateModel
+from .plate import PlateModel, merge_parts
 
 __all__ = ["write_obj"]
 
@@ -25,7 +25,7 @@ def _rgb_floats(color_hex: str) -> tuple[float, float, float]:
 
 
 def _fmt(value: float) -> str:
-    text = f"{float(value):.4f}".rstrip("0").rstrip(".")
+    text = f"{float(value):.6f}".rstrip("0").rstrip(".")
     return text if text not in ("", "-0") else "0"
 
 
@@ -45,19 +45,25 @@ def write_obj(plate: PlateModel, path: str | Path) -> Path:
     target.parent.mkdir(parents=True, exist_ok=True)
     mtl_name = target.with_suffix(".mtl").name
 
-    vertex_lines: list[str] = []
+    # One shared vertex pool: the parts are slices of a single solid and each
+    # keeps its own copy of the corners on their borders, so writing them one
+    # after another would describe every part-border edge twice.  OBJ indices are
+    # 1-based and global, which is exactly what the merged pool gives us.
+    points, per_part = merge_parts(plate.parts)
+
+    vertex_lines: list[str] = [
+        f"v {_fmt(x)} {_fmt(y)} {_fmt(z)}" for x, y, z in points.tolist()
+    ]
     face_lines: list[str] = []
-    offset = 1  # OBJ indices are 1-based and shared across groups
-    for part in plate.parts:
-        vertex_lines.append(f"# {part.name}  {part.color_hex}  extruder {part.extruder}")
-        for x, y, z in part.vertices:
-            vertex_lines.append(f"v {_fmt(x)} {_fmt(y)} {_fmt(z)}")
+    for part, triangles in zip(plate.parts, per_part):
+        face_lines.append(
+            f"# {part.name}  {part.color_hex}  extruder {part.extruder}"
+        )
         material = _safe(f"part_{part.palette_index + 1:02d}_{part.color_hex.lstrip('#')}")
         face_lines.append(f"g {_safe(part.name)}")
         face_lines.append(f"usemtl {material}")
-        for a, b, c in part.triangles:
-            face_lines.append(f"f {int(a) + offset} {int(b) + offset} {int(c) + offset}")
-        offset += int(len(part.vertices))
+        for a, b, c in triangles.tolist():
+            face_lines.append(f"f {a + 1} {b + 1} {c + 1}")
 
     body = [
         "# BambuPalette — flat multi-material plate",

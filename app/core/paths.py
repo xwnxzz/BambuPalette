@@ -406,13 +406,17 @@ def exports_dir() -> Path:
     downloads folder is offered instead, which is where they asked for it and
     where the next step (dragging the file into Bambu Studio) happens anyway.
 
-    A folder is only offered after a real write has been confirmed in it; a
-    Downloads folder redirected onto a locked or disconnected drive falls back
-    to the private folder so the dialog never opens somewhere the save will be
-    refused.
+    Downloads is offered **without testing it first**.  1.6.5 probed, and on the
+    reporter's machine the probe failed while the folder was perfectly usable:
+    the dialog then opened in the hidden private folder, which is the exact
+    complaint 「默认保存地址为下载」.  A probe decides whether *our* process may
+    create a file, and that is not the same question as where the user wants to
+    look for it — so the folder they asked for is offered, and a write that is
+    genuinely refused is handled where it happens (``picture_page._write_model``
+    retries next to our own data and names the file that really exists).
     """
     for candidate in _downloads_candidates():
-        if candidate.is_dir() and _write_probe(candidate) is None:
+        if candidate.is_dir():
             return candidate
     path = data_dir() / "exports"
     path.mkdir(parents=True, exist_ok=True)

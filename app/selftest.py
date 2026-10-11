@@ -91,6 +91,19 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     )
     del _QIcon, _QSize
 
+    # Objective "默认保存地址为下载": the frozen build must offer the user's own
+    # downloads folder, not the hidden private one, even though a write probe
+    # inside the bundle used to answer "no" and send every export to <app>\data.
+    _exports = paths.exports_dir()
+    lines.append(f"exports     {_exports}")
+    check(_exports.is_dir(), f"the export dialog opens in an existing folder ({_exports})")
+    _downloads = [candidate for candidate in paths._downloads_candidates() if candidate.is_dir()]
+    if _downloads:
+        check(
+            _exports == _downloads[0],
+            "the export dialog opens in the downloads folder, not a hidden data folder",
+        )
+
     from .core.engines import ENGINES, ENGINE_BAMBU, ENGINE_MIXER
     from .core.image_matching import MatchSettings, build_palette, match_image
     from .core.mixes import expected_recipe_count
@@ -827,12 +840,29 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     if triple_only is not None:
         first_recipe = triple_only.recipes[0]
         check(hasattr(first_recipe, "percent_c"), "that colour is reached by a three-filament recipe")
-        window._on_grid_activated(triple_only)
+        window._on_grid_selected(triple_only)
         app.processEvents()
-        check(window._pair_filter is None, "double-clicking a triple does not filter to two spools")
+        check(window._pair_filter is None, "selecting a triple does not filter to two spools")
         check(
             window._detail.colour() is triple_only,
-            "double-clicking a triple keeps showing that same colour",
+            "selecting a triple keeps showing that same colour",
+        )
+    # The double-click jump is gone: activating a two-colour mix must not narrow
+    # the grid either.  Only the detail panel's own button sets ``_pair_filter``.
+    pair_cell = None
+    if combined is not None:
+        for position in range(len(combined)):
+            if combined[position].recipes and combined.pair_colour_at(position) is not None:
+                pair_cell = combined[position]
+                break
+    check(pair_cell is not None, "the combined table holds a two-colour mix to test with")
+    if pair_cell is not None:
+        window._pair_filter = None
+        window._on_grid_selected(pair_cell)
+        app.processEvents()
+        check(
+            window._pair_filter is None,
+            "activating a two-colour mix no longer filters the grid to its pair",
         )
 
     # Render the real window once, so a broken Qt platform plugin or a missing

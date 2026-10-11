@@ -25,6 +25,7 @@ whole solid, because a per-part repair cannot see the edge its neighbour owns.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Sequence
 
 import numpy as np
 
@@ -37,6 +38,7 @@ __all__ = [
     "rectangles",
     "prism_mesh",
     "stitch_t_junctions",
+    "merge_parts",
     "plate_mesh",
     "edge_health",
     "signed_volume",
@@ -82,12 +84,15 @@ class PlateSettings:
 
 @dataclass
 class PlatePart:
-    """One filament's share of the slab, as its own indexed triangle window.
+    """One filament's share of the slab.
 
-    Parts share no vertex indices — each one carries its own copy of the corners
-    it uses — because every exporter writes them as separate groups and offsets
-    the indices per part.  The copies sit at identical positions, so welding the
-    parts back together reproduces the single solid they were cut from.
+    A part carries its own copy of every corner it uses, including the corners it
+    shares with a neighbour, because the builder stitches each region's outline
+    independently.  The copies sit at bit-identical positions, so
+    :func:`merge_parts` folds them back into the single solid they were cut from.
+    Exporters must go through that merge: splicing the parts together verbatim
+    hands every part-border edge two different index pairs, which is a mesh the
+    slicer reads as open even though no geometry is missing.
     """
 
     name: str
@@ -132,7 +137,19 @@ class PlateModel:
 
     @property
     def vertex_count(self) -> int:
+        """Vertices the parts carry between them, before coincident ones merge."""
         return sum(int(len(part.vertices)) for part in self.parts)
+
+    @property
+    def shared_vertex_count(self) -> int:
+        """Vertices the written mesh actually carries.
+
+        Border corners are shared, so this is smaller than :attr:`vertex_count`
+        and it is the number a reader of the exported file would count.
+        """
+        if not self.parts:
+            return 0
+        return int(len(merge_parts(self.parts)[0]))
 
     @property
     def volume_mm3(self) -> float:
@@ -147,7 +164,7 @@ class PlateModel:
             "parts": len(self.parts),
             "extruders": self.extruder_count,
             "triangles": self.triangle_count,
-            "vertices": self.vertex_count,
+            "vertices": self.shared_vertex_count,
             "width_mm": round(self.width_mm, 3),
             "depth_mm": round(self.depth_mm, 3),
             "thickness_mm": round(self.total_thickness_mm, 3),
@@ -588,21 +605,30 @@ def prism_mesh(
 # ---------------------------------------------------------------------------
 # Mesh health
 # ---------------------------------------------------------------------------
-def edge_health(points: np.ndarray, faces: np.ndarray) -> tuple[int, int]:
-    """``(open_edges, non_manifold_edges)`` after welding coincident vertices.
+def edge_health(
+    points: np.ndarray, faces: np.ndarray, *, weld: bool = False
+) -> tuple[int, int]:
+    """``(open_edges, non_manifold_edges)`` counted the way a reader counts them.
 
-    Bambu Studio welds an imported object's parts together before it reports mesh
-    statistics, so welding first is the number the user actually sees.
+    Counting follows the **index list**: an edge is shared only when both of its
+    triangles name the same two vertex indices.  Two vertices at identical
+    coordinates but different indices therefore leave that edge open.  This is
+    what a slicer's mesh statistics see — Bambu Studio reported 14,650 open
+    edges for a plate whose geometry was closed, and 14,650 is exactly the
+    index-level count — so this is the number that must gate acceptance.
+
+    ``weld=True`` first reunites vertices that share a position, which answers a
+    different question ("is the *geometry* closed?") and is only useful when
+    diagnosing the index list.  It is never the acceptance number: welding here
+    is what hid the defect that shipped in 1.6.5.
     """
-    welded, inverse = np.unique(
-        np.asarray(points, dtype=np.float64), axis=0, return_inverse=True
-    )
-    del welded
-    mapped = np.asarray(inverse, dtype=np.int64).reshape(-1)[
-        np.asarray(faces, dtype=np.int64)
-    ]
+    vertices = np.asarray(points, dtype=np.float64)
+    triangles = np.asarray(faces, dtype=np.int64)
+    if weld:
+        _welded, inverse = np.unique(vertices, axis=0, return_inverse=True)
+        triangles = np.asarray(inverse, dtype=np.int64).reshape(-1)[triangles]
     counts: dict[tuple[int, int], int] = {}
-    for a, b, c in mapped.tolist():
+    for a, b, c in triangles.tolist():
         for u, v in ((a, b), (b, c), (c, a)):
             key = (u, v) if u < v else (v, u)
             counts[key] = counts.get(key, 0) + 1
@@ -622,11 +648,50 @@ def signed_volume(points: np.ndarray, faces: np.ndarray) -> float:
     return float(np.einsum("ij,ij->i", a, np.cross(b, c)).sum() / 6.0)
 
 
+def merge_parts(parts: Sequence[PlatePart]) -> tuple[np.ndarray, list[np.ndarray]]:
+    """Fold the per-part vertex lists into ONE shared pool, with per-part faces.
+
+    Parts each keep their own copy of the corners they share with a neighbour, so
+    writing them back to back gives every part-border edge two different index
+    pairs.  The solid is geometrically closed but topologically open, and a reader
+    that counts edges by index — which is exactly what Bambu Studio's mesh
+    statistics do — reports the whole part border as open edges.  That is the bug
+    that shipped in 1.6.5: the user's file reported 14,650 open edges while
+    containing no gap at all.
+
+    Vertices are matched on the builder's own integer lattice,
+    ``round(coordinate * _SCALE)`` with ``_SCALE = 1_000_000``.  The 3MF writer
+    prints exactly those six decimals, so a vertex here and the vertex text in
+    the file agree one for one and the two welds cannot drift apart.
+
+    Returns the merged ``(N, 3)`` float64 points in first-seen order, and one
+    ``(T, 3)`` int64 triangle array per part indexing into that pool.
+    """
+    merged: list[Point] = []
+    slot_of: dict[tuple[int, int, int], int] = {}
+    per_part: list[np.ndarray] = []
+    for part in parts:
+        vertices = np.asarray(part.vertices, dtype=np.float64)
+        local = np.empty(len(vertices), dtype=np.int64)
+        for position, (x, y, z) in enumerate(vertices.tolist()):
+            key = (round(x * _SCALE), round(y * _SCALE), round(z * _SCALE))
+            slot = slot_of.get(key)
+            if slot is None:
+                slot = len(merged)
+                slot_of[key] = slot
+                merged.append((x, y, z))
+            local[position] = slot
+        per_part.append(local[np.asarray(part.triangles, dtype=np.int64)])
+    points = np.asarray(merged, dtype=np.float64).reshape(-1, 3)
+    return points, per_part
+
+
 def plate_mesh(plate: PlateModel) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """The whole plate as one mesh plus a per-triangle extruder list.
 
-    Vertices are concatenated with a per-part offset, exactly as the exporters
-    write them; call :func:`edge_health` to weld them back together.
+    The parts are merged into a single shared vertex pool, so the result is the
+    closed solid the exporters have to write — call :func:`edge_health` on it
+    without welding and it must report no open edges.
     """
     if not plate.parts:
         return (
@@ -634,18 +699,15 @@ def plate_mesh(plate: PlateModel) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
             np.zeros((0, 3), dtype=np.int64),
             np.zeros(0, dtype=np.int64),
         )
-    points: list[np.ndarray] = []
-    faces: list[np.ndarray] = []
-    extruders: list[np.ndarray] = []
-    offset = 0
-    for part in plate.parts:
-        points.append(part.vertices)
-        faces.append(part.triangles + offset)
-        extruders.append(
+    points, per_part = merge_parts(plate.parts)
+    faces = np.vstack(per_part)
+    extruders = np.concatenate(
+        [
             np.full(len(part.triangles), part.extruder, dtype=np.int64)
-        )
-        offset += int(len(part.vertices))
-    return np.vstack(points), np.vstack(faces), np.concatenate(extruders)
+            for part in plate.parts
+        ]
+    )
+    return points, faces, extruders
 
 
 # ---------------------------------------------------------------------------

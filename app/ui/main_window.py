@@ -236,7 +236,6 @@ class MainWindow(QMainWindow):
         target_row.addWidget(self._target_color)
         target_row.addWidget(self._find_button)
         target_row.addStretch(1)
-        target_row.addWidget(QLabel("双击两色混色 = 只看这一对耗材"))
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self._build_library_panel())
@@ -407,8 +406,13 @@ class MainWindow(QMainWindow):
 
     def _build_grid_panel(self) -> QWidget:
         self._grid = MixGrid()
+        # Activating a cell (double-click, or Enter on the focused one) does the
+        # same as selecting it.  It deliberately does NOT narrow the grid to the
+        # recipe's pair any more: that surprise jump was reported as
+        # 「双击混色以后颜色都不见了」, and the pair filter has an explicit button
+        # of its own in the detail panel.
         self._grid.recipeSelected.connect(self._on_grid_selected)
-        self._grid.recipeActivated.connect(self._on_grid_activated)
+        self._grid.recipeActivated.connect(self._on_grid_selected)
         self._grid.selectionCleared.connect(self._on_grid_cleared)
 
         # 「全部颜色」: the two-filament mixes, the three-filament mixes and the
@@ -1146,24 +1150,6 @@ class MainWindow(QMainWindow):
             self._detail.showFilament(cell.filament)
             return
         self._detail.showColour(cell)
-
-    def _on_grid_activated(self, cell) -> None:
-        """Double-click: only a two-filament mix has one parent pair to jump to.
-
-        A three-filament mix is made by three spools at once.  Filtering to its
-        first two would show the 81 two-colour ratios of a DIFFERENT colour —
-        which is exactly the 「配方是三色，双击后却变成两色」 report.  So a
-        triple (and a spool) only refreshes the detail panel.
-        """
-        if getattr(cell, "pair_index", 0) < 0 and hasattr(cell, "filament"):
-            self._detail.showFilament(cell.filament)
-            return
-        first = cell.recipes[0] if getattr(cell, "recipes", None) else None
-        # ``TripleRecipe`` is the only recipe shape carrying a third spool.
-        if first is None or hasattr(first, "percent_c"):
-            self._detail.showColour(cell)
-            return
-        self._show_pair(first.a_id, first.b_id)
 
     def _on_grid_cleared(self) -> None:
         """The user clicked blank space (or pressed Esc): drop the recipe."""

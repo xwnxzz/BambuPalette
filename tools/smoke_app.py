@@ -542,21 +542,43 @@ def main() -> int:
             f"a three-colour recipe names all three spools, got {first_recipe.ratio_text!r}",
         )
         triple_window._pair_filter = None
-        triple_window._on_grid_activated(triple_only)
+        triple_window._on_grid_selected(triple_only)
         app.processEvents()
         check(
             triple_window._pair_filter is None,
-            "double-clicking a three-colour mix does not fall back to two spools",
+            "selecting a three-colour mix does not fall back to two spools",
         )
         check(
             triple_window._detail.colour() is triple_only,
-            "double-clicking a three-colour mix keeps it in the detail panel",
+            "selecting a three-colour mix keeps it in the detail panel",
         )
         # The bottom line carries the table's own explanation, never a one-line
         # recipe that could only ever name the first two spools.
         check(
             "配比" in triple_window._status.text(),
             f"the bottom line is the table note, got {triple_window._status.text()!r}",
+        )
+    # The double-click jump was removed entirely: activating a TWO-colour mix must
+    # not narrow the grid to that pair either.  The pair filter now has exactly one
+    # entry point, the 「只看这一对耗材的全部混色」 button in the detail panel.
+    pair_cell = None
+    for position in range(len(combined_store)):
+        found = combined_store[position]
+        if getattr(found, "recipes", None) and combined_store.pair_colour_at(position) is not None:
+            pair_cell = found
+            break
+    check(pair_cell is not None, "the combined table holds a two-colour mix to test with")
+    if pair_cell is not None:
+        triple_window._pair_filter = None
+        triple_window._on_grid_selected(pair_cell)
+        app.processEvents()
+        check(
+            triple_window._pair_filter is None,
+            "activating a two-colour mix no longer filters the grid to its pair",
+        )
+        check(
+            triple_window._detail.colour() is pair_cell,
+            "activating a two-colour mix keeps it in the detail panel",
         )
     # Issue 4: the right-hand pane could not be dragged — it snapped.  A QLabel
     # holding the ~1400 px one-line note had no word wrap, and a non-wrapping
