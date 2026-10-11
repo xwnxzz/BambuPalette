@@ -104,7 +104,6 @@ class MixDetail(QWidget):
         title.setProperty("role", "sectionTitle")
 
         self._copy = QPushButton("复制配方", self)
-        self._copy.setToolTip("把「两种耗材 + 比例 + 预测颜色」复制到剪贴板，方便在 Bambu Studio 里配色")
         self._copy.clicked.connect(self._on_copy)
         self._copy.setEnabled(False)
 
@@ -188,7 +187,6 @@ class MixDetail(QWidget):
             )
 
         self._bar = PairBar(self)
-        self._bar.setToolTip("左端 = 第一种耗材 100%，右端 = 第二种耗材 100%；白线是当前比例")
 
         # 「颜色详情里有合成这个颜色的所有配方」: one distinct colour can be reached by
         # several spool pairs and several ratios, so the panel lists them all
@@ -206,7 +204,6 @@ class MixDetail(QWidget):
         self._formula_rows: list[dict] = []
 
         self._pair_button = QPushButton("只看这一对耗材的全部混色", self)
-        self._pair_button.setToolTip("把中间网格缩小到这两种耗材的 81 个配比")
         self._pair_button.clicked.connect(self._on_pair)
         self._steps = QLabel("", self)
         self._steps.setProperty("role", "hint")
@@ -340,7 +337,6 @@ class MixDetail(QWidget):
             line = _recipe_line(self._library, recipe)
             row["text"].setText(line)
             row["key"].setText(recipe.key)
-            row["frame"].setToolTip(f"{line}\n{recipe.color_hex}")
         for row in self._formula_rows[len(shown):]:
             row["frame"].setVisible(False)
 
@@ -423,14 +419,15 @@ class MixDetail(QWidget):
                 row["percent"].setText(f"{percent}%")
                 continue
             row["swatch"].setValue(filament.color_hex)
-            detail = " · ".join(p for p in (filament.brand, filament.material_type) if p)
+            # 品牌 / 种类 / 备注都写在这一行里：以前它们只活在悬停弹窗上，而悬停
+            # 弹窗已经去掉了。
+            pieces = [p for p in (filament.brand, filament.material_type) if p]
+            if filament.note:
+                pieces.append(f"备注：{filament.note}")
+            detail = " · ".join(pieces)
             row["name"].setText(filament.display_name)
             row["detail"].setText(detail if detail and detail != filament.display_name else "")
             row["percent"].setText(f"{percent}%\n{filament.color_hex}")
-            row["frame"].setToolTip(
-                f"{filament.display_name}\n{filament.color_hex}"
-                + (f"\n备注：{filament.note}" if filament.note else "")
-            )
 
         # The 0→100 % bar only means something for a pair of spools.
         three = len(parents) > 2
@@ -491,14 +488,13 @@ class MixDetail(QWidget):
         row = self._rows[0]
         row["frame"].setVisible(True)
         row["swatch"].setValue(filament.color_hex)
-        detail = " · ".join(p for p in (filament.brand, filament.material_type) if p)
+        pieces = [p for p in (filament.brand, filament.material_type) if p]
+        if filament.note:
+            pieces.append(f"备注：{filament.note}")
+        detail = " · ".join(pieces)
         row["name"].setText(filament.display_name)
         row["detail"].setText(detail if detail and detail != filament.display_name else "")
         row["percent"].setText(f"100%\n{filament.color_hex}")
-        row["frame"].setToolTip(
-            f"{filament.display_name}\n{filament.color_hex}"
-            + (f"\n备注：{filament.note}" if filament.note else "")
-        )
         # EVERY other row has to go, not just the second one.  A three-colour
         # recipe fills all three, and hiding only row 2 left row 3 on screen
         # still showing 「耗材丝3 … 12%」 from whatever was selected before —
@@ -529,11 +525,6 @@ class MixDetail(QWidget):
         self._pair_filtered = active
         self._pair_button.setText(
             "显示全部颜色" if active else "只看这一对耗材的全部混色"
-        )
-        self._pair_button.setToolTip(
-            "取消筛选，回到全部颜色"
-            if active
-            else "把中间网格缩小到这两种耗材的 81 个配比"
         )
         self._pair_button.setProperty("accent", "true" if active else "false")
         self._pair_button.style().unpolish(self._pair_button)

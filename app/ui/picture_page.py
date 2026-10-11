@@ -84,6 +84,23 @@ DRAG_SLOP = 3.0
 #: The two picture panels are panned and zoomed the same way.
 ZOOM_HINT = "滚轮缩放，按住左键拖动平移，双击还原成整张。"
 
+#: 图片匹配默认值。颜色数量直接顶到 Bambu Studio 的天花板：混色就是为了用少数
+#: 几卷料凑出一整张图，用户既然在用混色，就没有理由再自己往回缩。
+DEFAULT_MAX_COLOURS = MAX_PAINTED_FILAMENTS
+#: 一次打印最常用的卷数（AMS 四槽）。0 才是「不限」，默认值必须是真数字。
+DEFAULT_SPOOL_CAP = 4
+
+#: The one always-visible line under the toolbar.  It replaces the hover
+#: tooltips this page used to carry: a black pop-up that covered the picture was
+#: worse than no explanation at all, so the two facts a user cannot guess (the
+#: 32-colour ceiling and what 0 means) and the two gestures live here instead.
+PAGE_HINT = (
+    f"{ZOOM_HINT}\n"
+    f"颜色数量最多 {MAX_PAINTED_FILAMENTS} 是 Bambu Studio 自己的限制：一个工程里只认 "
+    f"{MAX_PAINTED_FILAMENTS} 个耗材位，第 {MAX_PAINTED_FILAMENTS + 1} 种颜色在切片时会被"
+    "丢掉（我们已经就这条限制向拓竹提了工单）。耗材上限 0 表示不限制；带透明区域的图片不能用抖动。"
+)
+
 
 def _to_qimage(image: Image.Image) -> QImage:
     """PIL image → QImage, copying so the buffer outlives the PIL object."""
@@ -129,7 +146,6 @@ class PictureView(QWidget):
         self._press_pos: QPointF | None = None
         self._last_pos: QPointF | None = None
         self._dragged = False
-        self.setToolTip(ZOOM_HINT)
 
     # -- contents ---------------------------------------------------------
     def setResult(self, result: MatchResult | None, source: QImage | None) -> None:
@@ -783,13 +799,11 @@ class PicturePage(QWidget):
         # Set when the library changed while this page was off screen; the
         # re-match is then done in showEvent instead of in setLibrary.
         self._stale = False
-        # Cache for _candidate_palette: the 全部颜色 list and the checkbox flag
-        # it was built for.
+        # Cache for _candidate_palette: the 全部颜色 list, dropped by setLibrary.
         self._candidates: list[PaletteEntry] | None = None
-        self._candidates_for: bool | None = None
         #: The three-filament catalogue, pushed in by the main window whenever it
-        #: is (re)built.  ``None`` means 「not ready」, which is why the
-        #: 「也算三色配方」 box stays greyed out until it arrives.
+        #: is (re)built.  ``None`` means 「not ready」: matching then runs on the
+        #: two-filament palette alone, and picks up the triples when they land.
         self._triples = None
         self._triple_palette = None
         #: The head list ``_triple_palette`` was built from, so the cache can be
@@ -808,37 +822,13 @@ class PicturePage(QWidget):
         self._rematch_button = QPushButton("重新匹配")
         self._rematch_button.clicked.connect(self._on_rematch)
 
-        self._include_mixes = QCheckBox("混色也算候选")
-        self._include_mixes.setChecked(True)
-        self._include_mixes.setToolTip("勾选后，候选颜色包含全部两两混色的 81 个配比")
-
-        # Three-filament mixes are the same idea one step further, and the reason
-        # this box starts greyed out is honest: they only exist once the
-        # 「颜色配方」 page has finished computing them.
-        self._include_triples = QCheckBox("也算三色配方")
-        self._include_triples.setToolTip(
-            "勾选后，候选颜色再算上三种耗材的混色。它比两两混色多得多"
-            "（41 卷料约 400 万种），匹配会慢几秒；三色配方要先在「颜色配方」页算完。"
-        )
-        self._include_triples.setEnabled(False)
-
         self._colour_count = QSpinBox()
         self._colour_count.setRange(2, MAX_PAINTED_FILAMENTS)
-        self._colour_count.setValue(12)
-        self._colour_count.setToolTip(
-            f"图片最多用多少种颜色；越少越省换料。\n"
-            f"上限 {MAX_PAINTED_FILAMENTS} 是 Bambu Studio 自己的限制：一个工程里只认 "
-            f"{MAX_PAINTED_FILAMENTS} 个耗材位，第 {MAX_PAINTED_FILAMENTS + 1} 种颜色在"
-            "切片时会被丢掉。我们已经就这条限制向拓竹提了工单；等它放开，这里才能跟着放开。"
-        )
+        self._colour_count.setValue(DEFAULT_MAX_COLOURS)
 
         self._spool_cap = QSpinBox()
         self._spool_cap.setRange(0, MAX_PAINTED_FILAMENTS)
-        self._spool_cap.setValue(0)
-        self._spool_cap.setToolTip(
-            "这个模型最多用几卷耗材；0 表示不限制。装不下的颜色会用最接近的、"
-            "只用得起的颜色代替。"
-        )
+        self._spool_cap.setValue(DEFAULT_SPOOL_CAP)
 
         self._max_dimension = QSpinBox()
         self._max_dimension.setRange(32, 4096)
@@ -847,7 +837,6 @@ class PicturePage(QWidget):
         self._max_dimension.setSuffix(" px")
 
         self._dither = QCheckBox("抖动")
-        self._dither.setToolTip("用误差扩散让渐变更平滑，但会牺牲色块的纯净度")
 
         top = QHBoxLayout()
         top.setSpacing(8)
@@ -858,8 +847,6 @@ class PicturePage(QWidget):
         top.addWidget(self._spool_cap)
         top.addWidget(QLabel("最大边长:"))
         top.addWidget(self._max_dimension)
-        top.addWidget(self._include_mixes)
-        top.addWidget(self._include_triples)
         top.addWidget(self._dither)
         top.addWidget(self._rematch_button)
         top.addStretch(1)
@@ -883,7 +870,6 @@ class PicturePage(QWidget):
         self._colour_spin.setSuffix(" mm")
 
         self._base_combo = QComboBox()
-        self._base_combo.setToolTip("底板用哪种颜色的耗材打印；默认用占比最大的颜色")
 
         self._export_3mf = QPushButton("生成 3MF（Bambu Studio）")
         self._export_3mf.setProperty("accent", "true")
@@ -925,16 +911,15 @@ class PicturePage(QWidget):
         # 「删除 / 合并 / 更换颜色 / 撤销 / 恢复」 sit in ONE row right under the
         # colour list, in that order: the first three all act on the selection
         # in the list, and the last two act on whatever those three did.
+        #
+        # None of them carries a hover tooltip any more: the black pop-up they
+        # raised covered the very picture the user was working on.  What each
+        # button does is said in the bottom line the moment it matters (a delete
+        # announces that those pixels are left blank, and so on).
         self._delete_button = QPushButton("删除")
-        self._delete_button.setToolTip(
-            "删掉选中的颜色：这些地方留空、变成透明，不打底板也不打印。可以多选。"
-        )
         self._delete_button.clicked.connect(self._on_delete_colours)
 
         self._merge_button = QPushButton("合并")
-        self._merge_button.setToolTip(
-            "把选中的几种颜色并成一种，并成哪一种由你在弹窗里挑。至少要选两种。"
-        )
         self._merge_button.clicked.connect(self._on_merge_colours)
 
         self._replace_button = QPushButton("更换颜色…")
@@ -942,25 +927,16 @@ class PicturePage(QWidget):
         # it: these five are all plain actions on the selection, and the only
         # blue button on this page is 生成 3MF, which is the one that finishes
         # the job.  A blue 更换颜色 read as "this is the important one".
-        self._replace_button.setToolTip(
-            "从「全部颜色」里另选一个颜色替换选中的这个色块（撤销可以退回来）"
-        )
         self._replace_button.clicked.connect(self._on_replace)
 
         self._multi_button = QPushButton("多选")
         self._multi_button.setCheckable(True)
-        self._multi_button.setToolTip(
-            "打开后，单击就是把颜色加进选择、再单击取消这一种，不用按住 Ctrl；"
-            "关掉就回到「一次只选一种」。打开时按钮会变成蓝色。"
-        )
         self._multi_button.toggled.connect(self._on_multi_toggled)
 
         self._undo_button = QPushButton("撤销")
-        self._undo_button.setToolTip("撤销上一步：删除、合并或更换颜色（Ctrl+Z）")
         self._undo_button.clicked.connect(self._undo)
 
         self._redo_button = QPushButton("恢复")
-        self._redo_button.setToolTip("把撤销掉的一步再做回来（Ctrl+Y）")
         self._redo_button.clicked.connect(self._redo)
 
         actions = QHBoxLayout()
@@ -1012,16 +988,13 @@ class PicturePage(QWidget):
         right.setSizes([420, 340])
 
         pictures = QSplitter(Qt.Orientation.Horizontal)
-        # 原图 and 预览 both zoom and pan with the same gesture, so the hint goes
-        # on the whole panel — picture, scroll area and title — and not just on the
-        # canvas, where a zoomed-in picture would cover it.
+        # 原图 and 预览 both zoom and pan with the same gesture; the hint is a
+        # permanent line under the toolbar now, not a tooltip on the canvas
+        # (which covered the picture the user was looking at).
         original_area = _scrollable(self._original_view)
         preview_area = _scrollable(self._view)
-        for area in (original_area, preview_area):
-            area.setToolTip(ZOOM_HINT)
-            area.viewport().setToolTip(ZOOM_HINT)
-        pictures.addWidget(self._wrap(original_area, "原图", ZOOM_HINT))
-        pictures.addWidget(self._wrap(preview_area, "预览", ZOOM_HINT))
+        pictures.addWidget(self._wrap(original_area, "原图"))
+        pictures.addWidget(self._wrap(preview_area, "预览"))
         # 预览 is the one the user works in, so it gets the extra room.
         pictures.setStretchFactor(0, 1)
         pictures.setStretchFactor(1, 1)
@@ -1038,22 +1011,26 @@ class PicturePage(QWidget):
         self._status.setProperty("role", "hint")
         self._status.setWordWrap(True)
 
+        # The always-visible explanation line.  It never changes, so it is a
+        # plain label rather than something the code rewrites.
+        self._page_hint = QLabel(PAGE_HINT)
+        self._page_hint.setProperty("role", "hint")
+        self._page_hint.setWordWrap(True)
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
         layout.addLayout(top)
+        layout.addWidget(self._page_hint)
         layout.addWidget(splitter, 1)
         layout.addWidget(self._status)
         layout.addLayout(bottom)
 
-    def _wrap(self, widget: QWidget, title: str, hint: str = "") -> QWidget:
+    def _wrap(self, widget: QWidget, title: str) -> QWidget:
         frame = QFrame()
         frame.setObjectName("panel")
         header = QLabel(title)
         header.setProperty("role", "sectionTitle")
-        if hint:
-            header.setToolTip(hint)
-            frame.setToolTip(hint)
         box = QVBoxLayout(frame)
         box.setContentsMargins(10, 8, 10, 10)
         box.setSpacing(8)
@@ -1095,18 +1072,14 @@ class PicturePage(QWidget):
     def setTriples(self, triples, library: FilamentLibrary | None = None) -> None:
         """Hand over the three-filament catalogue once it exists.
 
-        The box that offers them starts greyed out and the tooltip says why; it
-        only lights up when there is something behind it.  Unchecking on the way
-        in matters when the catalogue is replaced (a spool was hidden or added):
-        the old palette is dropped either way, because a three-filament colour is
+        ``None`` means 「not ready yet」 (an unfinished catalogue has no ``packed``
+        array), and the page then matches against 耗材本色 + 两色混色 only.  The
+        old palette is dropped either way, because a three-filament colour is
         only valid for the spool set it was computed from.
         """
         self._triples = triples
         self._triple_palette = None
         self._triple_head = None
-        self._include_triples.setEnabled(triples is not None)
-        if triples is None:
-            self._include_triples.setChecked(False)
         if library is not None:
             self._library = library
 
@@ -1153,7 +1126,7 @@ class PicturePage(QWidget):
         拆成「有颜色的像素」和「透明像素」两部分，有颜色的那部分被挤成一整行交给量化器，
         那一行上没有任何有意义的邻居关系，扩散出去只会是噪点。所以
         ``reduce_colours()`` 在 ``keep is not None`` 时直接忽略这个开关；与其让用户勾了
-        没反应，不如直接灰掉并且说清楚。
+        没反应，不如直接灰掉，并且把原因写在上面的常显提示行里。
         """
         threshold = self._settings().alpha_threshold
         blocked = False
@@ -1161,12 +1134,6 @@ class PicturePage(QWidget):
             alpha = np.asarray(self._image.getchannel("A"), dtype=np.uint8)
             blocked = bool((alpha <= threshold).any())
         self._dither.setEnabled(not blocked)
-        self._dither.setToolTip(
-            "这张图有透明区域，抖动对它不生效：有颜色的像素会被挤成一行再量化，"
-            "那一行上邻居关系没有意义，误差扩散只会变成噪点。"
-            if blocked
-            else "用误差扩散让渐变更平滑，但会牺牲色块的纯净度"
-        )
 
     def _on_import(self) -> None:
         start = str(paths.projects_dir())
@@ -1187,28 +1154,30 @@ class PicturePage(QWidget):
         ).clamped()
 
     def _candidate_palette(self) -> list[PaletteEntry]:
-        """The full 全部颜色 list, built once per library / checkbox state.
+        """The full 全部颜色 list, built once per library.
 
         At 41 spools this is 66,461 ``PaletteEntry`` objects and ~0.5 s to
         build.  It is needed both by the match and by the 「更换颜色…」 menu, and
         that menu is opened once per colour the user swaps — so rebuilding it
-        every time was pure waste.  ``setLibrary`` drops the cache, and the
-        checkbox flag is part of the key, so it can never go stale.
+        every time was pure waste.  ``setLibrary`` drops the cache.
+
+        Mixes are always in it.  There used to be a 「混色也算候选」 box; a spool
+        library without its 81-ratio mixes is not a smaller answer, it is half
+        the palette, so that choice was never a real one.
         """
-        wanted = bool(self._include_mixes.isChecked())
-        if self._candidates is None or self._candidates_for != wanted:
-            self._candidates = build_palette(self._library, self._catalog, include_mixes=wanted)
-            self._candidates_for = wanted
+        if self._candidates is None:
+            self._candidates = build_palette(self._library, self._catalog, include_mixes=True)
         return self._candidates
 
     def _match_palette(self) -> Sequence[PaletteEntry]:
-        """What the matcher is allowed to pick from.
+        """What the matcher picks from: 耗材本色 + 两色 + 三色混色.
 
-        Without three-filament mixes this is simply ``_candidate_palette()``.
-        With them it is that same list plus a lazy tail over the triple
-        catalogue: four million colours cannot be built as objects, so only the
-        few the picture actually keeps ever become one.  The head still wins its
-        ties, which is why the tail skips colours the head already offers.
+        Three-filament colours are handed in by the main window once the table
+        behind them is finished, and they always take part — the box that used
+        to gate them is gone.  Four million colours cannot be built as objects,
+        so the triple catalogue contributes a lazy tail: only the few the
+        picture actually keeps ever become one.  The head still wins its ties,
+        which is why the tail skips colours the head already offers.
 
         The cache is keyed on the head *list* we handed over, not on
         ``pool.head``: ``TriplePalette`` copies what it is given, so comparing
@@ -1216,7 +1185,7 @@ class PicturePage(QWidget):
         membership test — on every single match.
         """
         head = self._candidate_palette()
-        if not self._include_triples.isChecked() or self._triples is None:
+        if self._triples is None:
             return head
         if self._triple_palette is None or self._triple_head is not head:
             self._triple_palette = TriplePalette(head, self._triples, self._library)

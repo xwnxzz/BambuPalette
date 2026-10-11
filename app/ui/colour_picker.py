@@ -342,7 +342,6 @@ class ColourPickerDialog(QDialog):
         self._sort.setCurrentIndex(
             self._sort.findData(SORT_SIMILARITY) if self._sort.findData(SORT_SIMILARITY) >= 0 else 0
         )
-        self._sort.setToolTip("和「颜色配方」页一样的排序方式，外加按跟图片目标颜色最相似排序")
         self._sort.currentIndexChanged.connect(lambda *_: self._rebuild())
 
         self._search = QLineEdit()
@@ -495,9 +494,6 @@ class ColourPickerDialog(QDialog):
         item = QListWidgetItem(
             swatch_pixmap(entry.color_hex, 22),
             f"{entry.color_hex}   ΔE00 {difference:5.2f}   {entry_short_label(entry, self._library)}",
-        )
-        item.setToolTip(
-            f"{entry_short_label(entry, self._library)}\n{entry_recipe_text(entry, self._library)}"
         )
         return item
 

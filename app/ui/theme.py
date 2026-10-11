@@ -354,14 +354,6 @@ QSplitter::handle:horizontal {{
 QSplitter::handle:hover {{
     background: {BORDER};
 }}
-QToolTip {{
-    background: {TEXT};
-    color: {PANEL};
-    border: none;
-    padding: 6px 9px;
-    border-radius: {RADIUS_INPUT};
-    font-size: 12px;
-}}
 
 /* ------------------------------------------------------------------ labels */
 QLabel[role="sectionTitle"] {{

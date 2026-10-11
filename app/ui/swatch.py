@@ -263,10 +263,18 @@ class ColorField(QWidget):
             if colour is None:
                 self._hex.clear()
                 for spin in self._spins:
+                    # 未选择时三个数字框显示空白而不是 0：0,0,0 会被当成「预设
+                    # 的黑色」，而这正是不该预设的东西。数字值仍然是 0，用户一
+                    # 碰箭头/输入就恢复成普通显示（见 _on_spin）。
+                    spin.setSpecialValueText(" ")
                     spin.setValue(0)
             else:
                 self._hex.setText(colour.name().upper())
-                for spin, channel in zip(self._spins, (colour.red(), colour.green(), colour.blue())):
+                channels = (colour.red(), colour.green(), colour.blue())
+                for spin, channel in zip(self._spins, channels):
+                    # 恢复成普通显示：纯黑 #000000 的三个通道都是 0，最小值那里
+                    # 必须重新显示 "0"，不能留成空白。
+                    spin.setSpecialValueText("0")
                     spin.setValue(channel)
             self._swatch.setValue(None if colour is None else colour)
         finally:

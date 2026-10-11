@@ -33,7 +33,6 @@ class FilamentDialog(QDialog):
         self.setModal(True)
 
         self._name = QLineEdit(self)
-        self._name.setPlaceholderText("可选，例如「大简 PETG HF 金色」")
 
         self._brand = QComboBox(self)
         self._brand.setEditable(True)
@@ -84,9 +83,6 @@ class FilamentDialog(QDialog):
         self._ok_button.setDefault(True)
         self._cancel_button = QPushButton("取消", self)
         self._next_button = QPushButton("下一个", self)
-        self._next_button.setToolTip(
-            "先保存这一卷，然后清空表单接着加下一卷——不用关掉窗口再点一次「添加耗材」"
-        )
         button_row = QHBoxLayout()
         button_row.setContentsMargins(0, 0, 0, 0)
         button_row.setSpacing(8)
@@ -131,27 +127,31 @@ class FilamentDialog(QDialog):
         self._update_hint()
 
     def _resolved_hex(self) -> str:
-        """The colour this dialog means right now.
+        """The colour this dialog means right now — and nothing when none was given.
 
-        The three spin boxes start at 0 / 0 / 0 and the user reasonably reads
-        that as the colour they are about to add, so typing nothing at all and
-        pressing 「确认」 has to work and has to mean black.  The hex box stays
-        authoritative whenever it holds something.
+        There used to be a fallback: with the hex box untouched, the three spin
+        boxes (0 / 0 / 0) were read as the answer, so a spool could be saved
+        without the user ever choosing a colour, and it was black.  That is a
+        preset colour nobody asked for.  The hex box is now the only source:
+        ``ColorField`` fills it as soon as the user types a hex value, picks a
+        suggested one or touches any spin box, and leaves it empty otherwise.
         """
-        typed = self._color.hex()
-        if not is_unset(typed):
-            return typed
-        return _color.rgb_to_hex(self._color.rgb())
+        return self._color.hex()
 
     def _update_hint(self) -> None:
-        self._ok_button.setEnabled(True)
+        """Say what is still missing, and keep 确认 shut until nothing is.
+
+        The dialog must not be able to produce a spool with a colour the user
+        never chose, so both save buttons stay grey until ``_resolved_hex()``
+        has something to return.
+        """
         if not self._color.isSet():
-            r, g, b = self._color.rgb()
-            self._hint.setText(
-                "请填写颜色：可以直接输入 #RRGGBB，也可以填 R / G / B 三个数字。\n"
-                f"什么都没填就按三个数字框里的值算，现在是 RGB {r}, {g}, {b}。"
-            )
+            self._hint.setText("请填写颜色：可以直接输入 #RRGGBB，也可以填 R / G / B 三个数字。")
+            self._ok_button.setEnabled(False)
+            self._next_button.setEnabled(False)
             return
+        self._ok_button.setEnabled(True)
+        self._next_button.setEnabled(True)
         r, g, b = _color.hex_to_rgb(self._color.hex())
         lab = _color.lab_from_rgb((r, g, b))
         self._hint.setText(

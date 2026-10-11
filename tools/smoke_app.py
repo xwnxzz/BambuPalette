@@ -104,6 +104,10 @@ class _StubMessageBox:
     def warning(*args, **kwargs) -> int:  # noqa: D102
         return 0
 
+    @staticmethod
+    def information(*args, **kwargs) -> int:  # noqa: D102
+        return 0
+
 
 def _make_sample(target: Path) -> None:
     """A small picture with flat colour fields and one soft gradient."""
@@ -638,9 +642,15 @@ def main() -> int:
         triple_window._detail._title.text() == "颜色配方",
         f"the right-hand panel is 颜色配方, got {triple_window._detail._title.text()!r}",
     )
+    # The hover pop-ups are gone on purpose (the black box the user asked to
+    # delete), so nothing on this window may carry a tooltip any more.
     check(
-        "颜色配方" in triple_window._target_color.toolTip(),
-        "the target colour tooltip says 颜色配方 too",
+        triple_window._target_color.toolTip() == "",
+        "the target colour has no tooltip any more",
+    )
+    check(
+        triple_window._find_button.toolTip() == "",
+        "找最接近的颜色 has no tooltip any more",
     )
 
     # The version has to be readable without opening 关于: it is the same string
@@ -851,6 +861,82 @@ def main() -> int:
             "the adopted table has exactly as many colours as the one that built it",
         )
         fresh.close()
+
+        # --- item 3 end to end: importing an archive that carries its own mixes -
+        # m00041 item 3: 「导入文件中包含了混色，却提示说还在计算，而且我的鼠标一直在
+        # 转圈」.  The old _on_import started the three-filament build first and only
+        # then noticed the sidecar, so the timer kept stepping a catalogue with no
+        # working array while the wait cursor was never handed back.  This drives
+        # the real import action, not _adopt_mix_sidecar.
+        import app.ui.main_window as _mw  # noqa: E402
+        from PySide6.QtWidgets import QApplication as _QApp  # noqa: E402
+
+        from app.core import paths as _paths  # noqa: E402
+
+        library.save(archive)
+        # A cache directory of its own: the file this run already wrote for these
+        # five spools would otherwise answer from the ordinary cache path and the
+        # guard under test would never be asked anything.
+        scratch = sidecar_dir / "import-scratch"
+        (scratch / "cache").mkdir(parents=True, exist_ok=True)
+        saved_data_dir = _paths.data_dir
+        saved_chooser = _mw.QFileDialog
+        saved_box = _mw.QMessageBox
+        _paths.data_dir = lambda: scratch  # type: ignore[assignment]
+        _mw.QFileDialog = _StubChooser(archive)
+        _mw.QMessageBox = _StubMessageBox
+        importer = MainWindow(library=_Library())
+        try:
+            importer._on_import()
+            check(
+                importer._triples is not None and importer._triples.built,
+                "importing an archive with a cache lands with the mixes ready",
+            )
+            check(
+                importer._triple_timer is None,
+                "the three-filament timer is not left stepping a table with no workspace",
+            )
+            check(
+                not importer._build_notice,
+                "an import that brings its own cache leaves no build notice behind",
+            )
+            check(
+                _QApp.overrideCursor() is None,
+                "the wait cursor is handed back once the imported cache is in",
+            )
+            check(
+                importer._pending_sidecar is None,
+                "the pending sidecar is cleared after it has been used",
+            )
+            check(
+                "正在计算三色混色" not in importer._status.text(),
+                f"the status line does not claim to be computing, got {importer._status.text()!r}",
+            )
+
+            # Positive control: the same archive with no cache beside it must
+            # really start the build, otherwise those checks pass for free.
+            plain_scratch = sidecar_dir / "import-scratch-plain"
+            (plain_scratch / "cache").mkdir(parents=True, exist_ok=True)
+            _paths.data_dir = lambda: plain_scratch  # type: ignore[assignment]
+            no_cache = sidecar_dir / "no-cache.json"
+            no_cache.write_bytes(archive.read_bytes())
+            _mw.QFileDialog = _StubChooser(no_cache)
+            plain = MainWindow(library=_Library())
+            try:
+                plain._on_import()
+                check(
+                    plain._triple_timer is not None,
+                    "without a cache beside it the import does start the three-filament build",
+                )
+            finally:
+                plain._stop_triple_timer()
+                plain._end_build_notice()
+                plain.close()
+        finally:
+            _paths.data_dir = saved_data_dir  # type: ignore[assignment]
+            _mw.QFileDialog = saved_chooser
+            _mw.QMessageBox = saved_box
+            importer.close()
     triple_window.close()
 
     # --- blank space clears the selection; nothing is ever dimmed --------------
@@ -1028,20 +1114,61 @@ def main() -> int:
 
     add_dialog = FilamentDialog(None, [f.brand for f in library.filaments], [], window)
     check(not add_dialog._color.isSet(), "添加耗材 starts with NO preset colour")
-    # m08102 item 1: the three R/G/B spins start at 0, the user reads that as the
-    # colour, so 确认 must work straight away and mean black — not sit disabled.
+    # m01647 item 1 (「不要预设颜色」): an untouched dialog means NO colour at all.
+    # It used to mean black — the three spins read 0,0,0, so pressing 确认 gave the
+    # user a black spool they never chose, and the hint advertised that default.
     check(
-        add_dialog.values()["color_hex"] == "#000000",
-        f"an untouched dialog means RGB 0,0,0, got {add_dialog.values()['color_hex']!r}",
+        add_dialog.values()["color_hex"] == "",
+        f"an untouched dialog carries no colour, got {add_dialog.values()['color_hex']!r}",
     )
-    check(add_dialog._ok_button.isEnabled(), "确认 works immediately on the default RGB 0,0,0")
+    check(
+        not add_dialog._ok_button.isEnabled(),
+        "确认 is grey until the user gives a colour",
+    )
+    check(
+        not add_dialog._next_button.isEnabled(),
+        "下一个 is grey until the user gives a colour",
+    )
+    check(
+        "0, 0, 0" not in add_dialog._hint.text(),
+        f"the hint no longer advertises a default colour, got {add_dialog._hint.text()!r}",
+    )
+    # The spins show blank while nothing is set, so 0/0/0 cannot read as a preset.
+    from PySide6.QtWidgets import QSpinBox as _Spin
+
+    check(
+        [spin.text() for spin in add_dialog._color.findChildren(_Spin)] == [" ", " ", " "],
+        "the RGB boxes show blanks before the user touches them",
+    )
     add_dialog._color.setValue("#C8342E")
-    check(add_dialog._ok_button.isEnabled(), "确认 stays enabled once the user enters a colour")
+    check(add_dialog._ok_button.isEnabled(), "确认 comes alive once the user enters a colour")
+    check(add_dialog._next_button.isEnabled(), "下一个 comes alive too")
     check(add_dialog.values()["color_hex"] == "#C8342E", "the typed colour is what the spool gets")
+    check(
+        [spin.text() for spin in add_dialog._color.findChildren(_Spin)] == ["200", "52", "46"],
+        "the RGB boxes show the chosen colour",
+    )
+    # A colour whose channels are 0 must still print "0", not a blank.
+    add_dialog._color.setValue("#000000")
+    check(
+        [spin.text() for spin in add_dialog._color.findChildren(_Spin)] == ["0", "0", "0"],
+        "pure black still shows 0 in every channel",
+    )
+    add_dialog._color.setValue("#C8342E")
     # The colour is entered on the panel itself — there is no colour-picker dialog.
     check(
         add_dialog._color.findChild(QSpinBox) is not None,
         "the colour field offers R / G / B spin boxes",
+    )
+    # 名称 has no example placeholder any more (m01647 item 7).
+    check(
+        add_dialog._name.placeholderText() == "",
+        f"名称 carries no example text, got {add_dialog._name.placeholderText()!r}",
+    )
+    # No hover pop-ups anywhere in this dialog (m01647 item 4).
+    check(
+        add_dialog._next_button.toolTip() == "" and add_dialog._name.toolTip() == "",
+        "the add dialog has no tooltips left",
     )
     # m10238 item 3: 下一个 saves this spool and reopens an empty form, so adding
     # ten spools is ten dialogs deep, not one dialog and nine trips to 添加耗材.
@@ -1513,21 +1640,14 @@ def main() -> int:
                 {candidate.key for candidate in cached} == {candidate.key for candidate in entries},
                 "the cached list is exactly the replacement menu's candidates",
             )
-            page._include_mixes.setChecked(False)
-            without_mixes = page._candidate_palette()
+            # 「混色也算候选」 used to sit here: ticking it off built a smaller
+            # list, so the cache had to key on it.  The box is gone — a spool
+            # library without its mixes is half a palette — so the list is
+            # always the full one and the cache is keyed on nothing but the
+            # library itself.
             check(
-                without_mixes is not cached and len(without_mixes) < len(cached),
-                "turning mixes off builds a smaller candidate list",
-            )
-            check(
-                page._candidate_palette() is without_mixes,
-                "and that smaller list is cached too",
-            )
-            page._include_mixes.setChecked(True)
-            check(
-                page._candidate_palette() is not cached
-                and len(page._candidate_palette()) == len(cached),
-                "turning mixes back on rebuilds the full list",
+                page._candidate_palette() is cached,
+                "the candidate list stays cached; it has no checkbox to invalidate it",
             )
             picker = ColourPickerDialog(
                 entries,

@@ -123,6 +123,9 @@ class MainWindow(QMainWindow):
         # 确定的网格内容，可以把它关掉。
         self._auto_triples = auto_triples
         self._build_notice = False
+        # 导入一份「档案 + 混色表」时，档案旁边那份表的路径先记在这儿，让重建
+        # 耗材库的那一步别急着开始算（见 _on_import / _ensure_triples）。
+        self._pending_sidecar = None
 
         # The version rides in the title bar so 「我装的是哪一版」 never needs a trip
         # through Explorer → 属性.  It is the same string the exe's file properties
@@ -146,7 +149,7 @@ class MainWindow(QMainWindow):
     def _build_ui(self) -> None:
         title = QLabel("BambuPalette")
         title.setStyleSheet(f"font-size: 14px; font-weight: 650; color: {theme.TEXT};")
-        subtitle = QLabel("混色耗材色彩管理器 · 每两种耗材 81 个配比")
+        subtitle = QLabel("混色耗材色彩管理器 · 每两种耗材 81 个混色，每三种耗材 2556 个混色")
         subtitle.setProperty("role", "hint")
 
         head = QVBoxLayout()
@@ -178,14 +181,6 @@ class MainWindow(QMainWindow):
         if index < 0:
             index = self._engine_combo.findData(DEFAULT_ENGINE)
         self._engine_combo.setCurrentIndex(max(0, index))
-        self._engine_combo.setToolTip(
-            "Bambu 混色预览（默认）：与 Bambu Studio 2.8（02.08.x）「添加混色耗材」"
-            "对话框一致，用的是 Bambu 内置的 filament_mixer 颜料混色多项式。\n"
-            "Bambu 2.5 旧版预览：2.5.x 及更早用的是 8 位 sRGB 加权平均，"
-            "如果你的 Studio 还是旧版，选这一项才对得上。\n"
-            "光谱 KM 模型：用 Kubelka-Munk 光谱混合预测，更接近真实打印，但与 Studio 的预览值不同。\n"
-            "选择会被记住，下次启动保持不变。"
-        )
         self._engine_combo.currentIndexChanged.connect(self._on_engine_changed)
 
         self._sort_combo = QComboBox()
@@ -205,20 +200,12 @@ class MainWindow(QMainWindow):
         # Deliberately UNSET: the target is whatever the user wants to print, so
         # showing a made-up colour here would be a lie until they fill one in.
         self._target_color = ColorField()
-        self._target_color.setToolTip(
-            "想打印出来的目标颜色：直接输入 #RRGGBB，或者填 R / G / B 三个数字，"
-            "程序会找出最接近的颜色配方"
-        )
-        self._target_color.colorChanged.connect(self._on_target_color_changed)
         self._find_button = QPushButton("找最接近的颜色")
-        self._find_button.setToolTip(
-            "不用先填目标颜色也能按：没填就拿颜色表里选中的那个颜色来比，"
-            "表里也没选就拿 R / G / B 三个数字框里的值。"
-            "程序按 CIEDE2000 在当前显示的全部颜色里找出最接近的一个"
-        )
         # Deliberately always clickable — exactly like 确认 in the 添加耗材 dialog.
         # Pressing it before choosing a colour is not an error: it borrows the
         # colour the user is already looking at and says so in the bottom line.
+        # It is also the only place that answers 「用的是哪个颜色」, which is why the
+        # answer goes into the status line instead of a hover pop-up.
         self._find_button.clicked.connect(self._on_find_nearest)
 
         controls = QHBoxLayout()
@@ -360,10 +347,8 @@ class MainWindow(QMainWindow):
         self._delete_button = QPushButton("删除")
         self._delete_button.clicked.connect(self._on_delete)
         self._import_button = QPushButton("导入")
-        self._import_button.setToolTip("从 JSON 文件导入耗材档案（可与他人共享）")
         self._import_button.clicked.connect(self._on_import)
         self._export_button = QPushButton("导出")
-        self._export_button.setToolTip("把耗材档案导出成 JSON 文件")
         self._export_button.clicked.connect(self._on_export)
 
         row_one = QHBoxLayout()
@@ -494,18 +479,6 @@ class MainWindow(QMainWindow):
                 ),
             )
             item.setData(Qt.ItemDataRole.UserRole, filament.id)
-            item.setToolTip(
-                f"名称：{filament.display_name}\n"
-                f"颜色：{filament.color_hex}\n"
-                f"品牌：{filament.brand or '—'}\n"
-                f"种类：{filament.material_type or '—'}\n"
-                f"备注：{filament.note or '—'}"
-                + (
-                    "\n状态：已隐藏 —— 不参与混色，自己的颜色也不在「全部颜色」里"
-                    if filament.hidden
-                    else ""
-                )
-            )
             if filament.hidden:
                 # 行留着（不然没法把它放回来），但灰掉，让「这卷现在不算数」一眼
                 # 看得出来。
@@ -615,12 +588,26 @@ class MainWindow(QMainWindow):
                 return
 
     def _on_list_selection(self, current, previous) -> None:
+        """Spell the selected spool out in the bottom line.
+
+        This used to be a hover pop-up on the row: 名称/颜色/品牌/种类/备注.  The
+        pop-up is gone, so the one line that is always visible carries the same
+        facts — the row itself only has room for the name and the hex.
+        """
         if self._suppress_list_signal or current is None:
             return
         filament = self.library.get(current.data(Qt.ItemDataRole.UserRole))
-        if filament is not None:
-            self._status.setText(f"{filament.display_name} · {filament.color_hex} · "
-                                 f"{filament.brand or '—'} · {filament.material_type or '—'}")
+        if filament is None:
+            return
+        line = (
+            f"{filament.display_name} · {filament.color_hex} · "
+            f"{filament.brand or '—'} · {filament.material_type or '—'}"
+        )
+        if filament.note:
+            line += f" · 备注：{filament.note}"
+        if filament.hidden:
+            line += " · 已隐藏，不参与混色"
+        self._status.setText(line)
 
     def _on_list_menu(self, position) -> None:
         from PySide6.QtWidgets import QMenu
@@ -688,12 +675,23 @@ class MainWindow(QMainWindow):
                 filament = filament.copy()
             self.library.add(filament)
             added += 1
-        self._reload_library()
+        # 档案旁边那份三色混色缓存要在重建耗材库之前就登记好：重建会顺手开始算
+        # 三色（见 _ensure_triples），而这份档案很可能自带现成的表——先算再丢掉，
+        # 用户就要白等几分钟，鼠标还会一直转圈。
         sidecar = mix_sidecar_path(Path(path))
+        self._pending_sidecar = sidecar if sidecar.is_file() else None
+        self._reload_library()
         note = ""
-        if sidecar.is_file() and self._catalog is not None:
-            if self._adopt_mix_sidecar(sidecar):
+        if self._pending_sidecar is not None and self._catalog is not None:
+            adopted = self._adopt_mix_sidecar(self._pending_sidecar)
+            self._pending_sidecar = None
+            if adopted:
                 note = "\n同时用上了档案里的三色混色缓存，不用重算。"
+            else:
+                # 表不是这套耗材的：丢掉这次登记，回到正常路径去算。
+                self._ensure_triples()
+        else:
+            self._pending_sidecar = None
         QMessageBox.information(self, "导入完成", f"已导入 {added} 条耗材。{note}")
 
     def _on_export(self) -> None:
@@ -746,12 +744,17 @@ class MainWindow(QMainWindow):
             return False
         if not catalog.built:
             return False
+        # 这份表就是答案：正在算的那份（如果刚被 _reload_library 起过）立刻停掉，
+        # 不然那个计时器会继续往一张没有中间数组的表上写，进度文字和转圈鼠标也
+        # 会一直挂在那儿下不来。
+        self._stop_triple_timer()
         self._triples = catalog
         self._rebuild_combined()
         try:
             save_triple_cache(catalog, self._triples_path())
         except Exception:
             pass
+        self._end_build_notice()
         self._refresh_grid()
         return True
 
@@ -963,6 +966,9 @@ class MainWindow(QMainWindow):
             return
         if self._triples is not None or self._triple_timer is not None:
             return
+        if self._pending_sidecar is not None:
+            # 正在导入一份自带混色表的档案：几毫秒后就会换上它，现在开始算是白算。
+            return
         cached = load_triple_cache(
             self._triples_path(), self.library.visible, self._catalog.engine.id
         )
@@ -1079,14 +1085,14 @@ class MainWindow(QMainWindow):
         self._update_status()
 
     def _set_status_text(self, text: str) -> None:
-        """Write the bottom line, keeping the full sentence in the tooltip.
+        """Write the bottom line.
 
         The label wraps, so a long sentence folds onto a second line instead of
-        forcing the window wider or being clipped — but its tail is still worth
-        keeping in the tooltip for a single-glance read.
+        forcing the window wider or being clipped.  It used to be duplicated into
+        a hover pop-up as well; the pop-up is gone, so the wrapped label is the
+        whole channel and the sentences here stay short enough to read in it.
         """
         self._status.setText(text)
-        self._status.setToolTip(text)
 
     def _update_status(self) -> None:
         count = len(self.library.visible)
@@ -1252,20 +1258,6 @@ class MainWindow(QMainWindow):
         return best
 
     # -- misc --------------------------------------------------------------------
-    def _on_target_color_changed(self, value: str) -> None:
-        """Only the tooltip follows the target colour; the button stays enabled."""
-        chosen = bool(value) and self._target_color.isSet()
-        if not chosen:
-            self._find_button.setToolTip(
-                "不用先填目标颜色也能按：没填就拿颜色表里选中的那个颜色来比，"
-                "表里也没选就拿 R / G / B 三个数字框里的值。"
-                "程序按 CIEDE2000 在当前显示的全部颜色里找出最接近的一个"
-            )
-        else:
-            self._find_button.setToolTip(
-                f"在当前显示的全部颜色里，按 CIEDE2000 找出最接近 {value} 的那一个"
-            )
-
     def _on_find_nearest(self) -> None:
         """Find the closest colour, borrowing a target when the user typed none.
 

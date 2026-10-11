@@ -317,15 +317,32 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         None, [f.brand for f in window.library.filaments], [], window
     )
     check(not add_dialog._color.isSet(), "添加耗材 starts with NO preset colour")
-    # m08102 item 1: the R/G/B spins start at 0, so 确认 must work right away and
-    # mean black — it used to sit disabled until a colour was picked.
+    # m01647 item 1 (「不要预设颜色」): nothing may stand in for the colour the user
+    # has not chosen.  The three spins used to read 0,0,0 and 确认 accepted that as
+    # black, so a spool could be created in a colour nobody picked.
     check(
-        add_dialog.values()["color_hex"] == "#000000",
-        f"an untouched dialog means RGB 0,0,0, got {add_dialog.values()['color_hex']!r}",
+        add_dialog.values()["color_hex"] == "",
+        f"an untouched dialog carries no colour, got {add_dialog.values()['color_hex']!r}",
     )
-    check(add_dialog._ok_button.isEnabled(), "确认 is enabled on the default RGB 0,0,0")
+    check(
+        not add_dialog._ok_button.isEnabled(),
+        "确认 is grey until a colour is given",
+    )
+    check(
+        not add_dialog._next_button.isEnabled(),
+        "下一个 is grey until a colour is given",
+    )
+    check(
+        add_dialog._name.placeholderText() == "",
+        "名称 carries no example placeholder (m01647 item 7)",
+    )
+    check(
+        add_dialog._next_button.toolTip() == "",
+        "the dialog has no hover pop-up on 下一个 (m01647 item 4)",
+    )
     add_dialog._color.setValue("#123456")
-    check(add_dialog._ok_button.isEnabled(), "确认 stays enabled once a colour is entered")
+    check(add_dialog._ok_button.isEnabled(), "确认 comes alive once a colour is entered")
+    check(add_dialog._next_button.isEnabled(), "下一个 comes alive with it")
     check(add_dialog.values()["color_hex"] == "#123456", "the entered colour is reported")
     # m10238 item 3: 下一个 sits immediately left of 确认 and means "save this one,
     # then open a fresh empty form".
@@ -522,9 +539,16 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         abs(probe._pan.x()) <= limit_x + 0.5,
         "panning is clamped so the picture never leaves the panel",
     )
+    # The 滚轮缩放 / 拖动平移 instructions used to be a tooltip on both panels.
+    # m01647 item 4 deleted the hover pop-ups, so the same sentence is now the
+    # always-visible hint line at the top of the page — one line, both panels.
     check(
-        page._original_view.toolTip() == _pp.ZOOM_HINT and probe.toolTip() == _pp.ZOOM_HINT,
-        "both panels explain 滚轮缩放 / 拖动平移",
+        _pp.ZOOM_HINT in page._page_hint.text(),
+        f"the page hint explains 滚轮缩放 / 拖动平移, got {page._page_hint.text()!r}",
+    )
+    check(
+        page._original_view.toolTip() == "" and probe.toolTip() == "",
+        "neither panel carries a hover pop-up any more",
     )
 
     probe.reset_zoom()
@@ -552,9 +576,9 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     probe.deleteLater()
 
     # 抖动对有透明区域的图没有意义（有颜色的像素会被挤成一行再量化，那一行上没有
-    # 邻居关系），所以那种图上直接灰掉并且说明原因，而不是让用户勾了没反应。
+    # 邻居关系），所以那种图上直接灰掉，原因写在上面的常显提示行里 —— 悬停弹窗已经
+    # 按用户要求删掉了，所以原因不能再只活在弹窗上。
     check(page._dither.isEnabled(), "an opaque picture keeps 抖动 selectable")
-    check("误差扩散" in page._dither.toolTip(), "抖动 explains itself while it can still act")
     transparent = scratch / "selftest-alpha.png"
     alpha_image = Image.new("RGBA", (32, 32), "#F2F0EB")
     ImageDraw.Draw(alpha_image).rectangle((0, 0, 7, 31), fill=(242, 240, 235, 0))
@@ -562,64 +586,82 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     page.loadImage(transparent)
     app.processEvents()
     check(not page._dither.isEnabled(), "no meaningful dithering on a transparent picture")
-    check("透明" in page._dither.toolTip(), "and the checkbox says why it went grey")
+    check("透明" in page._page_hint.text(), "and the always-visible hint says why it went grey")
     page.loadImage(picture)
     app.processEvents()
     check(page._dither.isEnabled(), "抖动 comes back on an opaque picture")
 
-    # 颜色数量: the 32 ceiling belongs to Bambu Studio, not to us, so the box has
+    # 颜色数量: the 32 ceiling belongs to Bambu Studio, not to us, so the page has
     # to say so — the user asked for a bigger number and got "拓竹还没放开".
     from .mesh.threemf import MAX_PAINTED_FILAMENTS as _MAX_PAINTED
+    from .ui.picture_page import DEFAULT_SPOOL_CAP as _DEFAULT_SPOOL_CAP
 
     check(
         page._colour_count.maximum() == _MAX_PAINTED,
         f"颜色数量 stops at Bambu Studio's own ceiling ({_MAX_PAINTED})",
     )
-    ceiling_tip = page._colour_count.toolTip()
     check(
-        "Bambu Studio" in ceiling_tip and str(_MAX_PAINTED) in ceiling_tip,
-        "颜色数量 names Bambu Studio as the reason for the ceiling",
+        page._colour_count.value() == _MAX_PAINTED,
+        f"颜色数量 starts at the ceiling ({_MAX_PAINTED})",
     )
-    check("工单" in ceiling_tip, "and says the ceiling is reported to Bambu, not invented by us")
+    page_hint = page._page_hint.text()
+    check(
+        "Bambu Studio" in page_hint and str(_MAX_PAINTED) in page_hint,
+        "the always-visible hint names Bambu Studio as the reason for the ceiling",
+    )
+    check("工单" in page_hint, "and says the ceiling is reported to Bambu, not invented by us")
+    check(
+        page._page_hint.isVisibleTo(page),
+        "that hint is on screen, not hidden behind a hover pop-up",
+    )
 
     # 耗材上限 (m00780/m00840 #4): 0 = 不限制, otherwise the plan may spend only
     # that many spools, and colours that do not fit are replaced.
-    check(page._spool_cap.value() == 0, "耗材上限 starts at 0 = 不限制")
+    check(
+        page._spool_cap.value() == _DEFAULT_SPOOL_CAP,
+        f"耗材上限 starts at {_DEFAULT_SPOOL_CAP}",
+    )
     check(
         page._spool_cap.maximum() == _MAX_PAINTED,
         "耗材上限 cannot promise more spools than a project can hold",
     )
-    check(page._settings().max_spools == 0, "0 carries through to the matcher as 不限制")
+    check(
+        page._settings().max_spools == _DEFAULT_SPOOL_CAP,
+        f"{_DEFAULT_SPOOL_CAP} carries through to the matcher",
+    )
+    page._spool_cap.setValue(0)
+    check(page._settings().max_spools == 0, "0 still means 不限制")
     page._spool_cap.setValue(2)
     check(page._settings().max_spools == 2, "the spin box reaches the matcher")
-    page._spool_cap.setValue(0)
+    page._spool_cap.setValue(_DEFAULT_SPOOL_CAP)
 
     capped = match_image(picture, palette, MatchSettings(max_colours=12, max_spools=1))
     spent = sorted({parent for entry in capped.palette for parent in entry.filament_ids})
     check(len(spent) <= 1, f"耗材上限 1 really spends one spool ({spent})")
     check(capped.printed_pixels > 0, "and the picture is still printed, not blanked")
 
-    # 三色配方 (m00840 #1): the candidate pool cannot be built up front, so the
-    # checkbox stays grey until the 颜色配方 page has finished the triples.
+    # 三色配方 (m00840 #1): always part of the pool, and the two checkboxes that
+    # used to gate 混色 / 三色 are gone (m01647 item 5).
     from .core.triples import TripleCatalog as _TripleCatalog
     from .ui.picture_page import TriplePalette as _TriplePalette
 
     check(
-        not page._include_triples.isEnabled(),
-        "也算三色配方 waits, greyed, until the triples are finished",
+        not hasattr(page, "_include_triples") and not hasattr(page, "_include_mixes"),
+        "the 混色 / 三色 checkboxes are gone: every colour takes part",
     )
     head_pool = page._candidate_palette()
     check(
         not isinstance(page._match_palette(), _TriplePalette),
-        "an unticked 也算三色配方 keeps the two-filament pool",
+        "without a finished 3-colour table the pool is spools + pairs",
     )
     triples = _TripleCatalog(library.filaments, engine=ENGINE_MIXER).build()
     page.setTriples(triples, library)
     app.processEvents()
-    check(page._include_triples.isEnabled(), "也算三色配方 comes alive once the triples are built")
-    page._include_triples.setChecked(True)
     pool = page._match_palette()
-    check(isinstance(pool, _TriplePalette), "ticking it swaps in the three-filament pool")
+    check(
+        isinstance(pool, _TriplePalette),
+        "the 3-colour table joins the pool on its own, no checkbox to tick",
+    )
     check(len(pool) > len(head_pool), f"the pool grows ({len(head_pool)} → {len(pool)})")
     check(
         all(entry.key == other.key for entry, other in zip(pool[: len(head_pool)], head_pool)),
@@ -638,12 +680,11 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         page._match_palette() is pool,
         "the pool is built once, not once per match",
     )
-    page._include_triples.setChecked(False)
     page.setTriples(None, library)
     app.processEvents()
     check(
-        not page._include_triples.isEnabled() and not page._include_triples.isChecked(),
-        "without triples the box goes back to grey and unticked",
+        not isinstance(page._match_palette(), _TriplePalette),
+        "dropping the table (a spool changed) puts the pool back to spools + pairs",
     )
 
     page.buildPlate()
@@ -921,9 +962,11 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         window._detail._title.text() == "颜色配方",
         f"the right-hand panel is 颜色配方, got {window._detail._title.text()!r}",
     )
+    # No hover pop-ups anywhere on this window any more (m01647 item 4): the page
+    # name lives in the tab and the panel title, not in a black box on hover.
     check(
-        "颜色配方" in window._target_color.toolTip(),
-        "the target colour tooltip says 颜色配方 too",
+        window._target_color.toolTip() == "" and window._find_button.toolTip() == "",
+        "the target colour and 找最接近的颜色 carry no tooltip",
     )
 
     # The version must be readable without opening 关于, and it is the same string
