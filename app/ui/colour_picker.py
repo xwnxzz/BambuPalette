@@ -108,7 +108,7 @@ def entry_recipe_text(entry: PaletteEntry, library=None, *, compact: bool = Fals
     percentages without eliding them; the full recipe stays in the tooltip and
     in the 「选中的颜色」 panel.
     """
-    if entry.recipe is None:
+    if entry.recipe is None and not entry.parts:
         filament = entry.filament
         if filament is None:
             return f"{SPOOL_PREFIX}：{entry.color_hex}"
@@ -116,9 +116,15 @@ def entry_recipe_text(entry: PaletteEntry, library=None, *, compact: bool = Fals
         if compact:
             return f"{SPOOL_PREFIX}：{name} · 单色 100%"
         return f"{SPOOL_PREFIX}：{name} ({filament.color_hex}) · 单色 100%"
-    recipe = entry.recipe
+    if entry.parts:
+        # Two parents and three parents read the same way; a triple has no
+        # ``MixRecipe`` to pull the percentages out of.
+        pairs = tuple(entry.parts)
+    else:
+        recipe = entry.recipe
+        pairs = ((recipe.a_id, recipe.percent_a), (recipe.b_id, recipe.percent_b))
     parts = []
-    for filament_id, percent in ((recipe.a_id, recipe.percent_a), (recipe.b_id, recipe.percent_b)):
+    for filament_id, percent in pairs:
         filament = library.get(filament_id) if library is not None else None
         if filament is None:
             parts.append(f"{filament_id} {percent}%")
@@ -126,12 +132,12 @@ def entry_recipe_text(entry: PaletteEntry, library=None, *, compact: bool = Fals
             parts.append(f"{_parent_short_name(filament)} {percent}%")
         else:
             parts.append(f"{filament.display_name} ({filament.color_hex}) {percent}%")
-    return f"{RECIPE_PREFIX}：{parts[0]}  +  {parts[1]}"
+    return f"{RECIPE_PREFIX}：" + "  +  ".join(parts)
 
 
 def entry_short_label(entry: PaletteEntry, library=None) -> str:
     """A one-line description for a list row."""
-    if entry.recipe is None:
+    if entry.recipe is None and not entry.parts:
         filament = entry.filament
         return filament.display_name if filament is not None else entry.color_hex
     return entry.label

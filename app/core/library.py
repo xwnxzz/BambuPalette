@@ -7,6 +7,14 @@ A filament record carries everything the user types for a spool:
 * ``color_hex``      — the measured / declared colour of the printed material
 * ``note``           — free text 备注
 * ``name``           — optional display name, derived when left empty
+* ``hidden``         — 已用完、还没买回来的料：留在表里，但不参与任何混色
+
+``hidden`` is the "the spool is empty and the replacement has not arrived"
+switch.  A hidden spool keeps its row (the user still has to see it to unhide
+it) but contributes no colour anywhere: it is not offered as an ingredient of a
+two- or three-filament mix, and its own colour is not one of 「全部颜色」.  The
+filtering happens where the catalogues are built — see
+:attr:`FilamentLibrary.visible` — so every consumer agrees by construction.
 """
 
 from __future__ import annotations
@@ -126,6 +134,9 @@ class Filament:
     color_hex: str = "#FFFFFF"
     note: str = ""
     name: str = ""
+    #: 料用完了还没买回来，就先藏起来。 行还在，颜色不在：它不进任何混色，自己
+    #: 的颜色也不出现在「全部颜色」。 见 FilamentLibrary.visible。
+    hidden: bool = False
     created_at: str = field(default_factory=_now)
     updated_at: str = field(default_factory=_now)
 
@@ -135,6 +146,7 @@ class Filament:
         self.material_type = (self.material_type or "").strip()
         self.note = (self.note or "").strip()
         self.name = (self.name or "").strip()
+        self.hidden = bool(self.hidden)
 
     # -- derived ------------------------------------------------------------------
     @property
@@ -162,7 +174,7 @@ class Filament:
         return _color.hex_to_rgb(self.color_hex)
 
     def to_dict(self) -> dict:
-        return {
+        data = {
             "id": self.id,
             "name": self.name,
             "brand": self.brand,
@@ -172,6 +184,11 @@ class Filament:
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
         }
+        # 只在真的藏起来时才写这个键：老档案、和别人共用的档案里，没隐藏过的料
+        # 一个字节都不变。
+        if self.hidden:
+            data["hidden"] = True
+        return data
 
     @classmethod
     def from_dict(cls, data: dict) -> "Filament":
@@ -182,6 +199,7 @@ class Filament:
             material_type=str(data.get("materialType") or data.get("material_type") or ""),
             color_hex=str(data.get("colorHex") or data.get("color_hex") or ""),
             note=str(data.get("note") or ""),
+            hidden=bool(data.get("hidden")),
             created_at=str(data.get("createdAt") or _now()),
             updated_at=str(data.get("updatedAt") or _now()),
         )
@@ -225,6 +243,24 @@ class FilamentLibrary:
     @property
     def filaments(self) -> list[Filament]:
         return list(self._filaments)
+
+    @property
+    def visible(self) -> list[Filament]:
+        """The spools that may take part in mixing — everything not hidden.
+
+        Every catalogue is built from this list rather than from
+        :attr:`filaments`, which is what makes 「隐藏」 mean the same thing on
+        all three pages at once: a hidden spool is never an ingredient, so no
+        two-filament mix, no three-filament mix and no spool colour of its own
+        can be produced.  Filtering once here beats filtering in the matcher,
+        the grid, 「全部颜色」 and the exporter separately, where the four could
+        drift apart.
+        """
+        return [filament for filament in self._filaments if not filament.hidden]
+
+    @property
+    def hidden_count(self) -> int:
+        return sum(1 for filament in self._filaments if filament.hidden)
 
     def get(self, filament_id: str) -> Filament | None:
         return self._index.get(filament_id)

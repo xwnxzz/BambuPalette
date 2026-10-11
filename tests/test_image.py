@@ -23,9 +23,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.core.engines import ENGINE_BAMBU  # noqa: E402
+from app.core.engines import ENGINE_BAMBU, ENGINE_MIXER  # noqa: E402
 from app.core.image_matching import (  # noqa: E402
     MatchSettings,
+    TriplePalette,
+    _fit_spool_budget,
     _fold_clusters,
     _merge_indistinguishable,
     _merge_similar_colours,
@@ -41,6 +43,8 @@ from app.core.mixes import (  # noqa: E402
     SORT_SIMILARITY,
     MixCatalog,
 )
+from app.core.triples import TripleCatalog  # noqa: E402
+from app.mesh.threemf import MAX_PAINTED_FILAMENTS  # noqa: E402
 from app.spectral import color as _color  # noqa: E402
 
 SPOOLS = (
@@ -667,6 +671,194 @@ class ClusterFoldingTests(unittest.TestCase):
         classes = np.array([[0, 1, -1, -1], [0, 1, -1, -1]], dtype=np.int64)
         _, out_classes = _fold_clusters(colours, classes, 8, 2.0)
         self.assertEqual(list(out_classes[0]), [0, 1, -1, -1])
+
+
+class TriplePalettePoolTests(unittest.TestCase):
+    """「也算三色配方」: a bigger pool without materialising every colour.
+
+    The four-spool test library has four three-filament combinations, which is
+    small enough that every assertion below can look at the whole tail; the
+    point being tested is the structure (head first, tail lazy, three parents
+    per tail colour), not the size.
+    """
+
+    def setUp(self):
+        self.library = _library()
+        self.catalog = MixCatalog(self.library.filaments, engine=ENGINE_BAMBU).build()
+        self.triples = TripleCatalog(
+            self.library.filaments, engine=ENGINE_MIXER
+        ).build()
+        self.head = build_palette(self.library, self.catalog)
+        self.palette = TriplePalette(self.head, self.triples, self.library)
+
+    def _tail_entries(self):
+        return [self.palette[index] for index in range(len(self.head), len(self.palette))]
+
+    def test_the_head_comes_first_untouched(self):
+        self.assertEqual(self.palette[: len(self.head)], self.head)
+        self.assertIs(self.palette.head, self.palette.head)
+
+    def test_the_pool_really_is_bigger_than_the_two_filament_one(self):
+        self.assertGreater(self.triples.colour_count, 0)
+        self.assertGreater(len(self.palette), len(self.head))
+
+    def test_a_tail_colour_names_three_spools(self):
+        entry = self.palette[len(self.head)]
+        self.assertTrue(entry.is_mix)
+        self.assertIsNone(entry.recipe)
+        self.assertEqual(entry.recipes, ())
+        self.assertEqual(len(entry.parts), 3)
+        self.assertEqual(len(entry.filament_ids), 3)
+        for _parent, percent in entry.parts:
+            self.assertGreater(percent, 0)
+        self.assertEqual(sum(percent for _parent, percent in entry.parts), 100)
+        self.assertIn("%", entry.ratio_text)
+
+    def test_a_slice_is_the_same_as_indexing_one_by_one(self):
+        # Compare keys, not entries: two tail entries carry numpy Lab vectors,
+        # so ``==`` on them is ambiguous by design.
+        start = len(self.head)
+        self.assertEqual(
+            [entry.key for entry in self.palette[start : start + 3]],
+            [self.palette[start + offset].key for offset in range(3)],
+        )
+
+    def test_the_head_colour_is_never_offered_twice(self):
+        head_hexes = {entry.color_hex for entry in self.head}
+        tail_hexes = {entry.color_hex for entry in self._tail_entries()}
+        self.assertEqual(head_hexes & tail_hexes, set())
+        self.assertEqual(len(tail_hexes), len(self._tail_entries()))
+
+    def test_the_lab_table_lines_up_with_the_entries(self):
+        table = self.palette.lab_table()
+        self.assertEqual(table.shape, (len(self.palette), 3))
+        for index in (0, len(self.head), len(self.head) + 1, len(self.palette) - 1):
+            self.assertTrue(np.allclose(table[index], self.palette[index].lab))
+
+    def test_the_table_is_built_once(self):
+        self.assertIs(self.palette.lab_table(), self.palette.lab_table())
+
+    def test_the_head_declares_its_size(self):
+        # The nearest-colour search gives these rows their own shortlist, so a
+        # wide tail cannot evict a cheaper two-filament answer.
+        self.assertEqual(self.palette.head_size, len(self.head))
+        self.assertLess(self.palette.head_size, len(self.palette))
+
+    def test_the_bigger_pool_never_matches_worse(self):
+        # A colour no spool owns: the pool is a superset of the head, so the
+        # error can only go down.
+        image = Image.new("RGBA", (16, 16), (190, 60, 90, 255))
+        settings = MatchSettings(max_colours=3, max_dimension=64)
+        head_result = match_image(image, self.head, settings)
+        pool_result = match_image(image, self.palette, settings)
+
+        def worst(result) -> float:
+            return max(
+                _color.delta_e_2000(
+                    _color.lab_from_rgb(tuple(result.means[index])), entry.lab
+                )
+                for index, entry in enumerate(result.palette)
+            )
+
+        self.assertLessEqual(worst(pool_result), worst(head_result) + 1e-9)
+
+
+class SpoolBudgetTests(unittest.TestCase):
+    """「这个模型最多用几卷耗材」: 0 = 不限, otherwise a hard cap on spools."""
+
+    def setUp(self):
+        self.library = _library()
+        self.catalog = MixCatalog(self.library.filaments, engine=ENGINE_BAMBU).build()
+        self.palette = build_palette(self.library, self.catalog)
+
+    @staticmethod
+    def _spools(result) -> set[str]:
+        return {
+            parent for entry in result.palette for parent in entry.filament_ids
+        }
+
+    def test_zero_means_no_limit(self):
+        result = match_image(
+            _quadrant_image(), self.palette, MatchSettings(max_colours=4, max_spools=0)
+        )
+        self.assertEqual(len(self._spools(result)), 4)
+
+    def test_the_cap_is_the_number_of_distinct_spools(self):
+        result = match_image(
+            _quadrant_image(), self.palette, MatchSettings(max_colours=4, max_spools=2)
+        )
+        self.assertEqual(len(self._spools(result)), 2)
+        self.assertEqual(len(result.palette), 2)
+
+    def test_a_budget_of_one_leaves_one_colour(self):
+        result = match_image(
+            _quadrant_image(), self.palette, MatchSettings(max_colours=4, max_spools=1)
+        )
+        self.assertEqual(len(self._spools(result)), 1)
+        self.assertEqual(len(result.palette), 1)
+
+    def test_the_surviving_colour_is_the_biggest_region(self):
+        # Two quadrants are twice the area of the other two, so the budget has
+        # to keep one of those and repaint everything with it.
+        image = Image.new("RGBA", (40, 40), (0, 0, 0, 255))
+        image.paste(Image.new("RGBA", (20, 40), (200, 200, 195, 255)), (20, 0))
+        result = match_image(image, self.palette, MatchSettings(max_colours=4, max_spools=1))
+        self.assertEqual(len(result.palette), 1)
+        self.assertEqual(int(result.counts[0]), 40 * 40)
+
+    def test_a_refused_colour_never_reaches_the_result(self):
+        # Both picks want two spools, so with a budget of one they are refused
+        # and the promise can only be kept by repainting with a single spool.
+        mixes = [entry for entry in self.palette if entry.is_mix][:2]
+        self.assertEqual(len(mixes), 2)
+        for entry in mixes:
+            self.assertEqual(len(entry.filament_ids), 2)
+        indices = np.zeros((4, 4), dtype=np.int32)
+        indices[:, 2:] = 1
+        kept, counts, final = _fit_spool_budget(list(mixes), indices, 1, self.palette)
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(len(kept[0].filament_ids), 1)
+        self.assertNotIn(kept[0].key, {entry.key for entry in mixes})
+        self.assertEqual(int(counts.sum()), 16)
+        self.assertEqual(sorted(set(int(value) for value in final.reshape(-1))), [0])
+
+    def test_the_budget_keeps_everything_when_it_fits(self):
+        mixes = [entry for entry in self.palette if entry.is_mix][:2]
+        indices = np.zeros((4, 4), dtype=np.int32)
+        indices[:, 2:] = 1
+        # Four spools is the whole library, so nothing has to be refused.
+        self.assertIsNone(
+            _fit_spool_budget(list(mixes), indices, len(self.library.filaments), self.palette)
+        )
+
+    def test_no_budget_means_no_work(self):
+        mixes = [entry for entry in self.palette if entry.is_mix][:2]
+        indices = np.zeros((4, 4), dtype=np.int32)
+        self.assertIsNone(_fit_spool_budget(list(mixes), indices, 0, self.palette))
+
+    def test_a_budget_of_one_falls_back_to_a_single_spool(self):
+        # Both picks need two spools, so the promise can only be kept by
+        # repainting with the closest colour that uses one.
+        mixes = [entry for entry in self.palette if entry.is_mix][:2]
+        for entry in mixes:
+            self.assertEqual(len(entry.filament_ids), 2)
+        indices = np.zeros((4, 4), dtype=np.int32)
+        indices[:, 2:] = 1
+        kept, _counts, _final = _fit_spool_budget(list(mixes), indices, 1, self.palette)
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(len(kept[0].filament_ids), 1)
+
+    def test_transparent_pixels_stay_transparent(self):
+        mixes = [entry for entry in self.palette if entry.is_mix][:2]
+        indices = np.array([[0, 1, -1, -1], [0, 1, -1, -1]], dtype=np.int32)
+        _kept, _counts, final = _fit_spool_budget(list(mixes), indices, 1, self.palette)
+        self.assertEqual(list(final[0]), [0, 0, -1, -1])
+
+    def test_the_setting_is_clamped_like_the_others(self):
+        self.assertEqual(MatchSettings(max_spools=-4).clamped().max_spools, 0)
+        self.assertEqual(
+            MatchSettings(max_spools=10_000).clamped().max_spools, MAX_PAINTED_FILAMENTS
+        )
 
 
 if __name__ == "__main__":

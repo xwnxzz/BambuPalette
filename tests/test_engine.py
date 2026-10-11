@@ -40,6 +40,7 @@ from app.core.engines import (  # noqa: E402
     get_engine,
     resolve_engine_id,
 )
+from app.core.image_matching import build_palette  # noqa: E402
 from app.core.library import Filament, FilamentLibrary  # noqa: E402
 from app.core.mixes import (  # noqa: E402
     MIX_RATIOS,
@@ -1199,6 +1200,70 @@ class LibraryPersistenceTests(unittest.TestCase):
         ])
         self.assertEqual([f.color_hex for f in library.sort_by_color()],
                          ["#000000", "#FF0000", "#FFFFFF"])
+
+    def test_a_normal_spool_says_nothing_about_hiding(self):
+        # 没藏起来的料，导出档案里连 "hidden" 这个键都不该有：别人打开这份档案
+        # （或者用旧版本打开）看到的东西和从前一模一样。
+        data = Filament(name="白", color_hex="#FFFFFF").to_dict()
+        self.assertNotIn("hidden", data)
+
+    def test_hiding_survives_a_round_trip(self):
+        library = FilamentLibrary()
+        hidden = library.create(name="黑", color_hex="#000000", hidden=True)
+        library.create(name="白", color_hex="#FFFFFF")
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "lib.json"
+            library.save(path)
+            restored = FilamentLibrary.load(path)
+        self.assertTrue(restored.get(hidden.id).hidden)
+        self.assertFalse(restored.get(library[1].id).hidden)
+
+    def test_visible_drops_only_the_hidden_spools(self):
+        library = FilamentLibrary()
+        library.create(name="白", color_hex="#FFFFFF")
+        hidden = library.create(name="黑", color_hex="#000000", hidden=True)
+        library.create(name="金", color_hex="#D9A441")
+        self.assertEqual(len(library), 3)
+        self.assertEqual(library.hidden_count, 1)
+        self.assertEqual([f.name for f in library.visible], ["白", "金"])
+        # 行还在：藏起来是为了以后能放回来，不是为了看不见它。
+        self.assertIsNotNone(library.get(hidden.id))
+        library.update(hidden.id, hidden=False)
+        self.assertEqual(library.hidden_count, 0)
+        self.assertEqual(len(library.visible), 3)
+
+    def test_editing_a_hidden_spool_leaves_it_hidden(self):
+        # 编辑对话框不知道 hidden 这回事；改名字不该顺手把它放回混色里。
+        library = FilamentLibrary()
+        filament = library.create(name="黑", color_hex="#000000", hidden=True)
+        library.update(filament.id, name="黑 2", color_hex="#111111")
+        self.assertTrue(library.get(filament.id).hidden)
+
+    def test_an_unknown_hidden_value_is_coerced(self):
+        self.assertTrue(Filament(color_hex="#000000", hidden=1).hidden)
+        self.assertFalse(Filament(color_hex="#000000", hidden=None).hidden)
+        self.assertFalse(Filament.from_dict({"colorHex": "#000000"}).hidden)
+
+    def test_the_palette_leaves_hidden_spools_out(self):
+        # 「隐藏」承诺的两件事之一：它自己的颜色不再是可以打印的颜色。
+        library = FilamentLibrary()
+        library.create(name="白", color_hex="#FFFFFF")
+        library.create(name="黑", color_hex="#000000", hidden=True)
+        palette = build_palette(library, None, include_mixes=False)
+        self.assertEqual([entry.color_hex for entry in palette], ["#FFFFFF"])
+
+    def test_a_hidden_spool_ingredient_makes_no_mix(self):
+        # 另一件：它也不再是任何配方的原料。 配方表从 library.visible 建起来，
+        # 所以拿 visible 建的表里不可能有它。
+        library = FilamentLibrary()
+        library.create(name="白", color_hex="#FFFFFF")
+        hidden = library.create(name="黑", color_hex="#000000", hidden=True)
+        catalog = MixCatalog(library.visible, MIX_RATIOS).build()
+        ids = {recipe.a_id for recipe in catalog.recipes} | {
+            recipe.b_id for recipe in catalog.recipes
+        }
+        self.assertNotIn(hidden.id, ids)
+        self.assertTrue(all(recipe.a_id != hidden.id for recipe in catalog.recipes))
 
 
 if __name__ == "__main__":

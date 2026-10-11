@@ -77,6 +77,11 @@ class PaletteEntry:
     recipe: MixRecipe | None = None
     filament: Filament | None = None
     recipes: tuple[MixRecipe, ...] = ()
+    #: The recipe as ``((filament_id, percent), …)``, used when ``recipe`` cannot
+    #: describe it: a three-filament mix has no ``MixRecipe`` (it is a
+    #: :class:`~app.core.triples.TripleRecipe`), so the UI reads the parts for
+    #: two and three parents alike instead of growing a second code path.
+    parts: tuple[tuple[str, int], ...] = ()
 
     @property
     def is_mix(self) -> bool:
@@ -92,7 +97,11 @@ class PaletteEntry:
     def ratio_text(self) -> str:
         if len(self.recipes) > 1:
             return f"{len(self.recipes)} 个配方"
-        return self.recipe.ratio_text if self.recipe is not None else ""
+        if self.recipe is not None:
+            return self.recipe.ratio_text
+        if self.parts:
+            return " + ".join(f"{percent}%" for _parent, percent in self.parts)
+        return ""
 
     @property
     def short_label(self) -> str:
@@ -100,6 +109,8 @@ class PaletteEntry:
             return self.filament.display_name
         if self.recipe is not None:
             return f"{self.recipe.percent_a}% + {self.recipe.percent_b}%"
+        if self.parts:
+            return " + ".join(f"{percent}%" for _parent, percent in self.parts)
         return self.color_hex
 
 
@@ -113,9 +124,17 @@ def build_palette(
 
     Spools come first so that, when a mix lands exactly on a spool colour, the
     cheaper answer (one spool) wins the tie.
+
+    Spools the user hid (料用完了，还没买回来) are left out entirely — see
+    :attr:`FilamentLibrary.visible`.  The catalogue already excludes them as
+    ingredients, so without this the hidden spool's own colour would still be
+    offered as a printable colour, which is the one thing 「隐藏」 promises not
+    to happen.
     """
     entries: list[PaletteEntry] = []
     for filament in library:
+        if filament.hidden:
+            continue
         entries.append(
             PaletteEntry(
                 key=f"filament:{filament.id}",
@@ -234,6 +253,12 @@ class MatchSettings:
     # texture away first leaves the slots for colours that are actually
     # different.  0 turns it off.
     smooth_radius: int = 2
+    #: How many spools the whole plan may use.  A picture with 30 colours can
+    #: still be printed from four spools if the mixes are chosen well, and the
+    #: user who owns four spools asked for exactly that: keep the biggest
+    #: regions, and never introduce a spool the budget cannot pay for.  0 means
+    #: no limit.
+    max_spools: int = 0
 
     def clamped(self) -> "MatchSettings":
         # Imported here rather than at module level: ``app.mesh.plate`` imports
@@ -247,6 +272,7 @@ class MatchSettings:
             alpha_threshold=max(0, min(255, int(self.alpha_threshold))),
             merge_delta_e=max(0.0, min(10.0, float(self.merge_delta_e))),
             smooth_radius=max(0, min(8, int(self.smooth_radius))),
+            max_spools=max(0, min(MAX_PAINTED_FILAMENTS, int(self.max_spools))),
         )
 
 
@@ -294,7 +320,62 @@ class MatchResult:
         return self.counts / float(max(1, self.printed_pixels))
 
 
-def _nearest_entries(labs: np.ndarray, entries: Sequence[PaletteEntry]) -> np.ndarray:
+#: How many palette rows the nearest-colour search looks at per block.  The
+#: three-filament pool is millions of colours, so the distance to every one of
+#: them is computed in blocks and only the best few per target are carried
+#: forward — the full ``(targets × colours)`` matrix would be gigabytes.
+_SEARCH_BLOCK = 1 << 16
+
+
+def _palette_table(palette: Sequence[PaletteEntry]) -> np.ndarray:
+    """The ``(N, 3)`` Lab table the nearest-colour search runs against.
+
+    A palette that carries its own table is asked for it — the three-filament
+    pool does, because building a :class:`PaletteEntry` for each of its four
+    million colours is exactly what cannot be done.  Everything stays float64:
+    the shortlist pass is only a proxy, but the CIEDE2000 pass that follows is
+    the answer the UI reports, and rounding it through float32 would move
+    colours by more than the differences it is supposed to resolve.
+    """
+    getter = getattr(palette, "lab_table", None)
+    if callable(getter):
+        return np.asarray(getter(), dtype=np.float64)
+    return np.asarray([entry.lab for entry in palette], dtype=np.float64)
+
+
+def _shortlist_indices(
+    table: np.ndarray, targets: np.ndarray, shortlist: int
+) -> np.ndarray:
+    """The ``shortlist`` rows of ``table`` closest to each row of ``targets``.
+
+    Distances are Euclidean in Lab and computed in blocks: the three-filament
+    pool is millions of rows, so the full ``(targets × rows)`` matrix would be
+    gigabytes.
+    """
+    count = int(table.shape[0])
+    take = min(shortlist, count)
+    target_sq = (targets**2).sum(axis=1)[:, None]
+    best_indices = np.zeros((len(targets), 0), dtype=np.int64)
+    best_scores = np.zeros((len(targets), 0), dtype=np.float32)
+    for start in range(0, count, _SEARCH_BLOCK):
+        block = table[start : start + _SEARCH_BLOCK]
+        square = target_sq + (block**2).sum(axis=1)[None, :] - 2.0 * (targets @ block.T)
+        np.maximum(square, 0.0, out=square)
+        picked = np.argpartition(square, take - 1, axis=1)[:, :take]
+        best_indices = np.concatenate([best_indices, picked + start], axis=1)
+        best_scores = np.concatenate(
+            [best_scores, np.take_along_axis(square, picked, axis=1)], axis=1
+        )
+    width = best_scores.shape[1]
+    keep = np.argpartition(best_scores, min(shortlist, width) - 1, axis=1)[:, :shortlist]
+    return np.take_along_axis(best_indices, keep, axis=1)
+
+
+def _nearest_entries(
+    labs: np.ndarray,
+    entries: Sequence[PaletteEntry],
+    table: np.ndarray | None = None,
+) -> np.ndarray:
     """Index of the palette entry closest to each row of ``labs``.
 
     A Euclidean pass in Lab narrows the field, then CIEDE2000 picks the winner so
@@ -302,18 +383,32 @@ def _nearest_entries(labs: np.ndarray, entries: Sequence[PaletteEntry]) -> np.nd
     """
     if not entries:
         return np.zeros(len(labs), dtype=np.int64)
-    table = np.stack([entry.lab for entry in entries])
+    if table is None:
+        table = _palette_table(entries)
+    count = int(table.shape[0])
+    if count == 0:
+        return np.zeros(len(labs), dtype=np.int64)
+
+    targets = np.asarray(labs, dtype=np.float32)
+    best_indices = _shortlist_indices(table, targets, _SHORTLIST)
+
+    # A three-filament pool is a superset of the two-filament one, but a wider
+    # table can push a two-filament colour out of the Euclidean shortlist — and
+    # then ticking 「也算三色配方」 would quietly make a colour *worse*, which is
+    # the one thing it must never do.  So the head gets its own shortlist and the
+    # two are merged before the exact pass.
+    head_size = int(getattr(entries, "head_size", 0) or 0)
+    if 0 < head_size < count:
+        head_indices = _shortlist_indices(table[:head_size], targets, _SHORTLIST)
+        best_indices = np.concatenate([best_indices, head_indices], axis=1)
+
     out = np.zeros(len(labs), dtype=np.int64)
-    for row, lab in enumerate(labs):
-        distances = np.linalg.norm(table - lab, axis=1)
-        if distances.size > _SHORTLIST:
-            candidates = np.argpartition(distances, _SHORTLIST)[:_SHORTLIST]
-        else:
-            candidates = np.arange(distances.size)
+    for row in range(len(targets)):
+        candidates = best_indices[row]
         best_index = int(candidates[0])
         best = float("inf")
         for index in candidates:
-            value = _color.delta_e_2000(lab, table[index])
+            value = _color.delta_e_2000(labs[row], table[index])
             if value < best:
                 best = value
                 best_index = int(index)
@@ -659,6 +754,256 @@ def _merge_indistinguishable(
     )
 
 
+def _packed_key(rgb: Sequence[int]) -> int:
+    values = [int(value) & 0xFF for value in rgb]
+    return (values[0] << 16) | (values[1] << 8) | values[2]
+
+
+class TriplePalette(Sequence[PaletteEntry]):
+    """``entries`` (spools and pairs) plus every three-filament colour.
+
+    A 41-spool library has four million three-filament colours, so the tail is
+    never materialised: the matcher asks for the Lab table — built once, in
+    blocks, as float64 — and a :class:`PaletteEntry` is built only for the
+    handful of colours the picture actually keeps.  Colours the head already
+    offers are skipped, because one spool or one two-filament mix is the cheaper
+    way to reach the same hex and the tie should go to the cheaper answer.
+    """
+
+    def __init__(self, entries, triples, library=None) -> None:
+        self._head: list[PaletteEntry] = list(entries)
+        self._triples = triples
+        self._library = library
+        self._tail: np.ndarray | None = None
+        self._table: np.ndarray | None = None
+
+    @property
+    def head(self) -> list[PaletteEntry]:
+        """The spools and two-filament mixes, as they were handed in."""
+        return self._head
+
+    @property
+    def head_size(self) -> int:
+        """How many leading rows are spools and two-filament mixes.
+
+        The nearest-colour search gives these rows their own shortlist, so a
+        much wider tail can never evict a cheaper two-filament answer.
+        """
+        return len(self._head)
+
+    # -- lazy bookkeeping --------------------------------------------------
+    def _tail_indices(self) -> np.ndarray:
+        if self._tail is None:
+            packed = np.asarray(self._triples.packed, dtype=np.int64)
+            taken = np.fromiter(
+                (_packed_key(entry.rgb) for entry in self._head),
+                dtype=np.int64,
+                count=len(self._head),
+            )
+            # ``packed`` is deduplicated and ascending, so the membership test
+            # can assume uniqueness on both sides.
+            keep = ~np.isin(packed, taken, assume_unique=True)
+            self._tail = np.flatnonzero(keep)
+        return self._tail
+
+    def _name(self, filament_id: str) -> str:
+        getter = getattr(self._library, "get", None)
+        filament = getter(filament_id) if callable(getter) else None
+        return getattr(filament, "display_name", "") or str(filament_id)
+
+    def _entry_at(self, index: int) -> PaletteEntry:
+        """Build one entry for a three-filament colour (the only ones built)."""
+        recipes = self._triples.recipes_at(index)
+        recipe = recipes[0] if recipes else None
+        color_hex = self._triples.color_hex_at(index)
+        parts: tuple[tuple[str, int], ...] = ()
+        label = color_hex
+        if recipe is not None:
+            parts = (
+                (str(recipe.a_id), int(recipe.percent_a)),
+                (str(recipe.b_id), int(recipe.percent_b)),
+                (str(recipe.c_id), int(recipe.percent_c)),
+            )
+            label = " + ".join(
+                f"{self._name(parent)} {percent}%" for parent, percent in parts
+            )
+        rgb = tuple(int(value) for value in self._triples.rgb_at(index))
+        return PaletteEntry(
+            key=f"colour:{color_hex}",
+            color_hex=color_hex,
+            rgb=rgb,
+            lab=np.asarray(_color.lab_from_rgb(rgb), dtype=np.float64),
+            label=label,
+            kind="mix",
+            filament_ids=tuple(parent for parent, _percent in parts),
+            recipe=None,
+            recipes=(),
+            parts=parts,
+        )
+
+    # -- Sequence ----------------------------------------------------------
+    def __len__(self) -> int:
+        return len(self._head) + int(self._tail_indices().size)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return [self[position] for position in range(*index.indices(len(self)))]
+        position = int(index)
+        if position < 0:
+            position += len(self)
+        if not 0 <= position < len(self):
+            raise IndexError(index)
+        if position < len(self._head):
+            return self._head[position]
+        return self._entry_at(int(self._tail_indices()[position - len(self._head)]))
+
+    def lab_table(self) -> np.ndarray:
+        """``(len(self), 3)`` Lab, cached for the block search.
+
+        The tail reuses the catalogue's own cached table — it is the same Lab
+        values in the same order as ``packed``, and converting four million
+        colours twice would cost seconds for nothing.  Only the head, which the
+        catalogue never saw, is stacked here.
+        """
+        if self._table is None:
+            head = np.asarray([entry.lab for entry in self._head], dtype=np.float64)
+            head = head.reshape(len(self._head), 3)
+            tail = np.asarray(self._triples.lab_table(), dtype=np.float64)[
+                self._tail_indices()
+            ]
+            self._table = np.concatenate([head, tail], axis=0)
+        return self._table
+
+
+def _spool_ids(entry: PaletteEntry) -> tuple[str, ...]:
+    return tuple(str(value) for value in entry.filament_ids)
+
+
+def _renumber(
+    kept: list[PaletteEntry], folded: np.ndarray
+) -> tuple[list[PaletteEntry], np.ndarray, np.ndarray]:
+    """Recount ``folded`` and renumber largest-first, dropping empty entries.
+
+    ``folded`` holds compact indices into ``kept``.  Entries no pixel points at
+    any more are dropped outright — keeping one would put an unused filament in
+    the plate's slot list, which is the one thing the budget promises not to do.
+    """
+    live = np.unique(folded[folded >= 0])
+    counts = np.array(
+        [int(np.count_nonzero(folded == value)) for value in live], dtype=np.int64
+    )
+    order = np.argsort(-counts, kind="stable")
+    # ``order[rank] = position_in_live``, so the inverse maps a live index to
+    # the rank it ends up at.
+    rank_of_live = np.empty(live.size, dtype=_INDEX_DTYPE)
+    rank_of_live[order] = np.arange(live.size, dtype=_INDEX_DTYPE)
+    final = np.full(folded.shape, -1, dtype=_INDEX_DTYPE)
+    valid = folded >= 0
+    final[valid] = rank_of_live[np.searchsorted(live, folded[valid])]
+    return [kept[int(live[int(position)])] for position in order], counts[order], final
+
+
+def _affordable_nearest(
+    entry: PaletteEntry, budget: int, palette: Sequence[PaletteEntry] | None
+) -> PaletteEntry | None:
+    """The closest colour the budget can pay for, or ``None``.
+
+    Only the palette's own head is searched — spools and two-filament mixes.
+    A three-filament colour needs three spools, so with a budget below three it
+    can never be the answer, and walking the lazy tail to prove that would build
+    millions of entries to reject all of them.
+    """
+    if palette is None:
+        return None
+    candidates = getattr(palette, "head", None)
+    if candidates is None:
+        candidates = palette
+    best = None
+    best_value = float("inf")
+    for candidate in candidates:
+        if len(_spool_ids(candidate)) > budget:
+            continue
+        value = _color.delta_e_2000(entry.lab, candidate.lab)
+        if value < best_value:
+            best_value = value
+            best = candidate
+    return best
+
+
+def _fit_spool_budget(
+    kept: list[PaletteEntry],
+    indices: np.ndarray,
+    budget: int,
+    palette: Sequence[PaletteEntry] | None = None,
+) -> tuple[list[PaletteEntry], np.ndarray, np.ndarray] | None:
+    """Re-pick ``kept`` so the plan never asks for more than ``budget`` spools.
+
+    Walking the colours largest region first and refusing every one that would
+    introduce a spool the budget cannot pay for is the greedy reading of 「最多
+    用 N 卷料」: the big regions keep the colours the eye actually compares, and
+    a region whose recipe does not fit is repainted with the closest colour that
+    does.  ``kept`` is expected largest-first, which is how the caller hands it
+    over.  Returns ``None`` when nothing was dropped, so the caller keeps the
+    untouched result.
+    """
+    if budget <= 0 or len(kept) < 2:
+        return None
+
+    pool = list(kept)
+    needs = [set(_spool_ids(entry)) for entry in pool]
+    anchor = next(
+        (position for position, need in enumerate(needs) if len(need) <= budget), None
+    )
+    if anchor is None:
+        # Not one of the colours the picture picked can be printed inside the
+        # budget — a budget of one against a picture whose dominant colour is a
+        # mix, say.  Repainting with an affordable colour is the only way to
+        # keep the promise; the largest region is what it has to match.
+        fallback = _affordable_nearest(pool[0], budget, palette)
+        if fallback is not None:
+            pool.append(fallback)
+            needs.append(set(_spool_ids(fallback)))
+            anchor = len(pool) - 1
+        else:
+            # Nothing affordable exists at all (a budget below the cheapest
+            # recipe).  Keeping the largest colour beats deleting the picture.
+            anchor = 0
+    visit = [anchor] + [position for position in range(len(pool)) if position != anchor]
+
+    used: set[str] = set()
+    accepted: list[int] = []
+    remap = np.full(len(pool), -1, dtype=_INDEX_DTYPE)
+    for position in visit:
+        need = needs[position]
+        if not accepted:
+            used |= need
+            remap[position] = 0
+            accepted.append(position)
+            continue
+        if need <= used or len(used | need) <= budget:
+            used |= need
+            remap[position] = len(accepted)
+            accepted.append(position)
+            continue
+        entry = pool[position]
+        best = 0
+        best_value = float("inf")
+        for new_index, keep_position in enumerate(accepted):
+            value = _color.delta_e_2000(entry.lab, pool[keep_position].lab)
+            if value < best_value:
+                best_value = value
+                best = new_index
+        remap[position] = best
+
+    if len(accepted) == len(pool):
+        return None
+    folded = np.where(indices >= 0, remap[np.clip(indices, 0, None)], -1).astype(_INDEX_DTYPE)
+    # ``remap`` holds positions within ``accepted``, so the entries have to be
+    # re-expressed before renumbering; ``_renumber`` indexes into the list it is
+    # handed.
+    return _renumber([pool[position] for position in accepted], folded)
+
+
 def match_image(
     source: str | Path | Image.Image,
     palette: Sequence[PaletteEntry],
@@ -692,7 +1037,7 @@ def match_image(
 
     _report(progress, "在耗材与混色库里寻找最接近的颜色", 0.55)
     labs = _color.lab_from_rgb(colours)
-    chosen = _nearest_entries(labs, palette)
+    chosen = _nearest_entries(labs, palette, _palette_table(palette))
 
     _report(progress, "按像素分配颜色", 0.80)
     indices = np.where(mask, chosen[classes], -1).astype(_INDEX_DTYPE)
@@ -701,7 +1046,10 @@ def match_image(
     used = sorted(int(value) for value in np.unique(indices) if value >= 0)
     counts = np.array([int(np.count_nonzero(indices == value)) for value in used], dtype=np.int64)
     order = np.argsort(-counts, kind="stable")
-    kept = [list(palette)[used[int(position)]] for position in order]
+    # Indexed, never ``list(palette)``: with three-filament mixes on the pool is
+    # millions of colours and materialising it is the one thing that cannot be
+    # done.  ``used`` is at most the colour count, so this touches a handful.
+    kept = [palette[used[int(position)]] for position in order]
     remap = np.full(len(palette), -1, dtype=_INDEX_DTYPE)
     for new_index, position in enumerate(order):
         remap[used[int(position)]] = new_index
@@ -714,6 +1062,12 @@ def match_image(
     kept, ordered_counts, final = _merge_indistinguishable(
         kept, ordered_counts, final, config.merge_delta_e
     )
+    # 「最多用 N 卷料」 comes after the merge: folding two invisible shades
+    # together frees spools for free, so the budget should only have to work on
+    # colours that actually survived.
+    budgeted = _fit_spool_budget(kept, final, config.max_spools, palette)
+    if budgeted is not None:
+        kept, ordered_counts, final = budgeted
     if len(kept):
         pixels = np.asarray(image.convert("RGB"), dtype=np.float64).reshape(-1, 3)
         flat = final.reshape(-1)

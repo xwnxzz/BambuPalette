@@ -14,7 +14,7 @@ from pathlib import Path
 
 import numpy as np
 from PySide6.QtCore import QSize, Qt, QTimer
-from PySide6.QtGui import QAction, QColor, QKeySequence, QShortcut
+from PySide6.QtGui import QAction, QBrush, QColor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -487,7 +487,11 @@ class MainWindow(QMainWindow):
                 detail = f"RGB {red}, {green}, {blue}"
             item = QListWidgetItem(
                 swatch_icon(filament.color_hex, 28, 28),
-                f"{filament.display_name}   {detail}",
+                (
+                    f"{filament.display_name}   {detail}   （已隐藏）"
+                    if filament.hidden
+                    else f"{filament.display_name}   {detail}"
+                ),
             )
             item.setData(Qt.ItemDataRole.UserRole, filament.id)
             item.setToolTip(
@@ -496,8 +500,17 @@ class MainWindow(QMainWindow):
                 f"品牌：{filament.brand or '—'}\n"
                 f"种类：{filament.material_type or '—'}\n"
                 f"备注：{filament.note or '—'}"
+                + (
+                    "\n状态：已隐藏 —— 不参与混色，自己的颜色也不在「全部颜色」里"
+                    if filament.hidden
+                    else ""
+                )
             )
-            if self._pair_filter and filament.id in self._pair_filter:
+            if filament.hidden:
+                # 行留着（不然没法把它放回来），但灰掉，让「这卷现在不算数」一眼
+                # 看得出来。
+                item.setForeground(QBrush(QColor(theme.TEXT_FAINT)))
+            if not filament.hidden and self._pair_filter and filament.id in self._pair_filter:
                 font = item.font()
                 font.setBold(True)
                 item.setFont(font)
@@ -616,11 +629,43 @@ class MainWindow(QMainWindow):
         if filament is None:
             return
         menu = QMenu(self)
+        if filament.hidden:
+            menu.addAction("取消隐藏（重新参与混色）", lambda: self._set_hidden(filament, False))
+        else:
+            menu.addAction("隐藏（不参与混色）", lambda: self._set_hidden(filament, True))
+        menu.addSeparator()
         menu.addAction("编辑…", self._on_edit)
         menu.addAction("复制一条", lambda: self._on_duplicate(filament))
         menu.addSeparator()
         menu.addAction("删除", self._on_delete)
         menu.exec(self._list.mapToGlobal(position))
+
+    def _set_hidden(self, filament: Filament, hidden: bool) -> None:
+        """藏起一卷料，或者把它放回来。
+
+        隐藏不是删除：这一行还在表里，用户还得看得见它才能在想用的时候放回来。
+        变的是它贡献的颜色 —— 它不再是任何配方的原料，自己那一色也不进「全部
+        颜色」。 做法是让所有配方表都从 ``library.visible`` 建起来（而不是在
+        匹配器、网格、全部颜色、导出里各过滤一遍，那四处迟早会走岔）。
+
+        三色混色是跟着耗材清单算的，缓存键也来自那份清单，所以藏一卷料就相当于
+        换了一个耗材库：``_rebuild_catalog`` 里的 ``_invalidate_triples`` 会把
+        旧表丢掉（它里面还有这卷料），``_ensure_triples`` 再按新的键找缓存或重
+        算。 藏一卷料后第一次打开要等的那几分钟，就是重算三色混色的时间。
+        """
+        if filament.hidden == hidden:
+            return
+        self.library.update(filament.id, hidden=hidden)
+        if self._pair_filter and filament.id in self._pair_filter:
+            # 「只看这一对」里挂着它，格子会全空；先放开筛选再说。
+            self._pair_filter = None
+        self._reload_library()
+        self._select_filament(filament.id)
+        if hidden:
+            self._status.setText(
+                f"已隐藏 {filament.display_name}（{filament.color_hex}）："
+                "它不再参与混色，颜色也不在「全部颜色」里。右键可以放回来。"
+            )
 
     def _on_duplicate(self, filament: Filament) -> None:
         copy = filament.copy(name=(filament.name or filament.display_name) + " 副本")
@@ -688,14 +733,14 @@ class MainWindow(QMainWindow):
         try:
             with np.load(sidecar, allow_pickle=False) as data:
                 stored = str(data["key"].item()) if "key" in data else ""
-                if stored != triple_cache_key(self.library.filaments, self._catalog.engine.id):
+                if stored != triple_cache_key(self.library.visible, self._catalog.engine.id):
                     return False
                 payload = {name: data[name] for name in data.files if name != "key"}
         except Exception:
             return False
         try:
             catalog = TripleCatalog.loads(
-                self.library.filaments, payload, self._catalog.engine.id
+                self.library.visible, payload, self._catalog.engine.id
             )
         except Exception:
             return False
@@ -731,12 +776,12 @@ class MainWindow(QMainWindow):
                 # state first, which is the whole point.
                 QTimer.singleShot(BUILD_DELAY_MS, self._rebuild_catalog)
                 return
-            self._catalog = MixCatalog(self.library.filaments, MIX_RATIOS, engine=engine_id)
+            self._catalog = MixCatalog(self.library.visible, MIX_RATIOS, engine=engine_id)
             self._catalog.build()
         else:
             # Adding or deleting one spool only needs that spool's pairs; a full
             # rebuild is 66,420 recipes and ~3 s at 41 spools.
-            catalog.sync(self.library.filaments)
+            catalog.sync(self.library.visible)
         self._build_seconds = time.perf_counter() - started
         self._invalidate_triples()
         self._end_build_notice()
@@ -754,7 +799,7 @@ class MainWindow(QMainWindow):
 
     def _announce_build(self) -> None:
         """Say what the pending catalogue build is about to do."""
-        count = len(self.library)
+        count = len(self.library.visible)
         total = count * (count - 1) // 2 * len(MIX_RATIOS)
         # The grid's own empty state blames the library ("add two spools"); while
         # the calculation is running that is simply untrue.
@@ -839,9 +884,13 @@ class MainWindow(QMainWindow):
     # -- three-filament mixes ---------------------------------------------------
 
     def _triples_path(self):
-        """三色混色缓存在哪：一个耗材库 + 一个引擎一个文件。"""
+        """三色混色缓存在哪：一份耗材清单 + 一个引擎一个文件。
+
+        清单取 ``library.visible``：藏起一卷料就是换了一份清单，缓存键跟着变，
+        旧缓存里那份还带着这卷料的表就自然对不上了。
+        """
         engine_id = self._catalog.engine.id if self._catalog is not None else DEFAULT_ENGINE
-        key = triple_cache_key(self.library.filaments, engine_id)
+        key = triple_cache_key(self.library.visible, engine_id)
         return paths.data_dir() / "cache" / f"{TRIPLE_CACHE_PREFIX}{key}.npz"
 
     def _invalidate_triples(self) -> None:
@@ -866,15 +915,22 @@ class MainWindow(QMainWindow):
             self._combined = None
         else:
             self._combined = CombinedColours(
-                self._catalog, self._triples, self.library.filaments
+                self._catalog, self._triples, self.library.visible
             )
         self._combined_view = None
         self._combined_key = None
+        # The picture page may only offer three-filament colours once the table
+        # behind them is really finished — an unfinished catalogue has no
+        # ``packed`` array yet.  This is also the one place that knows both the
+        # table and the library it was built from, so the hand-over happens here
+        # rather than at each of the three call sites above.
+        ready = self._triples if self._triples is not None and self._triples.built else None
+        self._picture_page.setTriples(ready, self.library)
 
     def _ordered_combined(self, sort_key: str):
         """当前排序下的懒视图；排好的那一次留着，来回切设置不再重排。"""
         target = tuple(self._target_color.rgb())
-        signature = (sort_key, target, len(self.library))
+        signature = (sort_key, target, len(self.library.visible))
         if self._combined_key == signature and self._combined_view is not None:
             return self._combined_view
         self._combined_view = self._combined.ordered(sort_key, target)
@@ -892,31 +948,23 @@ class MainWindow(QMainWindow):
             return self._combined.search_hex(text)
         wanted = [
             filament.id
-            for filament in self.library.filaments
+            for filament in self.library.visible
             if query.casefold() in self._filament_haystack(filament)
         ]
         if not wanted:
             return np.empty(0, dtype=np.int64)
         return self._combined.search_spools(wanted)
 
-    # -- three-filament mixes ---------------------------------------------------
-
-    def _triples_path(self):
-        """三色混色缓存在哪：一个耗材库 + 一个引擎一个文件。"""
-        engine_id = self._catalog.engine.id if self._catalog is not None else DEFAULT_ENGINE
-        key = triple_cache_key(self.library.filaments, engine_id)
-        return paths.data_dir() / "cache" / f"{TRIPLE_CACHE_PREFIX}{key}.npz"
-
     def _ensure_triples(self) -> None:
         """三色混色不用谁去勾选：有 3 卷料就该有它，先看缓存，没有就算。"""
         if not self._auto_triples:
             return
-        if self._catalog is None or len(self.library) < 3:
+        if self._catalog is None or len(self.library.visible) < 3:
             return
         if self._triples is not None or self._triple_timer is not None:
             return
         cached = load_triple_cache(
-            self._triples_path(), self.library.filaments, self._catalog.engine.id
+            self._triples_path(), self.library.visible, self._catalog.engine.id
         )
         if cached is not None and cached.colour_count:
             self._triples = cached
@@ -928,7 +976,7 @@ class MainWindow(QMainWindow):
         self._start_triple_build()
 
     def _start_triple_build(self) -> None:
-        catalog = TripleCatalog(self.library.filaments, engine=self._catalog.engine.id)
+        catalog = TripleCatalog(self.library.visible, engine=self._catalog.engine.id)
         if not catalog.triple_count:
             return
         self._triples = catalog
@@ -1041,7 +1089,7 @@ class MainWindow(QMainWindow):
         self._status.setToolTip(text)
 
     def _update_status(self) -> None:
-        count = len(self.library)
+        count = len(self.library.visible)
         pairs = count * (count - 1) // 2
         shown = len(self._recipes)
         double_recipes = pairs * len(MIX_RATIOS)
@@ -1062,6 +1110,11 @@ class MainWindow(QMainWindow):
         note += f" · 共 {made:,} 个配比"
         if count:
             note += f" · 含 {count} 种耗材本色"
+        hidden = self.library.hidden_count
+        if hidden:
+            # 藏起来的料不在这条统计里，就得说出来，否则「耗材本色只有 40 种」
+            # 会像是丢了一卷。
+            note += f" · 另有 {hidden} 卷已隐藏（不参与混色）"
         note += f" · 去重后共 {everything:,} 个颜色"
         if self._pair_filter is not None:
             note += " · 已筛选"

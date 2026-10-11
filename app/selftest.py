@@ -567,6 +567,85 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     app.processEvents()
     check(page._dither.isEnabled(), "抖动 comes back on an opaque picture")
 
+    # 颜色数量: the 32 ceiling belongs to Bambu Studio, not to us, so the box has
+    # to say so — the user asked for a bigger number and got "拓竹还没放开".
+    from .mesh.threemf import MAX_PAINTED_FILAMENTS as _MAX_PAINTED
+
+    check(
+        page._colour_count.maximum() == _MAX_PAINTED,
+        f"颜色数量 stops at Bambu Studio's own ceiling ({_MAX_PAINTED})",
+    )
+    ceiling_tip = page._colour_count.toolTip()
+    check(
+        "Bambu Studio" in ceiling_tip and str(_MAX_PAINTED) in ceiling_tip,
+        "颜色数量 names Bambu Studio as the reason for the ceiling",
+    )
+    check("工单" in ceiling_tip, "and says the ceiling is reported to Bambu, not invented by us")
+
+    # 耗材上限 (m00780/m00840 #4): 0 = 不限制, otherwise the plan may spend only
+    # that many spools, and colours that do not fit are replaced.
+    check(page._spool_cap.value() == 0, "耗材上限 starts at 0 = 不限制")
+    check(
+        page._spool_cap.maximum() == _MAX_PAINTED,
+        "耗材上限 cannot promise more spools than a project can hold",
+    )
+    check(page._settings().max_spools == 0, "0 carries through to the matcher as 不限制")
+    page._spool_cap.setValue(2)
+    check(page._settings().max_spools == 2, "the spin box reaches the matcher")
+    page._spool_cap.setValue(0)
+
+    capped = match_image(picture, palette, MatchSettings(max_colours=12, max_spools=1))
+    spent = sorted({parent for entry in capped.palette for parent in entry.filament_ids})
+    check(len(spent) <= 1, f"耗材上限 1 really spends one spool ({spent})")
+    check(capped.printed_pixels > 0, "and the picture is still printed, not blanked")
+
+    # 三色配方 (m00840 #1): the candidate pool cannot be built up front, so the
+    # checkbox stays grey until the 颜色配方 page has finished the triples.
+    from .core.triples import TripleCatalog as _TripleCatalog
+    from .ui.picture_page import TriplePalette as _TriplePalette
+
+    check(
+        not page._include_triples.isEnabled(),
+        "也算三色配方 waits, greyed, until the triples are finished",
+    )
+    head_pool = page._candidate_palette()
+    check(
+        not isinstance(page._match_palette(), _TriplePalette),
+        "an unticked 也算三色配方 keeps the two-filament pool",
+    )
+    triples = _TripleCatalog(library.filaments, engine=ENGINE_MIXER).build()
+    page.setTriples(triples, library)
+    app.processEvents()
+    check(page._include_triples.isEnabled(), "也算三色配方 comes alive once the triples are built")
+    page._include_triples.setChecked(True)
+    pool = page._match_palette()
+    check(isinstance(pool, _TriplePalette), "ticking it swaps in the three-filament pool")
+    check(len(pool) > len(head_pool), f"the pool grows ({len(head_pool)} → {len(pool)})")
+    check(
+        all(entry.key == other.key for entry, other in zip(pool[: len(head_pool)], head_pool)),
+        "the spools and pairs still come first, untouched",
+    )
+    tail = pool[len(head_pool)]
+    check(
+        len(tail.parts) == 3 and len(tail.filament_ids) == 3,
+        f"the first new colour names three spools ({tail.label})",
+    )
+    check(
+        sum(percent for _parent, percent in tail.parts) == 100,
+        f"its recipe adds up to 100% ({tail.ratio_text})",
+    )
+    check(
+        page._match_palette() is pool,
+        "the pool is built once, not once per match",
+    )
+    page._include_triples.setChecked(False)
+    page.setTriples(None, library)
+    app.processEvents()
+    check(
+        not page._include_triples.isEnabled() and not page._include_triples.isChecked(),
+        "without triples the box goes back to grey and unticked",
+    )
+
     page.buildPlate()
     plate = page.plate
     check(plate is not None, "a plate was built")

@@ -13,6 +13,7 @@ choose; all Qt file dialogs default to the app's own exports directory.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -49,6 +50,7 @@ from ..core.image_matching import (
     MatchResult,
     MatchSettings,
     PaletteEntry,
+    TriplePalette,
     build_palette,
     match_image,
 )
@@ -785,6 +787,14 @@ class PicturePage(QWidget):
         # it was built for.
         self._candidates: list[PaletteEntry] | None = None
         self._candidates_for: bool | None = None
+        #: The three-filament catalogue, pushed in by the main window whenever it
+        #: is (re)built.  ``None`` means 「not ready」, which is why the
+        #: 「也算三色配方」 box stays greyed out until it arrives.
+        self._triples = None
+        self._triple_palette = None
+        #: The head list ``_triple_palette`` was built from, so the cache can be
+        #: invalidated by identity instead of by rebuilding the tail.
+        self._triple_head: list[PaletteEntry] | None = None
         self._build_ui()
         self._set_controls_enabled(False)
         self._update_actions()
@@ -802,11 +812,32 @@ class PicturePage(QWidget):
         self._include_mixes.setChecked(True)
         self._include_mixes.setToolTip("勾选后，候选颜色包含全部两两混色的 81 个配比")
 
+        # Three-filament mixes are the same idea one step further, and the reason
+        # this box starts greyed out is honest: they only exist once the
+        # 「颜色配方」 page has finished computing them.
+        self._include_triples = QCheckBox("也算三色配方")
+        self._include_triples.setToolTip(
+            "勾选后，候选颜色再算上三种耗材的混色。它比两两混色多得多"
+            "（41 卷料约 400 万种），匹配会慢几秒；三色配方要先在「颜色配方」页算完。"
+        )
+        self._include_triples.setEnabled(False)
+
         self._colour_count = QSpinBox()
         self._colour_count.setRange(2, MAX_PAINTED_FILAMENTS)
         self._colour_count.setValue(12)
         self._colour_count.setToolTip(
-            f"图片最多用多少种颜色；越少越省换料。Bambu Studio 最多认 {MAX_PAINTED_FILAMENTS} 种"
+            f"图片最多用多少种颜色；越少越省换料。\n"
+            f"上限 {MAX_PAINTED_FILAMENTS} 是 Bambu Studio 自己的限制：一个工程里只认 "
+            f"{MAX_PAINTED_FILAMENTS} 个耗材位，第 {MAX_PAINTED_FILAMENTS + 1} 种颜色在"
+            "切片时会被丢掉。我们已经就这条限制向拓竹提了工单；等它放开，这里才能跟着放开。"
+        )
+
+        self._spool_cap = QSpinBox()
+        self._spool_cap.setRange(0, MAX_PAINTED_FILAMENTS)
+        self._spool_cap.setValue(0)
+        self._spool_cap.setToolTip(
+            "这个模型最多用几卷耗材；0 表示不限制。装不下的颜色会用最接近的、"
+            "只用得起的颜色代替。"
         )
 
         self._max_dimension = QSpinBox()
@@ -823,9 +854,12 @@ class PicturePage(QWidget):
         top.addWidget(self._import_button)
         top.addWidget(QLabel("颜色数量:"))
         top.addWidget(self._colour_count)
+        top.addWidget(QLabel("耗材上限:"))
+        top.addWidget(self._spool_cap)
         top.addWidget(QLabel("最大边长:"))
         top.addWidget(self._max_dimension)
         top.addWidget(self._include_mixes)
+        top.addWidget(self._include_triples)
         top.addWidget(self._dither)
         top.addWidget(self._rematch_button)
         top.addStretch(1)
@@ -1045,6 +1079,8 @@ class PicturePage(QWidget):
         self._library = library
         self._catalog = catalog
         self._candidates = None
+        self._triple_palette = None
+        self._triple_head = None
         if self._image is None:
             return
         if not self.isVisible():
@@ -1055,6 +1091,24 @@ class PicturePage(QWidget):
             self._stale = True
             return
         self._on_rematch()
+
+    def setTriples(self, triples, library: FilamentLibrary | None = None) -> None:
+        """Hand over the three-filament catalogue once it exists.
+
+        The box that offers them starts greyed out and the tooltip says why; it
+        only lights up when there is something behind it.  Unchecking on the way
+        in matters when the catalogue is replaced (a spool was hidden or added):
+        the old palette is dropped either way, because a three-filament colour is
+        only valid for the spool set it was computed from.
+        """
+        self._triples = triples
+        self._triple_palette = None
+        self._triple_head = None
+        self._include_triples.setEnabled(triples is not None)
+        if triples is None:
+            self._include_triples.setChecked(False)
+        if library is not None:
+            self._library = library
 
     def showEvent(self, event) -> None:  # noqa: N802 (Qt naming)
         super().showEvent(event)
@@ -1129,6 +1183,7 @@ class PicturePage(QWidget):
             max_colours=int(self._colour_count.value()),
             max_dimension=int(self._max_dimension.value()),
             dither=bool(self._dither.isChecked()),
+            max_spools=int(self._spool_cap.value()),
         ).clamped()
 
     def _candidate_palette(self) -> list[PaletteEntry]:
@@ -1146,13 +1201,35 @@ class PicturePage(QWidget):
             self._candidates_for = wanted
         return self._candidates
 
+    def _match_palette(self) -> Sequence[PaletteEntry]:
+        """What the matcher is allowed to pick from.
+
+        Without three-filament mixes this is simply ``_candidate_palette()``.
+        With them it is that same list plus a lazy tail over the triple
+        catalogue: four million colours cannot be built as objects, so only the
+        few the picture actually keeps ever become one.  The head still wins its
+        ties, which is why the tail skips colours the head already offers.
+
+        The cache is keyed on the head *list* we handed over, not on
+        ``pool.head``: ``TriplePalette`` copies what it is given, so comparing
+        against its own copy would rebuild the tail — a four-million-row
+        membership test — on every single match.
+        """
+        head = self._candidate_palette()
+        if not self._include_triples.isChecked() or self._triples is None:
+            return head
+        if self._triple_palette is None or self._triple_head is not head:
+            self._triple_palette = TriplePalette(head, self._triples, self._library)
+            self._triple_head = head
+        return self._triple_palette
+
     def _on_rematch(self) -> None:
         if self._image is None:
             return
         if self._library is None or len(self._library) == 0:
             self._status.setText("请先在「颜色配方」页添加耗材，再匹配图片。")
             return
-        palette = self._candidate_palette()
+        palette = self._match_palette()
         if not palette:
             self._status.setText("调色板是空的，请先添加耗材。")
             return
