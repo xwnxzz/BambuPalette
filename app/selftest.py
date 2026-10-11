@@ -463,6 +463,110 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     app.processEvents()
     check(page.result is not None, "the picture page matched the picture")
 
+    # m00519 #2: 「原图 / 预览」用滚轮缩放、按住左键拖动平移、双击还原成整张。
+    from PySide6.QtCore import QEvent as _QEvent
+    from PySide6.QtCore import QPointF as _QPointF
+    from PySide6.QtCore import Qt as _Qt
+    from PySide6.QtGui import QMouseEvent as _QMouse
+
+    from .ui import picture_page as _pp
+
+    def _mouse(kind, pos, *, buttons=_Qt.MouseButtons.NoButton):
+        return _QMouse(
+            kind, pos, pos, _Qt.MouseButton.LeftButton, buttons, _Qt.KeyboardModifier.NoModifier
+        )
+
+    probe = _pp.PictureView()
+    probe.resize(400, 300)
+    probe.setResult(page.result, page._view._source)
+    app.processEvents()
+    check(probe.zoom() == _pp.ZOOM_MIN, "预览 starts at 「整张铺满面板」")
+    fit = probe._target_rect()
+    fit_scale = probe._scale
+    focus = _QPointF(probe.width() / 2.0, probe.height() / 2.0)
+    probe.zoom_by(2.0, focus)
+    app.processEvents()
+    zoomed = probe._target_rect()
+    check(
+        abs(probe.zoom() - _pp.ZOOM_STEP**2) < 1e-9,
+        f"two wheel notches zoom to {probe.zoom():.3f}×",
+    )
+    check(
+        zoomed.width() > fit.width() and probe._scale > fit_scale,
+        "zooming in draws the picture bigger than the panel",
+    )
+    check(
+        abs((zoomed.x() + (focus.x() - fit.x()) / fit_scale * probe._scale) - focus.x()) < 0.5,
+        "the pixel under the cursor stays under the cursor while zooming",
+    )
+    probe.zoom_by(50.0, focus)
+    check(abs(probe.zoom() - _pp.ZOOM_MAX) < 1e-9, f"zoom stops at {_pp.ZOOM_MAX:g}×")
+
+    # 拖动平移：按下、移动超过阈值、松手 —— 只平移，不挑颜色。
+    picked: list[int] = []
+    probe.regionClicked.connect(picked.append)
+    start = _QPointF(probe.width() / 2.0, probe.height() / 2.0)
+    dragged_to = _QPointF(start.x() + 60.0, start.y() + 45.0)
+    probe.mousePressEvent(
+        _mouse(_QEvent.Type.MouseButtonPress, start, buttons=_Qt.MouseButtons.LeftButton)
+    )
+    probe.mouseMoveEvent(
+        _mouse(_QEvent.Type.MouseMove, dragged_to, buttons=_Qt.MouseButtons.LeftButton)
+    )
+    probe.mouseReleaseEvent(_mouse(_QEvent.Type.MouseButtonRelease, dragged_to))
+    app.processEvents()
+    check(not picked, "dragging to pan never picks a colour on the way")
+    check(probe._pan != _QPointF(0.0, 0.0), "dragging moves the picture inside the panel")
+    limit_x = max(0.0, (probe._draw_size()[0] - probe.width()) / 2.0)
+    check(
+        abs(probe._pan.x()) <= limit_x + 0.5,
+        "panning is clamped so the picture never leaves the panel",
+    )
+    check(
+        page._original_view.toolTip() == _pp.ZOOM_HINT and probe.toolTip() == _pp.ZOOM_HINT,
+        "both panels explain 滚轮缩放 / 拖动平移",
+    )
+
+    probe.reset_zoom()
+    app.processEvents()
+    check(
+        probe.zoom() == _pp.ZOOM_MIN and probe._pan == _QPointF(0.0, 0.0),
+        "double-clicking (reset) goes back to the whole picture",
+    )
+    # A plain click must still pick the colour under the cursor.
+    import numpy as np  # noqa: PLC0415
+
+    rect = probe._target_rect()
+    printed = np.argwhere(page.result.indices >= 0)
+    row, column = (int(value) for value in printed[len(printed) // 2])
+    spot = _QPointF(rect.x() + (column + 0.5) * probe._scale, rect.y() + (row + 0.5) * probe._scale)
+    probe.mousePressEvent(
+        _mouse(_QEvent.Type.MouseButtonPress, spot, buttons=_Qt.MouseButtons.LeftButton)
+    )
+    probe.mouseReleaseEvent(_mouse(_QEvent.Type.MouseButtonRelease, spot))
+    app.processEvents()
+    check(
+        picked == [int(page.result.indices[row, column])],
+        f"a plain click still picks the colour under the cursor ({picked})",
+    )
+    probe.deleteLater()
+
+    # 抖动对有透明区域的图没有意义（有颜色的像素会被挤成一行再量化，那一行上没有
+    # 邻居关系），所以那种图上直接灰掉并且说明原因，而不是让用户勾了没反应。
+    check(page._dither.isEnabled(), "an opaque picture keeps 抖动 selectable")
+    check("误差扩散" in page._dither.toolTip(), "抖动 explains itself while it can still act")
+    transparent = scratch / "selftest-alpha.png"
+    alpha_image = Image.new("RGBA", (32, 32), "#F2F0EB")
+    ImageDraw.Draw(alpha_image).rectangle((0, 0, 7, 31), fill=(242, 240, 235, 0))
+    alpha_image.save(transparent)
+    page.loadImage(transparent)
+    app.processEvents()
+    check(not page._dither.isEnabled(), "no meaningful dithering on a transparent picture")
+    check("透明" in page._dither.toolTip(), "and the checkbox says why it went grey")
+    page.loadImage(picture)
+    app.processEvents()
+    check(page._dither.isEnabled(), "抖动 comes back on an opaque picture")
+
     page.buildPlate()
     plate = page.plate
     check(plate is not None, "a plate was built")

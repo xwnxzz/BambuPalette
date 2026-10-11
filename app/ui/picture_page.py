@@ -72,6 +72,16 @@ __all__ = ["PicturePage", "PictureView", "ColourList"]
 
 IMAGE_FILTER = "图片 (*.png *.jpg *.jpeg *.bmp *.webp *.gif *.tif *.tiff);;所有文件 (*)"
 
+#: Wheel zoom runs between 「整张铺满面板」 (1.0) and this many times the fit.
+ZOOM_MIN = 1.0
+ZOOM_MAX = 12.0
+#: One wheel notch multiplies the zoom by this much.
+ZOOM_STEP = 1.25
+#: A press that moves fewer than this many pixels counts as a click, not a drag.
+DRAG_SLOP = 3.0
+#: The two picture panels are panned and zoomed the same way.
+ZOOM_HINT = "滚轮缩放，按住左键拖动平移，双击还原成整张。"
+
 
 def _to_qimage(image: Image.Image) -> QImage:
     """PIL image → QImage, copying so the buffer outlives the PIL object."""
@@ -108,14 +118,35 @@ class PictureView(QWidget):
         self._plain = False
         self._scale = 1.0
         self._origin = QPointF(0.0, 0.0)
+        # 缩放和平移叠在「铺满面板」之上：_fit_scale 由面板尺寸算出来，_zoom 是
+        # 用户用滚轮乘上去的倍数，_pan 是像素位移。三者分开以后，改窗口大小仍然
+        # 是以「铺满」为基准，不会把之前放大的倍数算丢。
+        self._fit_scale = 1.0
+        self._zoom = 1.0
+        self._pan = QPointF(0.0, 0.0)
+        self._press_pos: QPointF | None = None
+        self._last_pos: QPointF | None = None
+        self._dragged = False
+        self.setToolTip(ZOOM_HINT)
 
     # -- contents ---------------------------------------------------------
     def setResult(self, result: MatchResult | None, source: QImage | None) -> None:
+        previous = self._source
         self._result = result
         self._source = source
         self._matched = self._build_matched(result) if result is not None else None
         self._selected = -1
         self._highlight = None
+        same_picture = (
+            previous is not None
+            and source is not None
+            and previous.width() == source.width()
+            and previous.height() == source.height()
+        )
+        if not same_picture:
+            # 换了图片（或者清空了）就回到「整张铺满」，否则用户一打开新图看到的
+            # 是上一张留下来的某个角落。
+            self.reset_zoom(update=False)
         self.update()
 
     def setSelected(self, index: int) -> None:
@@ -167,11 +198,81 @@ class PictureView(QWidget):
         width, height = self._result.width, self._result.height
         available_w = max(1, self.width() - 8)
         available_h = max(1, self.height() - 8)
-        self._scale = min(available_w / width, available_h / height)
+        self._fit_scale = min(available_w / width, available_h / height)
+        self._scale = self._fit_scale * self._zoom
         draw_w = width * self._scale
         draw_h = height * self._scale
-        self._origin = QPointF((self.width() - draw_w) / 2.0, (self.height() - draw_h) / 2.0)
+        if self._zoom <= ZOOM_MIN:
+            # 没有放大就没有可平移的余量：永远居中，免得图片被拖到面板外。
+            self._pan = QPointF(0.0, 0.0)
+        self._pan = self._clamped_pan(self._pan, draw_w, draw_h)
+        self._origin = QPointF(
+            (self.width() - draw_w) / 2.0 + self._pan.x(),
+            (self.height() - draw_h) / 2.0 + self._pan.y(),
+        )
         return QRectF(self._origin.x(), self._origin.y(), draw_w, draw_h)
+
+    def _draw_size(self) -> tuple[float, float]:
+        """How big the picture is drawn right now, in panel pixels."""
+        result = self._result
+        if result is None:
+            return 0.0, 0.0
+        scale = self._fit_scale * self._zoom
+        return result.width * scale, result.height * scale
+
+    def _clamped_pan(self, pan: QPointF, draw_w: float, draw_h: float) -> QPointF:
+        """Hold the pan inside the picture, so panning never opens a gap."""
+        limit_x = max(0.0, (draw_w - self.width()) / 2.0)
+        limit_y = max(0.0, (draw_h - self.height()) / 2.0)
+        return QPointF(
+            min(max(pan.x(), -limit_x), limit_x),
+            min(max(pan.y(), -limit_y), limit_y),
+        )
+
+    def zoom(self) -> float:
+        return self._zoom
+
+    def reset_zoom(self, *, update: bool = True) -> None:
+        """Back to 「整张铺满面板」, centred."""
+        self._zoom = ZOOM_MIN
+        self._pan = QPointF(0.0, 0.0)
+        if update:
+            self.update()
+
+    def zoom_by(self, steps: float, focus: QPointF | None = None) -> None:
+        """Zoom by ``steps`` wheel notches around ``focus`` (panel pixels).
+
+        Public so the self-check can drive it without a real wheel event.
+        """
+        if self._result is None or steps == 0.0:
+            return
+        if focus is None:
+            focus = QPointF(self.width() / 2.0, self.height() / 2.0)
+        self._zoom_to(self._zoom * (ZOOM_STEP**steps), focus)
+
+    def _zoom_to(self, zoom: float, focus: QPointF) -> None:
+        """Zoom so the picture point under ``focus`` stays under ``focus``."""
+        result = self._result
+        if result is None:
+            return
+        rect = self._target_rect()  # also refreshes _fit_scale for this panel size
+        if self._scale <= 0.0:
+            return
+        image_x = (focus.x() - rect.x()) / self._scale
+        image_y = (focus.y() - rect.y()) / self._scale
+        zoom = min(max(zoom, ZOOM_MIN), ZOOM_MAX)
+        if abs(zoom - self._zoom) < 1e-9:
+            return
+        self._zoom = zoom
+        scale = self._fit_scale * zoom
+        draw_w = result.width * scale
+        draw_h = result.height * scale
+        pan = QPointF(
+            focus.x() - (self.width() - draw_w) / 2.0 - image_x * scale,
+            focus.y() - (self.height() - draw_h) / 2.0 - image_y * scale,
+        )
+        self._pan = self._clamped_pan(pan, draw_w, draw_h)
+        self.update()
 
     def _base_image(self) -> QImage | None:
         if self._plain or not self._show_matched:
@@ -237,15 +338,85 @@ class PictureView(QWidget):
         painter.drawRect(rect)
         painter.end()
 
+    def wheelEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        if self._result is None:
+            event.ignore()
+            return
+        steps = event.angleDelta().y() / 120.0
+        if steps == 0.0:
+            event.ignore()
+            return
+        # A high-resolution wheel reports fractions of a notch; the exponent form
+        # handles those and whole notches with the same line.
+        self.zoom_by(steps, event.position())
+        event.accept()
+
     def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        if event.button() != Qt.MouseButton.LeftButton or self._result is None:
+            return
+        # 「点一下挑颜色」和「按住拖动平移」共用左键，所以按下时只记录起点，
+        # 究竟算哪一种，等松手时按移动距离判断。
+        position = event.position()
+        self._press_pos = QPointF(position)
+        self._last_pos = QPointF(position)
+        self._dragged = False
+        if self._zoom > ZOOM_MIN:
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        if self._press_pos is None or self._last_pos is None:
+            return
+        position = event.position()
+        if not self._dragged:
+            moved = position - self._press_pos
+            if abs(moved.x()) + abs(moved.y()) < DRAG_SLOP:
+                return
+            self._dragged = True
+        if self._zoom <= ZOOM_MIN:
+            return
+        self._target_rect()  # refreshes _fit_scale before the pan is clamped
+        draw_w, draw_h = self._draw_size()
+        self._pan = self._clamped_pan(self._pan + (position - self._last_pos), draw_w, draw_h)
+        self._last_pos = QPointF(position)
+        self.update()
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        press = self._press_pos
+        dragged = self._dragged
+        self._press_pos = None
+        self._last_pos = None
+        self._dragged = False
+        self.unsetCursor()
+        if press is None:
+            return
+        if dragged:
+            # 这是一次平移：画面动过了，鼠标下已经不是用户当初点的那个像素。
+            return
+        self._pick_at(event.position())
+
+    def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        if event.button() != Qt.MouseButton.LeftButton or self._zoom <= ZOOM_MIN:
+            return
+        # 双击 = 「我看够了，还我整张」。顺手丢掉这次按下留下的状态，免得松手时
+        # 又当成一次点选。
+        self._press_pos = None
+        self._last_pos = None
+        self._dragged = False
+        self.unsetCursor()
+        self.reset_zoom()
+
+    def _pick_at(self, position: QPointF) -> None:
+        """Report the colour of the pixel under ``position``, if there is one."""
         result = self._result
         if self._plain or result is None:
             return
         rect = self._target_rect()
-        if not rect.contains(event.position()):
+        if not rect.contains(position):
             return
-        x = int((event.position().x() - rect.x()) / self._scale)
-        y = int((event.position().y() - rect.y()) / self._scale)
+        x = int((position.x() - rect.x()) / self._scale)
+        y = int((position.y() - rect.y()) / self._scale)
         if not (0 <= x < result.width and 0 <= y < result.height):
             return
         index = int(result.indices[y, x])
@@ -807,8 +978,16 @@ class PicturePage(QWidget):
         right.setSizes([420, 340])
 
         pictures = QSplitter(Qt.Orientation.Horizontal)
-        pictures.addWidget(self._wrap(_scrollable(self._original_view), "原图"))
-        pictures.addWidget(self._wrap(_scrollable(self._view), "预览"))
+        # 原图 and 预览 both zoom and pan with the same gesture, so the hint goes
+        # on the whole panel — picture, scroll area and title — and not just on the
+        # canvas, where a zoomed-in picture would cover it.
+        original_area = _scrollable(self._original_view)
+        preview_area = _scrollable(self._view)
+        for area in (original_area, preview_area):
+            area.setToolTip(ZOOM_HINT)
+            area.viewport().setToolTip(ZOOM_HINT)
+        pictures.addWidget(self._wrap(original_area, "原图", ZOOM_HINT))
+        pictures.addWidget(self._wrap(preview_area, "预览", ZOOM_HINT))
         # 预览 is the one the user works in, so it gets the extra room.
         pictures.setStretchFactor(0, 1)
         pictures.setStretchFactor(1, 1)
@@ -833,11 +1012,14 @@ class PicturePage(QWidget):
         layout.addWidget(self._status)
         layout.addLayout(bottom)
 
-    def _wrap(self, widget: QWidget, title: str) -> QWidget:
+    def _wrap(self, widget: QWidget, title: str, hint: str = "") -> QWidget:
         frame = QFrame()
         frame.setObjectName("panel")
         header = QLabel(title)
         header.setProperty("role", "sectionTitle")
+        if hint:
+            header.setToolTip(hint)
+            frame.setToolTip(hint)
         box = QVBoxLayout(frame)
         box.setContentsMargins(10, 8, 10, 10)
         box.setSpacing(8)
@@ -907,7 +1089,30 @@ class PicturePage(QWidget):
             image = source
         self._image = image.convert("RGBA")
         self._source_qimage = _to_qimage(self._image)
+        self._sync_dither_state()
         self._on_rematch()
+
+    def _sync_dither_state(self) -> None:
+        """灰掉「抖动」——如果这张图根本用不上它。
+
+        抖动是误差扩散：它要靠「左右邻居」把量化误差摊出去。而带透明区域的图会先被
+        拆成「有颜色的像素」和「透明像素」两部分，有颜色的那部分被挤成一整行交给量化器，
+        那一行上没有任何有意义的邻居关系，扩散出去只会是噪点。所以
+        ``reduce_colours()`` 在 ``keep is not None`` 时直接忽略这个开关；与其让用户勾了
+        没反应，不如直接灰掉并且说清楚。
+        """
+        threshold = self._settings().alpha_threshold
+        blocked = False
+        if self._image is not None:
+            alpha = np.asarray(self._image.getchannel("A"), dtype=np.uint8)
+            blocked = bool((alpha <= threshold).any())
+        self._dither.setEnabled(not blocked)
+        self._dither.setToolTip(
+            "这张图有透明区域，抖动对它不生效：有颜色的像素会被挤成一行再量化，"
+            "那一行上邻居关系没有意义，误差扩散只会变成噪点。"
+            if blocked
+            else "用误差扩散让渐变更平滑，但会牺牲色块的纯净度"
+        )
 
     def _on_import(self) -> None:
         start = str(paths.projects_dir())
