@@ -277,6 +277,35 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     add_dialog._color.setValue("#123456")
     check(add_dialog._ok_button.isEnabled(), "确认 stays enabled once a colour is entered")
     check(add_dialog.values()["color_hex"] == "#123456", "the entered colour is reported")
+    # m10238 item 3: 下一个 sits immediately left of 确认 and means "save this one,
+    # then open a fresh empty form".
+    check(
+        add_dialog._next_button.text() == "下一个",
+        f"the add dialog offers 下一个, got {add_dialog._next_button.text()!r}",
+    )
+    check(not add_dialog.wants_another(), "a plain 确认 does not ask for another spool")
+    # 下一个 must sit immediately left of 确认: the row is read off the dialog, not
+    # assumed, because a QDialogButtonBox would park it at the far left edge.
+    from PySide6.QtWidgets import QHBoxLayout as _QHBoxLayout
+
+    button_row = next(
+        layout
+        for layout in add_dialog.findChildren(_QHBoxLayout)
+        if layout.indexOf(add_dialog._ok_button) >= 0
+    )
+    left, right = button_row.indexOf(add_dialog._next_button), button_row.indexOf(
+        add_dialog._ok_button
+    )
+    check(
+        0 <= left == right - 1,
+        f"下一个 sits immediately before 确认, got next={left} ok={right}",
+    )
+    add_dialog._next_button.click()
+    check(add_dialog.wants_another(), "下一个 asks for another spool")
+    check(
+        add_dialog.result() == FilamentDialog.DialogCode.Accepted,
+        "下一个 accepts the dialog so the spool is kept",
+    )
     check(
         add_dialog.build_filament().color_hex == "#123456",
         "a spool built from the dialog carries the entered colour",
@@ -496,12 +525,44 @@ def run_selftest(*, report_path: Path | None = None) -> int:
             f"多选 lets two plain clicks keep two colours: {page._list.selected_indices()}",
         )
         check(page._merge_button.isEnabled(), "合并 lights up from a plain multi-selection")
+        # m10238 item 4a: while 多选 is on, clicking a block in 「预览」 has to join
+        # the selection too — the picture and the list are the same regions.
+        before_toggle = set(page._list.selected_indices())
+        page._on_region_clicked(2)
+        app.processEvents()
+        check(
+            len(page._list.selected_indices()) == len(before_toggle) + 1,
+            f"a click in 预览 adds a colour while 多选 is on: {page._list.selected_indices()}",
+        )
+        page._on_region_clicked(2)
+        app.processEvents()
+        check(
+            set(page._list.selected_indices()) == before_toggle,
+            "clicking the same block again takes it back out",
+        )
         page._multi_button.setChecked(False)
         app.processEvents()
         check(
             len(page._list.selected_indices()) == 2,
             "the selection survives turning 多选 back off",
         )
+        # m10238 item 4b: a click must never reshuffle the list, or the row under
+        # the cursor becomes a different colour than the one just clicked.
+        order_before = [
+            page._list._list.item(i).data(Qt.ItemDataRole.UserRole)
+            for i in range(page._list._list.count())
+        ]
+        page._list.pin(1)
+        app.processEvents()
+        check(
+            [
+                page._list._list.item(i).data(Qt.ItemDataRole.UserRole)
+                for i in range(page._list._list.count())
+            ]
+            == order_before,
+            "clicking a colour never reorders the list",
+        )
+        check(page._list._row_of(1) == 1, "the clicked colour stays in its own row")
         page._list.select([doomed])
         page._on_delete_colours()
         app.processEvents()
@@ -644,6 +705,41 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         "关于 points at the exe's file properties",
     )
     check(window._find_button.isEnabled(), "找最接近的颜色 is clickable before a target is picked")
+    check(
+        _version in window.windowTitle(),
+        f"the title bar carries the version, got {window.windowTitle()!r}",
+    )
+
+    # m10238 item 2: with an empty 目标颜色 the button must SEARCH, not just print
+    # a hint — it borrows the colour the user is looking at and says so.
+    window._target_color.clear()
+    window._clear_filters()
+    app.processEvents()
+    borrowed_cell = window._recipes[len(window._recipes) // 2]
+    window._grid.selectRecipe(borrowed_cell)
+    window._find_button.click()
+    app.processEvents()
+    check(
+        "目标颜色取自" in window._status.text(),
+        f"an empty target borrows one instead of refusing, got {window._status.text()[:70]!r}",
+    )
+    check(
+        borrowed_cell.color_hex.upper() in window._status.text().upper(),
+        "the borrowed target is the colour the user was looking at",
+    )
+    check(
+        window._target_color.hex().upper() == borrowed_cell.color_hex.upper(),
+        "the borrowed colour is shown in the 目标颜色 field",
+    )
+    window._target_color.clear()
+    window._grid.clearSelection()
+    app.processEvents()
+    window._find_button.click()
+    app.processEvents()
+    check(
+        "数字框里的 RGB" in window._status.text(),
+        f"with no table selection the R/G/B numbers are used, got {window._status.text()[:70]!r}",
+    )
 
     # A spool's own colour has exactly ONE parent — itself.  Row 3 used to keep
     # showing the previous three-colour recipe's 「耗材丝3 … 12%」, so a raw spool

@@ -124,7 +124,10 @@ class MainWindow(QMainWindow):
         self._auto_triples = auto_triples
         self._build_notice = False
 
-        self.setWindowTitle("BambuPalette — 混色耗材色彩管理器")
+        # The version rides in the title bar so 「我装的是哪一版」 never needs a trip
+        # through Explorer → 属性.  It is the same string the exe's file properties
+        # carry: build/BambuPalette.spec reads it out of app/__init__.py.
+        self.setWindowTitle(f"BambuPalette {__version__} — 混色耗材色彩管理器")
         self.resize(1320, 840)
         self.setMinimumSize(1020, 640)
 
@@ -209,12 +212,13 @@ class MainWindow(QMainWindow):
         self._target_color.colorChanged.connect(self._on_target_color_changed)
         self._find_button = QPushButton("找最接近的颜色")
         self._find_button.setToolTip(
-            "先点「目标颜色」选好想打印的颜色，再按这里；"
-            "程序会按 CIEDE2000 在当前显示的全部颜色里找出最接近的一个"
+            "不用先填目标颜色也能按：没填就拿颜色表里选中的那个颜色来比，"
+            "表里也没选就拿 R / G / B 三个数字框里的值。"
+            "程序按 CIEDE2000 在当前显示的全部颜色里找出最接近的一个"
         )
         # Deliberately always clickable — exactly like 确认 in the 添加耗材 dialog.
-        # Pressing it before choosing a colour is not an error, it just explains
-        # what is missing, so there is no reason to grey the button out.
+        # Pressing it before choosing a colour is not an error: it borrows the
+        # colour the user is already looking at and says so in the bottom line.
         self._find_button.clicked.connect(self._on_find_nearest)
 
         controls = QHBoxLayout()
@@ -516,28 +520,40 @@ class MainWindow(QMainWindow):
         return self.library.get(item.data(Qt.ItemDataRole.UserRole))
 
     def _on_add(self) -> None:
-        dialog = FilamentDialog(
-            None,
-            brands=[f.brand for f in self.library if f.brand],
-            types=[f.material_type for f in self.library if f.material_type],
-            parent=self,
-        )
-        if dialog.exec() != FilamentDialog.DialogCode.Accepted:
-            return
-        filament = dialog.build_filament()
-        duplicate = self.library.find_duplicate(filament.color_hex, filament.material_type, filament.brand)
-        if duplicate is not None:
-            answer = QMessageBox.question(
-                self,
-                "已经存在同样的耗材",
-                f"{duplicate.display_name}（{duplicate.color_hex}）看起来和这条一样，仍然要添加吗？",
+        """Add a spool; 「下一个」 keeps the session going for the next one.
+
+        The dialog is rebuilt for each spool rather than reset in place, so every
+        field, the brand / type suggestions and the colour all start clean.
+        """
+        while True:
+            dialog = FilamentDialog(
+                None,
+                brands=[f.brand for f in self.library if f.brand],
+                types=[f.material_type for f in self.library if f.material_type],
+                parent=self,
             )
-            if answer != QMessageBox.StandardButton.Yes:
+            if dialog.exec() != FilamentDialog.DialogCode.Accepted:
                 return
-        self.library.add(filament)
-        self._reload_library()
-        self._select_filament(filament.id)
-        self._status.setText(f"已添加 {filament.display_name}（{filament.color_hex}）")
+            filament = dialog.build_filament()
+            duplicate = self.library.find_duplicate(
+                filament.color_hex, filament.material_type, filament.brand
+            )
+            if duplicate is not None:
+                answer = QMessageBox.question(
+                    self,
+                    "已经存在同样的耗材",
+                    f"{duplicate.display_name}（{duplicate.color_hex}）看起来和这条一样，仍然要添加吗？",
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    if dialog.wants_another():
+                        continue
+                    return
+            self.library.add(filament)
+            self._reload_library()
+            self._select_filament(filament.id)
+            self._status.setText(f"已添加 {filament.display_name}（{filament.color_hex}）")
+            if not dialog.wants_another():
+                return
 
     def _on_edit(self) -> None:
         filament = self._selected_filament()
@@ -1202,8 +1218,9 @@ class MainWindow(QMainWindow):
         chosen = bool(value) and self._target_color.isSet()
         if not chosen:
             self._find_button.setToolTip(
-                "先点「目标颜色」选好想打印的颜色，再按这里；"
-                "程序会按 CIEDE2000 在当前显示的全部颜色里找出最接近的一个"
+                "不用先填目标颜色也能按：没填就拿颜色表里选中的那个颜色来比，"
+                "表里也没选就拿 R / G / B 三个数字框里的值。"
+                "程序按 CIEDE2000 在当前显示的全部颜色里找出最接近的一个"
             )
         else:
             self._find_button.setToolTip(
@@ -1211,10 +1228,27 @@ class MainWindow(QMainWindow):
             )
 
     def _on_find_nearest(self) -> None:
+        """Find the closest colour, borrowing a target when the user typed none.
+
+        「找最接近的颜色」 has to DO something every time it is pressed: with an
+        empty 目标颜色 the old code only wrote a hint, which reads as a broken
+        button.  So the target is taken from, in order: the colour the user is
+        looking at in the table, then the R / G / B numbers as they stand.
+        """
         target = self._target_color.hex()
+        borrowed = ""
         if not target:
-            self._set_status_text("请先点「目标颜色」选一个想打印出来的颜色。")
-            return
+            current = self._grid.selectedRecipe()
+            if current is not None:
+                target = current.color_hex
+                borrowed = f"你正看着的 {target}"
+                # Show it in the field as well: a search must never aim at
+                # something the window does not display.
+                self._target_color.setValue(target)
+            else:
+                r, g, b = self._target_color.rgb()
+                target = _color.rgb_to_hex((r, g, b))
+                borrowed = f"数字框里的 RGB {r}, {g}, {b}"
         if not len(self._recipes):
             self._set_status_text("还没有可搜索的颜色，请先添加至少一种耗材。")
             return
@@ -1228,13 +1262,13 @@ class MainWindow(QMainWindow):
         # whenever the target IS a colour the user owns — so say so instead of
         # presenting it as a mixture.
         if getattr(best, "recipe_count", 1):
-            self._set_status_text(
-                f"最接近 {target} 的颜色是 {best.color_hex}（色差 ΔE00 = {distance:.2f}）"
-            )
+            found = f"最接近 {target} 的颜色是 {best.color_hex}"
         else:
-            self._set_status_text(
-                f"最接近 {target} 的颜色就是耗材本色 {best.color_hex}（色差 ΔE00 = {distance:.2f}）"
-            )
+            found = f"最接近 {target} 的颜色就是耗材本色 {best.color_hex}"
+        self._set_status_text(
+            f"{found}（色差 ΔE00 = {distance:.2f}）"
+            + (f"；目标颜色取自{borrowed}" if borrowed else "")
+        )
 
     def _about_text(self) -> str:
         """The 关于 text, version line included.

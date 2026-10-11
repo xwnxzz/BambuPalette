@@ -344,14 +344,76 @@ class ColourList(QWidget):
     def entries(self) -> list[PaletteEntry]:
         return list(self._result.palette) if self._result is not None else []
 
-    def pin(self, index: int) -> None:
-        """Put ``index`` first; every other entry keeps its relative order."""
+    def pin(self, index: int, *, reorder: bool = False) -> None:
+        """Make ``index`` the current colour and reveal its row.
+
+        ``reorder=True`` also moves it to the top of the list.  A plain click
+        must NOT reorder: the list used to shuffle on every click, so the row
+        that appeared under the cursor was a DIFFERENT colour than the one just
+        clicked (the user reported exactly that).  The order is now the sort order
+        and nothing else; only the sample screenshots ask for a colour to be
+        shown first.
+        """
         result = self._result
         if result is None or not (0 <= index < len(result.palette)):
             return
         self._pinned = int(index)
+        if not reorder:
+            self._reveal()
+            return
         self._order = [self._pinned] + [i for i in range(len(result.palette)) if i != self._pinned]
         self._refresh()
+
+    def _row_of(self, index: int) -> int:
+        for row in range(self._list.count()):
+            item = self._list.item(row)
+            if item is not None and int(item.data(Qt.ItemDataRole.UserRole)) == index:
+                return row
+        return -1
+
+    def _reveal(self) -> None:
+        """Highlight the current colour's row and scroll it into view.
+
+        What happens to the selection depends on the mode, and getting this wrong
+        greys 删除 / 合并 / 更换颜色 out again:
+
+        * 「一次只选一种」 (``ExtendedSelection``): ``setCurrentRow`` selects this
+          row and drops the others — that IS the new selection, so nothing is put
+          back.  It runs suppressed, so the cache and the buttons are refreshed by
+          hand afterwards.
+        * 「多选」 (``MultiSelection``): the user's set must survive, because
+          revealing a row is not a selection act.  ``setCurrentRow`` is free to
+          drop the rest, so the set is read first and written back.
+        """
+        if self._pinned < 0:
+            return
+        row = self._row_of(self._pinned)
+        if row < 0:
+            return
+        multi = self._list.selectionMode() == QAbstractItemView.SelectionMode.MultiSelection
+        keep = self.selected_indices() if multi else []
+        self._suppress = True
+        self._list.setCurrentRow(row)
+        self._list.scrollToItem(self._list.item(row), QAbstractItemView.ScrollHint.EnsureVisible)
+        self._suppress = False
+        if multi:
+            self.select(keep)
+        else:
+            self._on_selection_changed()
+
+    def toggle(self, index: int) -> None:
+        """Add or remove one colour from the selection.
+
+        This is what a click on a block in 「预览」 does while 「多选」 is on: the
+        picture and the list are two views of the same regions, so pointing at a
+        region in the picture has to work like pointing at its row.
+        """
+        row = self._row_of(int(index))
+        if row < 0:
+            return
+        item = self._list.item(row)
+        item.setSelected(not item.isSelected())
+        self._reveal()
 
     def select(self, indices) -> None:
         """Select these palette indices, exactly as clicking them would.
@@ -422,11 +484,12 @@ class ColourList(QWidget):
                 item = self._list.item(row)
                 if int(item.data(Qt.ItemDataRole.UserRole)) in self._picked:
                     item.setSelected(True)
-            if self._pinned >= 0 and self._list.count():
-                self._list.setCurrentRow(0)
         else:
             self._picked = set()
         self._suppress = False
+        # The rows moved: put the highlight back on the colour it was on, not on
+        # whatever happens to be row 0 now.
+        self._reveal()
 
     def _update_summary(self) -> None:
         result = self._result
@@ -947,6 +1010,14 @@ class PicturePage(QWidget):
         self._select(index)
 
     def _on_region_clicked(self, index: int) -> None:
+        """A click in 「预览」 means the same thing as a click on that row.
+
+        With 「多选」 on it toggles the region in and out of the selection, so the
+        user can pick colours by pointing at the picture instead of hunting for
+        the row in the list.
+        """
+        if self._multi_button.isChecked():
+            self._list.toggle(index)
         self._select(index)
 
     def _on_colour_activated(self, index: int) -> None:

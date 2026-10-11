@@ -81,6 +81,22 @@ def main() -> int:
     print("wrote", OUT / "ui-main.png")
     print("wrote", OUT / "ui-pair.png")
 
+    # The 添加耗材 dialog is pictured in the README, so it is rendered here too
+    # rather than left to go stale every time a button moves.
+    from app.ui.filament_dialog import FilamentDialog  # noqa: E402
+
+    dialog = FilamentDialog(
+        None,
+        [filament.brand for filament in library.filaments],
+        sorted({filament.material_type for filament in library.filaments}),
+        window,
+    )
+    dialog.show()
+    app.processEvents()
+    dialog.grab().save(str(OUT / "add-filament.png"))
+    dialog.close()
+    print("wrote", OUT / "add-filament.png")
+
     # Picture page: import a generated sample, match it, and grab the result.
     sample = ROOT / "samples" / "sample-picture.png"
     _make_sample(sample)
@@ -91,8 +107,9 @@ def main() -> int:
     result = page.result
     assert result is not None, "the sample picture did not match"
     print("picture:", f"{result.width}x{result.height}", "colours:", len(result.palette))
-    # Click a colour in the list, the way the user would.
-    page._list.pin(len(result.palette) - 1)
+    # Show the LAST colour first, the way a click used to.  ``reorder=True`` is
+    # explicit because a real click no longer shuffles the list.
+    page._list.pin(len(result.palette) - 1, reorder=True)
     page._view.setSelected(len(result.palette) - 1)
     app.processEvents()
     window.grab().save(str(OUT / "ui-picture.png"))

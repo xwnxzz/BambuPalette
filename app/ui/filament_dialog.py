@@ -6,11 +6,11 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
-    QDialogButtonBox,
     QFormLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QPushButton,
     QVBoxLayout,
 )
 
@@ -27,6 +27,7 @@ class FilamentDialog(QDialog):
     def __init__(self, filament: Filament | None = None, brands=(), types=(), parent=None):
         super().__init__(parent)
         self._filament = filament
+        self._another = False
         self.setWindowTitle("编辑耗材" if filament is not None else "添加耗材")
         self.setMinimumWidth(440)
         self.setModal(True)
@@ -75,16 +76,27 @@ class FilamentDialog(QDialog):
         preview_row.addWidget(self._hint, 1)
         preview_row.addStretch(0)
 
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
-            self,
+        # The row is built by hand instead of with QDialogButtonBox so 「下一个」
+        # sits IMMEDIATELY left of 「确认」, which is where the user asked for it —
+        # a button box parks an ActionRole button at the far left edge instead.
+        self._ok_button = QPushButton("确认", self)
+        self._ok_button.setProperty("accent", True)
+        self._ok_button.setDefault(True)
+        self._cancel_button = QPushButton("取消", self)
+        self._next_button = QPushButton("下一个", self)
+        self._next_button.setToolTip(
+            "先保存这一卷，然后清空表单接着加下一卷——不用关掉窗口再点一次「添加耗材」"
         )
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("确认")
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setProperty("accent", True)
-        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
-        self._ok_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
+        button_row = QHBoxLayout()
+        button_row.setContentsMargins(0, 0, 0, 0)
+        button_row.setSpacing(8)
+        button_row.addStretch(1)
+        button_row.addWidget(self._next_button)
+        button_row.addWidget(self._ok_button)
+        button_row.addWidget(self._cancel_button)
+        self._ok_button.clicked.connect(self.accept)
+        self._cancel_button.clicked.connect(self.reject)
+        self._next_button.clicked.connect(self._on_next)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 18, 18, 14)
@@ -92,7 +104,7 @@ class FilamentDialog(QDialog):
         layout.addLayout(form)
         layout.addLayout(preview_row)
         layout.addStretch(1)
-        layout.addWidget(buttons)
+        layout.addLayout(button_row)
 
         self._color.colorChanged.connect(self._on_color_changed)
 
@@ -149,6 +161,21 @@ class FilamentDialog(QDialog):
         )
 
     # -- results -----------------------------------------------------------------
+    def _on_next(self) -> None:
+        """Save this spool but stay open for the next one.
+
+        The dialog reports it through :meth:`wants_another` rather than by
+        avoiding ``accept()``, so the caller keeps ONE code path for reading
+        ``values()`` and the window can open a fresh dialog for the next spool
+        (a reset in place would have to un-remember every widget by hand).
+        """
+        self._another = True
+        self.accept()
+
+    def wants_another(self) -> bool:
+        """True when the dialog was closed with 「下一个」 instead of 「确认」."""
+        return self._another
+
     def values(self) -> dict:
         return {
             "name": self._name.text().strip(),

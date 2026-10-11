@@ -638,6 +638,11 @@ def main() -> int:
         "BambuPalette.exe 的文件属性里也写着同一个版本号。" in about,
         "关于 points at the exe's file properties",
     )
+    # m10238 item 1: and it must be visible without opening any dialog at all.
+    check(
+        _version in triple_window.windowTitle(),
+        f"the title bar carries the version, got {triple_window.windowTitle()!r}",
+    )
 
     # A spool's own colour must hide EVERY parent row, not just the second one:
     # row 3 kept the 「耗材丝3 … 12%」 text from the previous three-colour recipe,
@@ -1016,6 +1021,30 @@ def main() -> int:
         add_dialog._color.findChild(QSpinBox) is not None,
         "the colour field offers R / G / B spin boxes",
     )
+    # m10238 item 3: 下一个 saves this spool and reopens an empty form, so adding
+    # ten spools is ten dialogs deep, not one dialog and nine trips to 添加耗材.
+    check(not add_dialog.wants_another(), "确认 alone does not ask for another spool")
+    from PySide6.QtWidgets import QHBoxLayout as _DialogRow
+
+    button_row = next(
+        layout
+        for layout in add_dialog.findChildren(_DialogRow)
+        if layout.indexOf(add_dialog._ok_button) >= 0
+    )
+    check(
+        0 <= button_row.indexOf(add_dialog._next_button) == button_row.indexOf(add_dialog._ok_button) - 1,
+        "下一个 sits immediately left of 确认",
+    )
+    add_dialog._next_button.click()
+    check(add_dialog.wants_another(), "下一个 asks for another spool")
+    check(
+        add_dialog.result() == FilamentDialog.DialogCode.Accepted,
+        "下一个 still keeps the spool the user just typed",
+    )
+    check(
+        add_dialog.build_filament().color_hex == "#C8342E",
+        "the spool kept by 下一个 is the typed colour",
+    )
     add_dialog.close()
 
     check(
@@ -1171,11 +1200,42 @@ def main() -> int:
     # Deliberately clickable with nothing chosen, exactly like 确认 in 添加耗材:
     # pressing it early explains what is missing instead of being greyed out.
     check(window._find_button.isEnabled(), "找最接近的颜色 can be pressed right away")
+    # With a colour highlighted in the table, the borrow comes from THERE — that is
+    # the colour the user is actually looking at.
+    window._target_color.clear()
+    borrowed = window._recipes[len(window._recipes) // 2]
+    window._grid.selectRecipe(borrowed)
+    app.processEvents()
+    window._find_button.click()
+    app.processEvents()
+    # m10238 item 2: it must SEARCH, not print an instruction.  With no target it
+    # borrows the colour the user is looking at and says so.
+    check(
+        "目标颜色取自你正看着的" in window._status.text(),
+        f"an empty target borrows the highlighted colour: {window._status.text()!r}",
+    )
+    check(
+        borrowed.color_hex.upper() in window._status.text().upper(),
+        f"the borrowed target is the colour in the table: {window._status.text()!r}",
+    )
+    check(
+        "最接近" in window._status.text(),
+        f"and the borrow really answers a colour: {window._status.text()!r}",
+    )
+    check(
+        window._target_color.hex().upper() == borrowed.color_hex.upper(),
+        f"the borrowed colour is shown in the 目标颜色 field, got {window._target_color.hex()!r}",
+    )
+    # Nothing highlighted and no target typed: the R / G / B numbers are the only
+    # thing left to aim at, so they are used.
+    window._target_color.clear()
+    window._grid.clearSelection()
+    app.processEvents()
     window._find_button.click()
     app.processEvents()
     check(
-        "目标颜色" in window._status.text(),
-        f"pressing it with no target explains what is missing: {window._status.text()!r}",
+        "目标颜色取自数字框里的 RGB" in window._status.text(),
+        f"with nothing picked it falls back to the R/G/B numbers: {window._status.text()!r}",
     )
     window._target_color.setValue("#808080")
     check(window._find_button.isEnabled(), "找最接近的颜色 stays enabled once a colour is entered")
@@ -1277,13 +1337,27 @@ def main() -> int:
         page._on_colour_selected(last)
         app.processEvents()
         check(page._view._selected == last, "choosing a colour highlights it in the picture")
+        # Clicking must NOT reshuffle the list: it used to move the clicked colour
+        # to the top, so the row under the cursor became a different colour than
+        # the one just clicked.
         check(
-            rows.item(0).data(Qt.ItemDataRole.UserRole) == last,
-            "the chosen colour is pinned to the top of the list",
+            rows.item(0).data(Qt.ItemDataRole.UserRole) == 0,
+            "the list keeps its sort order — row 0 stays the first sorted colour",
+        )
+        check(
+            page._list._row_of(last) == last,
+            "the clicked colour is still in its own row",
+        )
+        check(
+            rows.currentRow() == last,
+            f"the current row is the clicked colour, got {rows.currentRow()}",
+        )
+        check(
+            page._list.selected_indices() == [last],
+            f"clicking one colour selects exactly that one: {page._list.selected_indices()}",
         )
         order = [rows.item(i).data(Qt.ItemDataRole.UserRole) for i in range(rows.count())]
-        expected = [last] + [i for i in range(len(result.palette)) if i != last]
-        check(order == expected, "every other colour keeps its original order")
+        check(order == list(range(len(result.palette))), "no row moved because of the click")
 
         # Issue 6: 原图 must stay the uploaded picture.  It used to grey out the
         # moment a colour was selected, so it looked like a washed-out copy of
