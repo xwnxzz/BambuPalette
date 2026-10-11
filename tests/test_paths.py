@@ -27,6 +27,15 @@ ENV_KEYS = (
     "BAMBU_PALETTE_DATA_DIR",
 )
 
+# Variables that decide the data directory without any fallback logic kicking
+# in.  Cleared for every DataDirTestCase so the suite behaves the same whatever
+# the developer's shell happens to export.
+PINNING_KEYS = (
+    "BAMBU_PALETTE_DATA_DIR",
+    "BAMBU_PALETTE_PORTABLE",
+    "FILAMENT_STUDIO_PORTABLE",
+)
+
 
 def _library(color: str = "#123456") -> dict:
     return {
@@ -71,6 +80,14 @@ class DataDirTestCase(unittest.TestCase):
         self._temp = tempfile.TemporaryDirectory(prefix="fcs-paths-")
         self.root = Path(self._temp.name)
         self._saved = {key: os.environ.get(key) for key in ENV_KEYS}
+        # These three pin the data directory from OUTSIDE the process, so an
+        # inherited value would silently short-circuit every test below — the
+        # fallback and legacy-adoption paths would simply never run.  The
+        # README tells scripts to set BAMBU_PALETTE_DATA_DIR, so a developer
+        # following it would otherwise see ~29 mysterious failures here.
+        # Each test sets whatever it needs through self.env(...).
+        for key in PINNING_KEYS:
+            os.environ.pop(key, None)
 
     def tearDown(self) -> None:
         for key, value in self._saved.items():
