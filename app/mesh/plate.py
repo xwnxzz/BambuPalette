@@ -3,18 +3,23 @@
 The user's requirement is explicit: the export must be a *flat* print, not a
 relief.  Two thicknesses are therefore all we need —
 
-* a **base plate** covering the picture's silhouette at
-  ``base_thickness_mm``, so the object is a solid slab with exactly the
-  picture's outline (nothing thinner than a printable layer);
-* one **cone per colour** stacked on top of the base at
-  ``colour_thickness_mm``, so the top surface reproduces the picture and every
-  colour region can be assigned to its own filament.
+* the slab is ``base_thickness_mm`` thick in the base colour, so the object is a
+  solid with exactly the picture's outline;
+* the top ``colour_thickness_mm`` of that same slab carries the picture's colours,
+  one filament per colour region.
+
+The slab is built as **one watertight solid**, not as one closed prism stacked on
+another.  Stacking looks equivalent and is not: the colour prisms' undersides sit
+exactly on the base's top face and their side walls touch each other, so the
+assembled mesh is full of interior walls and coincident faces.  A slicer unions
+those away silently, but anything that *counts* them — Bambu Studio's mesh
+statistics, for one — reports thousands of non-manifold edges, and the model is
+not actually a manifold solid.
 
 Geometry is built on the pixel grid and compressed into maximal rectangles, so a
 512×512 picture becomes thousands of quads rather than hundreds of thousands.
-Every part is a closed prism, and the whole model is watertight up to the
-T-junctions a rectangle decomposition necessarily leaves — the mesh repair step
-every slicer runs on import closes those.
+T-junctions left by that compression are repaired exactly, in one pass over the
+whole solid, because a per-part repair cannot see the edge its neighbour owns.
 """
 
 from __future__ import annotations
@@ -32,8 +37,18 @@ __all__ = [
     "rectangles",
     "prism_mesh",
     "stitch_t_junctions",
+    "plate_mesh",
+    "edge_health",
+    "signed_volume",
     "build_plate",
 ]
+
+#: Tag used for the faces that print in the base colour, distinct from every
+#: palette index (which are ``>= 0``) because the base colour is normally *also*
+#: one of the palette entries and the two must not be confused.
+BASE_TAG = -1
+
+Point = tuple[float, float, float]
 
 
 # ---------------------------------------------------------------------------
@@ -67,7 +82,13 @@ class PlateSettings:
 
 @dataclass
 class PlatePart:
-    """One printed object: a closed prism with its own filament."""
+    """One filament's share of the slab, as its own indexed triangle window.
+
+    Parts share no vertex indices — each one carries its own copy of the corners
+    it uses — because every exporter writes them as separate groups and offsets
+    the indices per part.  The copies sit at identical positions, so welding the
+    parts back together reproduces the single solid they were cut from.
+    """
 
     name: str
     color_hex: str
@@ -211,45 +232,279 @@ def _merge_stacked(rects: list[tuple[int, int, int, int]]) -> list[tuple[int, in
 # ---------------------------------------------------------------------------
 # Mesh
 # ---------------------------------------------------------------------------
-def prism_mesh(
-    mask: np.ndarray,
-    *,
-    z_bottom: float,
-    z_top: float,
-    pixel_mm: float,
-    flip_y: bool = True,
-) -> tuple[np.ndarray, np.ndarray]:
-    """A closed prism over ``mask``: top + bottom over the mask, sides on its rim.
+_EPS = 1e-9
 
-    Returns ``(vertices, triangles)`` with outward-facing winding.  The sides are
-    only emitted where the mask meets a different region or the outside, so the
-    mesh carries no internal walls.
+#: Coordinates are indexed on an integer lattice so "does a vertex sit on this
+#: line" is an exact test rather than a tolerance guess.  The scale has to be fine
+#: enough to keep the two heights apart: rounding to whole numbers puts the base
+#: layer's top (0.8 mm) and the colour layer's top (1.4 mm) on the same integer,
+#: and the index then hands a top-surface edge a vertex from the layer below it —
+#: which tears the polygon into a shape no triangulation can close.
+_SCALE = 1_000_000
 
-    The faces are wound in pixel space, where ``y`` grows downwards.  Placing the
-    picture upright on the build plate needs ``y`` mirrored, and a mirror inverts
-    every normal, so the winding is reversed at the very end to compensate.
+
+def _newell(points: list[Point]) -> tuple[float, float, float]:
+    """A planar polygon's area-weighted normal."""
+    nx = ny = nz = 0.0
+    count = len(points)
+    for index in range(count):
+        x0, y0, z0 = points[index]
+        x1, y1, z1 = points[(index + 1) % count]
+        nx += (y0 - y1) * (z0 + z1)
+        ny += (z0 - z1) * (x0 + x1)
+        nz += (x0 - x1) * (y0 + y1)
+    return nx, ny, nz
+
+
+def _polygon_area(flat: list[tuple[float, float]]) -> float:
+    """Twice the signed area of a 2-D polygon; positive when counter-clockwise."""
+    total = 0.0
+    count = len(flat)
+    for index in range(count):
+        x0, y0 = flat[index]
+        x1, y1 = flat[(index + 1) % count]
+        total += x0 * y1 - x1 * y0
+    return total
+
+
+def _cross2(o, a, b) -> float:
+    return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+
+def _inside_triangle(p, a, b, c) -> bool:
+    """Point-in-triangle for a counter-clockwise triangle, boundary included."""
+    return (
+        _cross2(a, b, p) >= 0.0
+        and _cross2(b, c, p) >= 0.0
+        and _cross2(c, a, p) >= 0.0
+    )
+
+
+class _Stitcher:
+    """Weld coincident vertices, then split every edge a third vertex sits on.
+
+    A rectangle decomposition inevitably leaves T-junctions: a long edge of one
+    rectangle meets the corner of two neighbours, and a slicer reads that as an
+    open boundary.  Every polygon here is axis-aligned in pixel space, so "this
+    vertex lies strictly inside that edge" is an exact test.
+
+    Triangulating a split loop by fanning it from one of its **own corners** emits
+    zero-area slivers whenever that corner shares an original edge with the
+    inserted points — and those slivers are what turned a handful of real
+    T-junctions into thousands of reported open and non-manifold edges.  A loop is
+    therefore ear-clipped rather than fanned; see :meth:`triangulate`.
     """
-    if z_top <= z_bottom:
-        raise ValueError("z_top must be greater than z_bottom")
+
+    def __init__(self, points: np.ndarray) -> None:
+        welded, inverse = np.unique(
+            np.asarray(points, dtype=np.float64), axis=0, return_inverse=True
+        )
+        self.points: list[Point] = [tuple(row) for row in welded.tolist()]
+        self.inverse = np.asarray(inverse, dtype=np.int64).reshape(-1)
+        self._integer = np.rint(welded * _SCALE).astype(np.int64)
+        self._lines: dict[tuple[str, int, int], list[int]] = {}
+        for index, (x, y, z) in enumerate(self._integer.tolist()):
+            self._lines.setdefault(("x", y, z), []).append(index)
+            self._lines.setdefault(("y", x, z), []).append(index)
+            self._lines.setdefault(("z", x, y), []).append(index)
+        self._cache: dict[tuple[int, int], list[int]] = {}
+
+    def welded(self, index: int) -> int:
+        """The welded vertex id of the raw vertex ``index``."""
+        return int(self.inverse[index])
+
+    def between(self, a: int, b: int) -> list[int]:
+        """Welded vertices strictly inside the edge ``a→b``, in travel order.
+
+        The cache always stores the ascending order, because the same edge is
+        asked for from both of its faces and only one of them may travel
+        downwards.
+        """
+        key = (a, b) if a <= b else (b, a)
+        cached = self._cache.get(key)
+        if cached is None:
+            pa = self._integer[a]
+            pb = self._integer[b]
+            delta = np.abs(pb - pa)
+            # Only axis-aligned edges can carry T-junctions.  A fan diagonal is
+            # not axis-aligned, and the line index below would happily return
+            # vertices that lie on the diagonal's *bounding line* rather than on
+            # the diagonal, which would tear the polygon open.
+            if int(np.count_nonzero(delta)) != 1:
+                cached = []
+            else:
+                axis = int(np.argmax(delta))
+                names = ("x", "y", "z")
+                others = [int(pa[i]) for i in range(3) if i != axis]
+                candidates = self._lines.get((names[axis], others[0], others[1]), [])
+                low = int(min(pa[axis], pb[axis]))
+                high = int(max(pa[axis], pb[axis]))
+                values = self._integer[candidates, axis]
+                found = [
+                    int(candidates[i])
+                    for i in np.flatnonzero((values > low) & (values < high))
+                ]
+                found.sort(key=lambda index: int(self._integer[index, axis]))
+                cached = found
+            self._cache[key] = cached
+        return list(reversed(cached)) if a > b else cached
+
+    def loop(self, polygon: list[int]) -> list[int]:
+        """The polygon's boundary with every T-junction vertex inserted."""
+        out: list[int] = []
+        count = len(polygon)
+        for position in range(count):
+            a = int(polygon[position])
+            b = int(polygon[(position + 1) % count])
+            out.append(a)
+            out.extend(self.between(a, b))
+        return out
+
+    def _fan(self, loop: list[int]) -> list[tuple[int, int, int]]:
+        """Last-resort fan from a centroid, used only when ear clipping stalls."""
+        count = len(loop)
+        centre = len(self.points)
+        self.points.append(
+            tuple(
+                sum(self.points[index][axis] for index in loop) / count
+                for axis in range(3)
+            )
+        )
+        return [(centre, loop[k], loop[(k + 1) % count]) for k in range(count)]
+
+    def triangulate(self, loop: list[int]) -> list[tuple[int, int, int]]:
+        """Ear-clip a planar loop, keeping every T-junction vertex and no slivers.
+
+        Fanning from a fixed corner or from the centroid both eventually cut a
+        triangle whose edge lies *along* an existing boundary edge: a wall's
+        vertical edge, or the segment the loop's own average lands on once a
+        neighbour has split its top edge.  Ear clipping cannot do that — an ear is
+        only taken when no other vertex of the loop sits inside it (boundary
+        included), so a diagonal never lands on a vertex that is not its endpoint.
+
+        Collinear vertices are deliberately **not** clipped away: they are exactly
+        the vertices a neighbouring polygon's corner needs to find.  Dropping them
+        to get tidier triangles would put the T-junction straight back.
+        """
+        count = len(loop)
+        if count < 3:
+            return []
+        if count == 3:
+            return [(loop[0], loop[1], loop[2])]
+
+        coords = [self.points[index] for index in loop]
+        normal = _newell(coords)
+        axis = max(range(3), key=lambda item: abs(normal[item]))
+        if abs(normal[axis]) <= _EPS:
+            return self._fan(loop)
+        other = [item for item in range(3) if item != axis]
+        flat = [(point[other[0]], point[other[1]]) for point in coords]
+
+        order = list(range(count))
+        flipped = _polygon_area(flat) < 0.0
+        if flipped:
+            order.reverse()
+
+        out: list[tuple[int, int, int]] = []
+        while len(order) > 3:
+            clipped = False
+            for position in range(len(order)):
+                before = order[position - 1]
+                here = order[position]
+                after = order[(position + 1) % len(order)]
+                a, b, c = flat[before], flat[here], flat[after]
+                if _cross2(a, b, c) <= _EPS:
+                    continue  # reflex or collinear — not an ear
+                if any(
+                    _inside_triangle(flat[j], a, b, c)
+                    for j in order
+                    if j not in (before, here, after)
+                ):
+                    continue
+                out.append((loop[before], loop[here], loop[after]))
+                order.pop(position)
+                clipped = True
+                break
+            if not clipped:
+                out.extend(self._fan([loop[index] for index in order]))
+                order = []
+                break
+        if len(order) == 3:
+            out.append((loop[order[0]], loop[order[1]], loop[order[2]]))
+        return [(a, c, b) for a, b, c in out] if flipped else out
+
+    def build(
+        self, polygons: list[list[int]], tags: list[int]
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Triangulate indexed polygons, carrying one tag through to each face."""
+        faces: list[tuple[int, int, int]] = []
+        face_tags: list[int] = []
+        for polygon, tag in zip(polygons, tags):
+            triangles = self.triangulate(self.loop(polygon))
+            faces.extend(triangles)
+            face_tags.extend([tag] * len(triangles))
+        return (
+            np.array(self.points, dtype=np.float64).reshape(-1, 3),
+            np.array(faces, dtype=np.int64).reshape(-1, 3),
+            np.array(face_tags, dtype=np.int64).reshape(-1),
+        )
+
+
+def _assemble(
+    polygons: list[list[Point]], tags: list[int]
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Weld, T-junction-stitch and triangulate a tagged polygon soup.
+
+    The whole solid goes through **one** stitcher.  Stitching part by part cannot
+    work: the long edge belongs to one part and the two corner vertices that
+    should split it belong to its neighbour, so each part would keep half a
+    T-junction and the weld would show an open edge.
+    """
+    flat = [point for polygon in polygons for point in polygon]
+    stitcher = _Stitcher(np.array(flat, dtype=np.float64).reshape(-1, 3))
+    indexed: list[list[int]] = []
+    cursor = 0
+    for polygon in polygons:
+        indexed.append(
+            [stitcher.welded(cursor + offset) for offset in range(len(polygon))]
+        )
+        cursor += len(polygon)
+    return stitcher.build(indexed, tags)
+
+
+def stitch_t_junctions(
+    points: np.ndarray, faces: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Weld coincident vertices and split every edge a third vertex sits on.
+
+    A triangle-level entry point for callers that already hold a triangle soup;
+    the plate builder works on polygons instead, through :func:`_assemble`.
+    """
+    stitcher = _Stitcher(points)
+    indexed = [
+        [stitcher.welded(int(index)) for index in triangle]
+        for triangle in np.asarray(faces, dtype=np.int64).tolist()
+    ]
+    vertices, triangles, _tags = stitcher.build(indexed, [0] * len(indexed))
+    return vertices, triangles
+
+
+def _prism_polygons(
+    mask: np.ndarray, *, z_bottom: float, z_top: float
+) -> list[list[Point]]:
+    """The six-sided boundary of a closed prism over ``mask``, as quads."""
     height, width = mask.shape
-    rects = _merge_stacked(rectangles(mask))
+    polygons: list[list[Point]] = []
 
-    vertices: list[tuple[float, float, float]] = []
-    triangles: list[tuple[int, int, int]] = []
-
-    def quad(p0, p1, p2, p3) -> None:
-        base = len(vertices)
-        vertices.extend((p0, p1, p2, p3))
-        triangles.append((base, base + 1, base + 2))
-        triangles.append((base, base + 2, base + 3))
-
-    for x, y, w, h in rects:
+    for x, y, w, h in _merge_stacked(rectangles(mask)):
         x0, x1 = float(x), float(x + w)
         y0, y1 = float(y), float(y + h)
         # top face, normal +Z
-        quad((x0, y0, z_top), (x1, y0, z_top), (x1, y1, z_top), (x0, y1, z_top))
+        polygons.append([(x0, y0, z_top), (x1, y0, z_top), (x1, y1, z_top), (x0, y1, z_top)])
         # bottom face, normal -Z
-        quad((x0, y1, z_bottom), (x1, y1, z_bottom), (x1, y0, z_bottom), (x0, y0, z_bottom))
+        polygons.append(
+            [(x0, y1, z_bottom), (x1, y1, z_bottom), (x1, y0, z_bottom), (x0, y0, z_bottom)]
+        )
 
     occupied = mask.astype(bool)
     north = occupied & ~np.vstack([np.zeros((1, width), dtype=bool), occupied[:-1]])
@@ -262,14 +517,18 @@ def prism_mesh(
         for x0, x1 in _runs(north[y]):
             a, b = float(x0), float(x1)
             # normal -Y
-            quad((a, plane, z_bottom), (b, plane, z_bottom), (b, plane, z_top), (a, plane, z_top))
+            polygons.append(
+                [(a, plane, z_bottom), (b, plane, z_bottom), (b, plane, z_top), (a, plane, z_top)]
+            )
 
     for y in np.flatnonzero(south.any(axis=1)):
         plane = float(y) + 1.0
         for x0, x1 in _runs(south[y]):
             a, b = float(x0), float(x1)
             # normal +Y
-            quad((b, plane, z_bottom), (a, plane, z_bottom), (a, plane, z_top), (b, plane, z_top))
+            polygons.append(
+                [(b, plane, z_bottom), (a, plane, z_bottom), (a, plane, z_top), (b, plane, z_top)]
+            )
 
     # The side walls run down the picture, so their runs are gathered per column
     # and merged vertically — that keeps them aligned with the top and bottom
@@ -279,18 +538,45 @@ def prism_mesh(
         for y0, y1 in _runs(west[:, x]):
             ya, yb = float(y0), float(y1)
             # normal -X
-            quad((plane, yb, z_bottom), (plane, ya, z_bottom), (plane, ya, z_top), (plane, yb, z_top))
+            polygons.append(
+                [(plane, yb, z_bottom), (plane, ya, z_bottom), (plane, ya, z_top), (plane, yb, z_top)]
+            )
 
     for x in np.flatnonzero(east.any(axis=0)):
         plane = float(x) + 1.0
         for y0, y1 in _runs(east[:, x]):
             ya, yb = float(y0), float(y1)
             # normal +X
-            quad((plane, ya, z_bottom), (plane, yb, z_bottom), (plane, yb, z_top), (plane, ya, z_top))
+            polygons.append(
+                [(plane, ya, z_bottom), (plane, yb, z_bottom), (plane, yb, z_top), (plane, ya, z_top)]
+            )
 
-    points = np.array(vertices, dtype=np.float64).reshape(-1, 3)
-    faces = np.array(triangles, dtype=np.int64).reshape(-1, 3)
-    points, faces = stitch_t_junctions(points, faces)
+    return polygons
+
+
+def prism_mesh(
+    mask: np.ndarray,
+    *,
+    z_bottom: float,
+    z_top: float,
+    pixel_mm: float,
+    flip_y: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """A closed prism over ``mask``: top + bottom over the mask, sides on its rim.
+
+    Returns ``(vertices, triangles)`` with outward-facing winding.  The sides are
+    only emitted where the mask meets the outside, so the prism carries no
+    internal walls.
+
+    The faces are wound in pixel space, where ``y`` grows downwards.  Placing the
+    picture upright on the build plate needs ``y`` mirrored, and a mirror inverts
+    every normal, so the winding is reversed at the very end to compensate.
+    """
+    if z_top <= z_bottom:
+        raise ValueError("z_top must be greater than z_bottom")
+    height = mask.shape[0]
+    polygons = _prism_polygons(mask, z_bottom=z_bottom, z_top=z_top)
+    points, faces, _tags = _assemble(polygons, [0] * len(polygons))
     points[:, 0] *= pixel_mm
     points[:, 1] *= pixel_mm
     if flip_y:
@@ -299,74 +585,67 @@ def prism_mesh(
     return points, faces
 
 
-def stitch_t_junctions(
-    points: np.ndarray, faces: np.ndarray
-) -> tuple[np.ndarray, np.ndarray]:
-    """Weld coincident vertices and split every edge a third vertex sits on.
+# ---------------------------------------------------------------------------
+# Mesh health
+# ---------------------------------------------------------------------------
+def edge_health(points: np.ndarray, faces: np.ndarray) -> tuple[int, int]:
+    """``(open_edges, non_manifold_edges)`` after welding coincident vertices.
 
-    A rectangle decomposition inevitably leaves T-junctions: a long edge of one
-    rectangle meets the corner of two neighbours.  A slicer sees the long edge as
-    an open boundary there.  Every face here is axis-aligned in pixel space, so
-    "this vertex lies strictly inside that edge" is an exact test and the repair
-    is a fan re-triangulation.  Afterwards each part is watertight.
+    Bambu Studio welds an imported object's parts together before it reports mesh
+    statistics, so welding first is the number the user actually sees.
     """
-    welded, inverse = np.unique(np.asarray(points, dtype=np.float64), axis=0, return_inverse=True)
-    welded_int = np.rint(welded).astype(np.int64)
-    remapped = inverse[np.asarray(faces, dtype=np.int64)]
+    welded, inverse = np.unique(
+        np.asarray(points, dtype=np.float64), axis=0, return_inverse=True
+    )
+    del welded
+    mapped = np.asarray(inverse, dtype=np.int64).reshape(-1)[
+        np.asarray(faces, dtype=np.int64)
+    ]
+    counts: dict[tuple[int, int], int] = {}
+    for a, b, c in mapped.tolist():
+        for u, v in ((a, b), (b, c), (c, a)):
+            key = (u, v) if u < v else (v, u)
+            counts[key] = counts.get(key, 0) + 1
+    return (
+        sum(1 for count in counts.values() if count == 1),
+        sum(1 for count in counts.values() if count > 2),
+    )
 
-    lines: dict[tuple[str, int, int], list[int]] = {}
-    for index, (x, y, z) in enumerate(welded_int.tolist()):
-        lines.setdefault(("x", y, z), []).append(index)
-        lines.setdefault(("y", x, z), []).append(index)
-        lines.setdefault(("z", x, y), []).append(index)
 
-    cache: dict[tuple[int, int], list[int]] = {}
+def signed_volume(points: np.ndarray, faces: np.ndarray) -> float:
+    """Six times the signed volume, over six — positive when normals face out."""
+    vertices = np.asarray(points, dtype=np.float64)
+    triangles = np.asarray(faces, dtype=np.int64)
+    a = vertices[triangles[:, 0]]
+    b = vertices[triangles[:, 1]]
+    c = vertices[triangles[:, 2]]
+    return float(np.einsum("ij,ij->i", a, np.cross(b, c)).sum() / 6.0)
 
-    def between(a: int, b: int) -> list[int]:
-        """Welded vertices strictly inside the edge ``a→b``, in travel order.
 
-        The cache always stores the ascending order, because the same edge is
-        asked for from both of its faces and only one of them may travel
-        downwards.
-        """
-        key = (a, b) if a <= b else (b, a)
-        cached = cache.get(key)
-        if cached is None:
-            pa = welded_int[a]
-            pb = welded_int[b]
-            delta = np.abs(pb - pa)
-            # Only axis-aligned edges can carry T-junctions.  A fan diagonal is
-            # not axis-aligned, and the line index below would happily return
-            # vertices that lie on the diagonal's *bounding line* rather than on
-            # the diagonal, which would tear the polygon open.
-            if int(np.count_nonzero(delta)) != 1:
-                cached = []
-            else:
-                axis = int(np.argmax(delta))
-                names = ("x", "y", "z")
-                others = [int(pa[i]) for i in range(3) if i != axis]
-                candidates = lines.get((names[axis], others[0], others[1]), [])
-                low = int(min(pa[axis], pb[axis]))
-                high = int(max(pa[axis], pb[axis]))
-                values = welded_int[candidates, axis]
-                found = [int(candidates[i]) for i in np.flatnonzero((values > low) & (values < high))]
-                found.sort(key=lambda index: int(welded_int[index, axis]))
-                cached = found
-            cache[key] = cached
-        return list(reversed(cached)) if a > b else cached
+def plate_mesh(plate: PlateModel) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The whole plate as one mesh plus a per-triangle extruder list.
 
-    out: list[tuple[int, int, int]] = []
-    for triangle in remapped.tolist():
-        polygon: list[int] = []
-        for i in range(3):
-            a, b = int(triangle[i]), int(triangle[(i + 1) % 3])
-            polygon.append(a)
-            polygon.extend(between(a, b))
-        for k in range(1, len(polygon) - 1):
-            out.append((polygon[0], polygon[k], polygon[k + 1]))
-
-    return welded, np.array(out, dtype=np.int64).reshape(-1, 3)
-
+    Vertices are concatenated with a per-part offset, exactly as the exporters
+    write them; call :func:`edge_health` to weld them back together.
+    """
+    if not plate.parts:
+        return (
+            np.zeros((0, 3), dtype=np.float64),
+            np.zeros((0, 3), dtype=np.int64),
+            np.zeros(0, dtype=np.int64),
+        )
+    points: list[np.ndarray] = []
+    faces: list[np.ndarray] = []
+    extruders: list[np.ndarray] = []
+    offset = 0
+    for part in plate.parts:
+        points.append(part.vertices)
+        faces.append(part.triangles + offset)
+        extruders.append(
+            np.full(len(part.triangles), part.extruder, dtype=np.int64)
+        )
+        offset += int(len(part.vertices))
+    return np.vstack(points), np.vstack(faces), np.concatenate(extruders)
 
 
 # ---------------------------------------------------------------------------
@@ -378,7 +657,20 @@ def build_plate(
     *,
     base_label: str = "底板",
 ) -> PlateModel:
-    """Assemble the base slab plus one stacked prism per colour."""
+    """Build the picture as ONE watertight slab, then cut it into per-filament parts.
+
+    The solid has exactly four kinds of face:
+
+    * the underside, over the whole silhouette, in the base colour;
+    * the top surface at ``base_thickness + colour_thickness``, tiled by colour
+      region and tagged with that region's filament;
+    * the outside rim below ``base_thickness``, in the base colour;
+    * the outside rim above it, in the colour of the region that owns that
+      stretch of rim.
+
+    There are no interior walls and no coincident faces, so the assembly is a
+    genuine 2-manifold with a well-defined inside and outside.
+    """
     config = (settings or PlateSettings()).clamped()
     if not result.palette:
         raise ValueError("没有一个可打印的颜色，无法生成模型。")
@@ -401,51 +693,176 @@ def build_plate(
     base_index = config.base_index
     if base_index < 0 or base_index >= len(result.palette):
         base_index = int(np.argmax(result.counts))
+    base_extruder = base_index + 1
 
     z_base_top = config.base_thickness_mm
     z_colour_top = config.base_thickness_mm + config.colour_thickness_mm
 
-    parts: list[PlatePart] = []
-
-    # --- the base plate: the picture's silhouette -----------------------------
     silhouette = result.indices >= 0
     if not silhouette.any():
         raise ValueError("图片没有可见像素，无法生成模型。")
-    vertices, triangles = prism_mesh(
-        silhouette, z_bottom=0.0, z_top=z_base_top, pixel_mm=pixel
-    )
-    base_entry = result.palette[base_index]
-    parts.append(
-        PlatePart(
+
+    height, width = result.indices.shape
+    polygons: list[list[Point]] = []
+    tags: list[int] = []
+
+    def add(polygon: list[Point], tag: int) -> None:
+        polygons.append(polygon)
+        tags.append(tag)
+
+    # --- the base colour: the underside of the slab --------------------------
+    for x, y, w, h in _merge_stacked(rectangles(silhouette)):
+        x0, x1 = float(x), float(x + w)
+        y0, y1 = float(y), float(y + h)
+        add([(x0, y1, 0.0), (x1, y1, 0.0), (x1, y0, 0.0), (x0, y0, 0.0)], BASE_TAG)
+
+    # --- one filament per colour: its patch of the top surface ---------------
+    for index in range(len(result.palette)):
+        mask = result.indices == index
+        if not mask.any():
+            continue
+        for x, y, w, h in _merge_stacked(rectangles(mask)):
+            x0, x1 = float(x), float(x + w)
+            y0, y1 = float(y), float(y + h)
+            add(
+                [
+                    (x0, y0, z_colour_top),
+                    (x1, y0, z_colour_top),
+                    (x1, y1, z_colour_top),
+                    (x0, y1, z_colour_top),
+                ],
+                index,
+            )
+
+    # --- the outside rim, split at the base layer ----------------------------
+    # A wall belongs to a colour only where that colour touches the *outside* of
+    # the silhouette.  Where two colours merely touch each other there is no wall
+    # at all: it would be an interior face nobody can see and every slicer has to
+    # repair.
+    above = np.vstack([np.zeros((1, width), dtype=bool), silhouette[:-1]])
+    below = np.vstack([silhouette[1:], np.zeros((1, width), dtype=bool)])
+    left = np.hstack([np.zeros((height, 1), dtype=bool), silhouette[:, :-1]])
+    right = np.hstack([silhouette[:, 1:], np.zeros((height, 1), dtype=bool)])
+
+    for index in range(len(result.palette)):
+        mask = result.indices == index
+        if not mask.any():
+            continue
+        north = mask & ~above
+        south = mask & ~below
+        west = mask & ~left
+        east = mask & ~right
+
+        for y in np.flatnonzero(north.any(axis=1)):
+            plane = float(y)
+            for x0, x1 in _runs(north[y]):
+                a, b = float(x0), float(x1)
+                add(
+                    [(a, plane, 0.0), (b, plane, 0.0), (b, plane, z_base_top), (a, plane, z_base_top)],
+                    BASE_TAG,
+                )
+                add(
+                    [
+                        (a, plane, z_base_top),
+                        (b, plane, z_base_top),
+                        (b, plane, z_colour_top),
+                        (a, plane, z_colour_top),
+                    ],
+                    index,
+                )
+
+        for y in np.flatnonzero(south.any(axis=1)):
+            plane = float(y) + 1.0
+            for x0, x1 in _runs(south[y]):
+                a, b = float(x0), float(x1)
+                add(
+                    [(b, plane, 0.0), (a, plane, 0.0), (a, plane, z_base_top), (b, plane, z_base_top)],
+                    BASE_TAG,
+                )
+                add(
+                    [
+                        (b, plane, z_base_top),
+                        (a, plane, z_base_top),
+                        (a, plane, z_colour_top),
+                        (b, plane, z_colour_top),
+                    ],
+                    index,
+                )
+
+        for x in np.flatnonzero(west.any(axis=0)):
+            plane = float(x)
+            for y0, y1 in _runs(west[:, x]):
+                ya, yb = float(y0), float(y1)
+                add(
+                    [(plane, yb, 0.0), (plane, ya, 0.0), (plane, ya, z_base_top), (plane, yb, z_base_top)],
+                    BASE_TAG,
+                )
+                add(
+                    [
+                        (plane, yb, z_base_top),
+                        (plane, ya, z_base_top),
+                        (plane, ya, z_colour_top),
+                        (plane, yb, z_colour_top),
+                    ],
+                    index,
+                )
+
+        for x in np.flatnonzero(east.any(axis=0)):
+            plane = float(x) + 1.0
+            for y0, y1 in _runs(east[:, x]):
+                ya, yb = float(y0), float(y1)
+                add(
+                    [(plane, ya, 0.0), (plane, yb, 0.0), (plane, yb, z_base_top), (plane, ya, z_base_top)],
+                    BASE_TAG,
+                )
+                add(
+                    [
+                        (plane, ya, z_base_top),
+                        (plane, yb, z_base_top),
+                        (plane, yb, z_colour_top),
+                        (plane, ya, z_colour_top),
+                    ],
+                    index,
+                )
+
+    points, faces, face_tags = _assemble(polygons, tags)
+
+    points[:, 0] *= pixel
+    points[:, 1] *= pixel
+    points[:, 1] = height * pixel - points[:, 1]
+    faces = faces[:, ::-1]
+
+    # --- cut the one solid into per-filament parts ---------------------------
+    parts: list[PlatePart] = [
+        _slice_part(
+            BASE_TAG,
+            points,
+            faces,
+            face_tags,
             name=base_label,
-            color_hex=base_entry.color_hex,
+            color_hex=result.palette[base_index].color_hex,
             palette_index=base_index,
-            extruder=base_index + 1,
-            vertices=vertices,
-            triangles=triangles,
+            extruder=base_extruder,
             region_pixels=int(np.count_nonzero(silhouette)),
             z_bottom_mm=0.0,
             z_top_mm=z_base_top,
         )
-    )
+    ]
 
-    # --- one stacked prism per colour ----------------------------------------
     for index, entry in enumerate(result.palette):
-        mask = result.indices == index
-        count = int(np.count_nonzero(mask))
+        count = int(np.count_nonzero(result.indices == index))
         if not count:
             continue
-        vertices, triangles = prism_mesh(
-            mask, z_bottom=z_base_top, z_top=z_colour_top, pixel_mm=pixel
-        )
         parts.append(
-            PlatePart(
+            _slice_part(
+                index,
+                points,
+                faces,
+                face_tags,
                 name=_part_name(entry, index),
                 color_hex=entry.color_hex,
                 palette_index=index,
                 extruder=index + 1,
-                vertices=vertices,
-                triangles=triangles,
                 region_pixels=count,
                 z_bottom_mm=z_base_top,
                 z_top_mm=z_colour_top,
@@ -466,6 +883,23 @@ def build_plate(
         colour_thickness_mm=config.colour_thickness_mm,
         notes=notes,
         source=result.source,
+    )
+
+
+def _slice_part(
+    tag: int,
+    points: np.ndarray,
+    faces: np.ndarray,
+    face_tags: np.ndarray,
+    **kwargs,
+) -> PlatePart:
+    """One filament's faces, re-indexed into a private vertex block."""
+    selected = faces[face_tags == tag]
+    used, local = np.unique(selected, return_inverse=True)
+    return PlatePart(
+        vertices=points[used],
+        triangles=np.asarray(local, dtype=np.int64).reshape(-1, 3),
+        **kwargs,
     )
 
 

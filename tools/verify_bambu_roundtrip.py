@@ -151,6 +151,59 @@ def count_geometry(path: Path) -> dict:
     return report
 
 
+def mesh_health(path: Path) -> tuple[int, int]:
+    """Open / non-manifold edge counts of a 3MF, welded the way a slicer welds it.
+
+    Bambu Studio reports these two numbers on the object panel, so they are the
+    numbers a user judges the file by.  Every part is written with its own vertex
+    block, so the positions have to be reunited before counting — otherwise each
+    part looks like a bag of open edges.
+    """
+    import numpy as np
+
+    from app.mesh.plate import edge_health
+
+    points: list[tuple[float, float, float]] = []
+    faces: list[tuple[int, int, int]] = []
+    offset = 0
+    with zipfile.ZipFile(path) as archive:
+        for name in archive.namelist():
+            if not name.endswith(".model"):
+                continue
+            root = ET.fromstring(archive.read(name))
+            for mesh in (item for item in root.iter() if _local(item.tag) == "mesh"):
+                base = offset
+                for vertex in mesh.iter():
+                    if _local(vertex.tag) != "vertex":
+                        continue
+                    points.append(
+                        (
+                            float(vertex.get("x", 0.0)),
+                            float(vertex.get("y", 0.0)),
+                            float(vertex.get("z", 0.0)),
+                        )
+                    )
+                offset += sum(
+                    1 for item in mesh.iter() if _local(item.tag) == "vertex"
+                )
+                for item in mesh.iter():
+                    if _local(item.tag) != "triangle":
+                        continue
+                    faces.append(
+                        (
+                            int(item.get("v1", 0)) + base,
+                            int(item.get("v2", 0)) + base,
+                            int(item.get("v3", 0)) + base,
+                        )
+                    )
+    if not faces:
+        return 0, 0
+    return edge_health(
+        np.array(points, dtype=np.float64).reshape(-1, 3),
+        np.array(faces, dtype=np.int64).reshape(-1, 3),
+    )
+
+
 def main() -> int:
     bambu = find_bambu()
     if bambu is None:
@@ -179,6 +232,11 @@ def main() -> int:
     print(
         "              paints: "
         + "  ".join(f"{code}×{count:,}" for code, count in sorted(source_report["paints"].items()))
+    )
+    source_open, source_non_manifold = mesh_health(source)
+    print(
+        f"              mesh: {source_open:,} open edges  "
+        f"{source_non_manifold:,} non-manifold edges"
     )
 
     exported = TEMP / "bambu-roundtrip.3mf"
@@ -233,16 +291,23 @@ def main() -> int:
     missing = set(source_report["paints"]) - set(returned["paints"])
     if missing:
         failures.append(f"paint codes {sorted(missing)} did not survive the round trip")
+    if source_open:
+        failures.append(
+            f"the exported plate has {source_open:,} open edges — Bambu Studio shows these "
+            f"as 信息: 发现 N 个开放边 and offers to repair the model"
+        )
+    if source_non_manifold:
+        failures.append(
+            f"the exported plate has {source_non_manifold:,} non-manifold edges — Bambu Studio "
+            f"shows these as 错误: N 非流形边"
+        )
     if source_report["filaments"] and returned["filaments"] != source_report["filaments"]:
-        # NOT a failure.  Bambu Studio only reads ``filament_colour`` out of
-        # ``project_settings.config`` for files whose Application metadata starts
-        # with ``BambuStudio``; a file imported from another program is read as a
-        # plain 3MF and gets the slicer's own default spool.  The colours that do
-        # travel are the ``<basematerials>`` table and the ``paint_color`` codes
-        # on the triangles, and those are checked above.  Renaming the
-        # Application to ``BambuStudio-…`` does make this file's filament list
-        # round trip, but it also makes Bambu Studio abort with an
-        # out-of-memory crash, so it is deliberately not done.
+        # NOT a failure, and for our own exports it no longer even applies: the
+        # writer stopped emitting ``Metadata/project_settings.config``, because
+        # Bambu Studio rejects any partial project config and then paints the
+        # plate from its own spools (see the comment in ``app/mesh/threemf.py``).
+        # The colours that travel are the ``<basematerials>`` table and the
+        # ``paint_color`` codes on the triangles, and those are checked above.
         warnings.append(
             f"the filament list is not carried by a foreign-project import "
             f"({source_report['filaments']} -> {returned['filaments']}); "

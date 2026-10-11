@@ -31,8 +31,11 @@ from app.mesh.plate import (  # noqa: E402
     PlateSettings,
     _merge_stacked,
     build_plate,
+    edge_health,
+    plate_mesh,
     prism_mesh,
     rectangles,
+    signed_volume,
 )
 
 SPOOLS = (
@@ -234,14 +237,74 @@ class PlateTests(unittest.TestCase):
         )
         self.assertTrue(any("喷嘴" in note for note in plate.notes), plate.notes)
 
-    def test_every_part_is_a_closed_outward_prism(self):
+    def test_the_whole_plate_is_one_closed_outward_solid(self):
+        """The plate is a single manifold solid, not a stack of closed prisms.
+
+        A part on its own is *not* closed any more — it is a slice of the solid and
+        is open exactly where it meets its neighbours.  What has to hold is that
+        welding the parts back together (which is what an importing slicer does
+        before it counts anything) gives a closed surface with no interior walls.
+        """
         plate = build_plate(self.result, PlateSettings(target_width_mm=100.0))
-        for part in plate.parts:
-            with self.subTest(part=part.name):
-                boundary, non_manifold = _edge_health(part.vertices, part.triangles)
-                self.assertEqual(boundary, 0)
-                self.assertEqual(non_manifold, 0)
-                self.assertGreater(_signed_volume(part.vertices, part.triangles), 0.0)
+        points, faces, extruders = plate_mesh(plate)
+        self.assertEqual(len(faces), plate.triangle_count)
+        self.assertEqual(len(extruders), len(faces))
+
+        boundary, non_manifold = edge_health(points, faces)
+        self.assertEqual(boundary, 0, "组装后不该有开放边")
+        self.assertEqual(non_manifold, 0, "组装后不该有非流形边")
+        self.assertGreater(signed_volume(points, faces), 0.0)
+
+    def test_the_assembled_volume_is_the_printed_volume(self):
+        """Volume = printed pixels x cell area x total thickness, exactly."""
+        plate = build_plate(self.result, PlateSettings(target_width_mm=100.0))
+        points, faces, _ = plate_mesh(plate)
+        expected = (
+            int(np.count_nonzero(self.result.indices >= 0))
+            * plate.pixel_size_mm**2
+            * plate.total_thickness_mm
+        )
+        self.assertAlmostEqual(signed_volume(points, faces), expected, places=6)
+
+    def test_no_face_is_a_sliver(self):
+        """No zero-area triangle, and no edge lying across another vertex.
+
+        A fan over a T-junction-split polygon emits slivers whose edges run along
+        the polygon's own boundary; they inflate both the open-edge and the
+        non-manifold-edge count and are what Bambu Studio reported.
+        """
+        plate = build_plate(self.result, PlateSettings(target_width_mm=100.0))
+        points, faces, _ = plate_mesh(plate)
+        corners = points[faces]
+        areas = np.linalg.norm(
+            np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0]), axis=1
+        )
+        self.assertTrue(bool((areas > 1e-9).all()), "出现了零面积三角形")
+
+        # Every edge that the triangulation produced must be free of other
+        # vertices: welding keeps identical positions, so a vertex sitting inside
+        # an edge shows up as an edge that is not an edge of any single triangle.
+        welded, inverse = np.unique(points, axis=0, return_inverse=True)
+        mapped = np.asarray(inverse).reshape(-1)[faces]
+        edges: set[tuple[int, int]] = set()
+        for a, b, c in mapped.tolist():
+            for u, v in ((a, b), (b, c), (c, a)):
+                edges.add((u, v) if u < v else (v, u))
+        for u, v in edges:
+            start = welded[u]
+            end = welded[v]
+            span = end - start
+            length = float(np.linalg.norm(span))
+            if length <= 1e-9:
+                continue
+            relative = (welded - start) @ span / (length * length)
+            offset = np.linalg.norm(
+                (welded - start) - np.outer(relative, span), axis=1
+            )
+            inside = (relative > 1e-9) & (relative < 1.0 - 1e-9) & (offset < 1e-6)
+            self.assertEqual(
+                int(np.count_nonzero(inside)), 0, f"边 {u}->{v} 上还压着别的顶点"
+            )
 
     def test_region_pixels_cover_the_printed_pixels(self):
         plate = build_plate(self.result, PlateSettings())

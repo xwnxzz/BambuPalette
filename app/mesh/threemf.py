@@ -10,10 +10,24 @@ Two files carry everything Bambu Studio needs:
     colour, but one object whose triangles are painted.
 
 ``Metadata/project_settings.config``
-    The project's filament list — ``filament_colour`` and friends.  Without it
-    Bambu Studio paints the model with whatever spools happen to sit in the AMS,
-    which is why an early build of this exporter showed a plate in the wrong
-    colours even though the geometry was right.
+    **Deliberately not written.**  A project config of our own is what makes
+    Bambu Studio print 「3mf文件配置无效，仅加载几何数据」 and then paint the
+    plate from its own spool list.  It rejects every partial config — including
+    a ten-key one containing nothing but the filament list — and a *complete*
+    one is a 555-key document that only Bambu Studio itself can produce.  With
+    no config at all the loader takes its standard-3MF path instead: it keeps
+    the colour data (``The 3mf is not from Bambu Lab, load geometry data and
+    color data only.``) and the plate opens in the right colours, silently.
+    Verified against the installed 02.08.02.61: no dialog, correct colours.
+    What the user loses is only Bambu's copy of the spool *names*; the colours,
+    the geometry and the paint codes all still travel, and the names are still
+    in the mesh's ``<basematerials>`` for any reader that wants them.
+
+    Tagging the file as Bambu Studio's own (``Application = BambuStudio-…``)
+    was tried as the alternative and rejected: the GUI survives it but adds its
+    「自定义的预设」 G-code safety warning, and Bambu's headless
+    ``--export-3mf`` dies with an access violation (0xC0000005) on every file
+    tagged that way, with a full, a minimal or an empty config beside it.
 
 An earlier version emitted one ``<part>`` per colour and relied purely on
 ``Metadata/model_settings.config``'s per-part ``extruder``.  That works for the
@@ -44,6 +58,7 @@ from pathlib import Path
 from typing import Sequence
 from xml.sax.saxutils import escape
 
+from .. import __version__
 from .plate import PlateModel
 
 __all__ = [
@@ -51,15 +66,30 @@ __all__ = [
     "FilamentSlot",
     "slots_from_palette",
     "THREEMF_APPLICATION",
+    "THREEMF_APP_VERSION",
+    "THREEMF_GENERATOR",
     "DEFAULT_PLATE_MM",
     "PAINT_CODES",
     "MAX_PAINTED_FILAMENTS",
     "paint_code",
 ]
 
-#: Recorded in ``<metadata name="Application">``.  Kept honest instead of
-#: impersonating Bambu Studio; the importer keys off the standard parts below.
-THREEMF_APPLICATION = "BambuPalette"
+#: The program that wrote the file, as recorded in ``Application``.
+#:
+#: It stays ``BambuPalette`` on purpose.  Impersonating Bambu Studio
+#: (``Application = "BambuStudio-…"``) was tried and rejected: the GUI survives
+#: it but adds its 「自定义的预设」 G-code safety warning, and the headless
+#: ``--export-3mf`` path dies with an access violation (0xC0000005) on every
+#: such file, whether the config beside it is full, minimal or empty.
+THREEMF_GENERATOR = "BambuPalette"
+
+#: Recorded as ``<metadata name="Application">``.
+THREEMF_APPLICATION = THREEMF_GENERATOR
+
+#: The version stamped into the ``slice_info`` header.  Free text — nothing the
+#: importer needs reads it — but it names the real writer, and it is taken from
+#: the package so it cannot drift away from the version in the About box.
+THREEMF_APP_VERSION = f"{__version__}.0"
 
 #: Bambu's printers all ship a 256 mm build plate, so that is where the object
 #: is centred.  A larger plate simply leaves more room around it.
@@ -347,54 +377,40 @@ def _project_filaments(
     return [slot or FilamentSlot(color_hex="#FFFFFF") for slot in slots]
 
 
-def _project_settings(slots: Sequence[FilamentSlot]) -> str:
-    """``Metadata/project_settings.config`` — the project's filament list.
-
-    Bambu Studio reads ``filament_colour`` from here for projects it considers
-    its own — that is, files whose ``Application`` metadata starts with
-    ``BambuStudio``.  A file imported from another program is read as a plain
-    3MF, so Bambu Studio takes no colours from this file; the colours that do
-    travel are the ``<basematerials>`` and ``paint_color`` attributes on the mesh
-    itself.  This file is written anyway because it costs nothing, it documents
-    the intended spool for every slot, and readers that do honour it then get the
-    right answer.
-
-    Only the keys this program can answer for are written — everything else
-    (printer, process, g-code) falls back to Bambu Studio's own defaults.
-
-    A warning to anyone tempted to "fix" this by renaming the Application
-    metadata to ``BambuStudio-…``: Bambu Studio then treats the file as its own
-    project, and with a filament list it did not write itself it aborts with an
-    out-of-memory crash (reproduced three times against 02.08.02.61).  Shipping a
-    file that crashes the slicer is far worse than a file whose colours have to
-    be picked once in the import dialog.
-    """
-    count = len(slots)
-    colours = [slot.color_hex for slot in slots]
-    payload = {
-        "filament_colour": colours,
-        "filament_multi_colour": colours,
-        "filament_colour_type": ["0"] * count,
-        "filament_type": [slot.material_type or "PLA" for slot in slots],
-        "filament_vendor": [slot.vendor for slot in slots],
-        "filament_settings_id": [slot.name or f"BambuPalette {i + 1}" for i, slot in enumerate(slots)],
-        "filament_ids": [""] * count,
-        "filament_diameter": ["1.75"] * count,
-        "filament_flow_ratio": ["0.98"] * count,
-        "filament_map_mode": "Auto For Flush",
-        "filament_map": ["1"] * count,
-        "filament_volume_map": ["0"] * count,
-        "filament_self_index": [str(i + 1) for i in range(count)],
-        "filament_prime_volume": ["30"] * count,
-        "default_filament_colour": [""] * count,
-        "nozzle_diameter": ["0.4"],
-        "extruder_colour": ["#018001"],
-        "master_extruder_id": "1",
-        "physical_extruder_map": ["0"],
-        "single_extruder_multi_material": "1" if count > 1 else "0",
-        "enable_prime_tower": "1" if count > 1 else "0",
-    }
-    return json.dumps(payload, indent=4, ensure_ascii=False) + "\n"
+# ---------------------------------------------------------------------------
+# Why there is no Metadata/project_settings.config
+# ---------------------------------------------------------------------------
+# This package used to carry a hand-written project config — the filament list,
+# the nozzle size, the vendor and material names — because Bambu Studio paints a
+# plate from its *project* filaments, not from the mesh.  It was the wrong lever.
+#
+# `Plater::load_files` runs the config through `check_project_config`, and when
+# that returns false it drops the config whole and reports, in the user's words,
+# 「3mf文件配置无效，仅加载几何数据」.  Measured against the installed
+# Bambu Studio 02.08.02.61, by opening each variant in the GUI and screenshotting
+# the result:
+#
+#   * 26-key config (what shipped)          -> 「配置无效」 dialog, plate in
+#                                              Bambu's spool colours
+#   * 10-key config (filament list only)    -> same dialog
+#   * config with nozzle_diameter and
+#     extruder_type matched in length       -> same dialog
+#   * config with extruder_type removed     -> same dialog
+#   * `{}` (empty config)                   -> NO dialog, correct colours
+#   * no project_settings.config at all     -> NO dialog, correct colours
+#
+# So the check rejects *any* partial config, and a complete one is a 555-key
+# document only Bambu Studio itself writes.  With no config the loader falls
+# back to its standard-3MF path — `The 3mf is not from Bambu Lab, load geometry
+# data and color data only.` — which is exactly the behaviour wanted: the
+# colours come from the mesh's `<basematerials>` and `paint_color`, and the
+# plate opens silently in the right colours.
+#
+# The other route, claiming to be Bambu Studio (`Application = BambuStudio-…`,
+# which is what makes the importer accept a config), was measured too and
+# rejected: the GUI survives it but adds a 「自定义的预设」 G-code safety warning,
+# and `bambu-studio.exe --export-3mf` crashes with 0xC0000005 on every file
+# tagged that way — with a full config, a ten-key one and an empty one alike.
 
 
 # ---------------------------------------------------------------------------
@@ -438,7 +454,9 @@ def write_3mf(
         archive.writestr(
             "Metadata/model_settings.config", _model_settings(plate, name)
         )
-        archive.writestr("Metadata/project_settings.config", _project_settings(slots))
+        # No Metadata/project_settings.config — see the comment above.  Bambu
+        # Studio rejects a partial project config and then paints the plate from
+        # its own spools; leaving the entry out makes it keep the mesh colours.
         archive.writestr(
             "Metadata/filament_sequence.json",
             json.dumps(
@@ -449,11 +467,10 @@ def write_3mf(
             "Metadata/slice_info.config",
             '<?xml version="1.0" encoding="UTF-8"?>\n'
             "<config><header>"
-            f'<header_item key="X-BBL-Client-Type" value="{_attr(THREEMF_APPLICATION)}" />'
-            # A Bambu Studio compatibility marker (the client version its own
-            # parser expects), NOT BambuPalette's version — that lives in
-            # app/__init__.py and is reported by --selftest.
-            '<header_item key="X-BBL-Client-Version" value="1.0.0" />'
+            # Free-text provenance.  Bambu Studio writes "slicer" here; naming
+            # the real program costs nothing, because nothing reads this field.
+            f'<header_item key="X-BBL-Client-Type" value="{_attr(THREEMF_GENERATOR)}" />'
+            f'<header_item key="X-BBL-Client-Version" value="{_attr(THREEMF_APP_VERSION)}" />'
             "</header></config>\n",
         )
     return target

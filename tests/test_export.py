@@ -1,9 +1,9 @@
 """Export tests: the 3MF package layout and the OBJ/MTL pair.
 
 The 3MF assertions follow the structure recorded from a real Bambu Studio
-project file (``BambuStudio-02.06.00.51``): OPC plumbing, a separate geometry
-file per part pulled in through ``<components>``, and every extruder assignment
-in ``Metadata/model_settings.config``.
+project file (``BambuStudio-02.06.00.51``): OPC plumbing, a single painted
+object with the colours on its triangles, and every extruder assignment in
+``Metadata/model_settings.config``.
 
 Run with::
 
@@ -12,7 +12,6 @@ Run with::
 
 from __future__ import annotations
 
-import json
 import sys
 import unittest
 import xml.etree.ElementTree as ET
@@ -30,7 +29,13 @@ if str(PROJECT_ROOT) not in sys.path:
 from app.core.image_matching import MatchSettings, build_palette, match_image  # noqa: E402
 from app.core.library import Filament, FilamentLibrary  # noqa: E402
 from app.mesh.objfile import write_obj  # noqa: E402
-from app.mesh.plate import PlateSettings, build_plate  # noqa: E402
+from app.mesh.plate import (  # noqa: E402
+    PlateSettings,
+    build_plate,
+    edge_health,
+    plate_mesh,
+    signed_volume,
+)
 from app.mesh.threemf import write_3mf  # noqa: E402
 
 SPOOLS = (
@@ -128,16 +133,24 @@ class ThreeMfTests(ExportTestCase):
         self.assertIn("/3D/3dmodel.model", targets)
 
     def test_every_xml_part_is_well_formed(self):
-        # Metadata/project_settings.config is JSON despite the .config suffix —
-        # Bambu Studio's own naming quirk, not ours, so it is parsed as JSON.
         with zipfile.ZipFile(self._write()) as archive:
             for name in archive.namelist():
                 if name.endswith(".model") or name.endswith(".xml"):
                     ET.fromstring(archive.read(name))
                 elif name == "Metadata/model_settings.config":
                     ET.fromstring(archive.read(name))
-                elif name == "Metadata/project_settings.config":
-                    json.loads(archive.read(name))
+
+    def test_there_is_no_project_settings_config(self):
+        """Bambu Studio must not be handed a partial project config.
+
+        Measured against 02.08.02.61: any partial ``project_settings.config``
+        makes ``Plater::load_files`` print 「3mf文件配置无效，仅加载几何数据」 and
+        then paint the plate from its own spools.  With the entry absent the
+        loader keeps the mesh's colour data and there is no dialog at all, which
+        is why the writer stopped emitting it.
+        """
+        with zipfile.ZipFile(self._write()) as archive:
+            self.assertNotIn("Metadata/project_settings.config", archive.namelist())
 
     def _model(self):
         with zipfile.ZipFile(self._write()) as archive:
@@ -266,18 +279,17 @@ class ThreeMfTests(ExportTestCase):
         ]
         self.assertEqual(face_counts, [str(self.plate.triangle_count)])
 
-    def test_the_project_file_carries_one_filament_per_colour(self):
-        with zipfile.ZipFile(self._write()) as archive:
-            settings = json.loads(archive.read("Metadata/project_settings.config"))
-        count = self.plate.extruder_count
-        self.assertEqual(len(settings["filament_colour"]), count)
-        self.assertEqual(len(settings["filament_multi_colour"]), count)
+    def test_the_mesh_carries_one_base_material_per_colour(self):
+        """The colours travel in the mesh now that the project config is gone."""
+        root = self._model()
+        table = next(
+            item for item in root.iter() if _local(item.tag) == "basematerials"
+        )
+        entries = [item for item in table if _local(item.tag) == "base"]
+        self.assertEqual(len(entries), self.plate.extruder_count)
         for part in self.plate.parts:
-            self.assertEqual(settings["filament_colour"][part.extruder - 1], part.color_hex)
-        # Bambu's own key is the SINGULAR filament_map.  filament_maps is a
-        # model_settings.config plate key and must not be repeated here.
-        self.assertEqual(len(settings["filament_map"]), count)
-        self.assertNotIn("filament_maps", settings)
+            entry = entries[part.extruder - 1]
+            self.assertEqual(entry.get("displaycolor"), f"{part.color_hex.upper()}FF")
 
     def test_the_plate_records_one_instance_of_the_object(self):
         with zipfile.ZipFile(self._write()) as archive:
@@ -396,22 +408,17 @@ class ObjTests(ExportTestCase):
 
 class GeometrySanityTests(ExportTestCase):
     def test_the_exported_solids_are_closed_and_positive(self):
-        for part in self.plate.parts:
-            welded, inverse = np.unique(np.round(part.vertices, 6), axis=0, return_inverse=True)
-            faces = inverse[part.triangles]
-            counts: dict[tuple[int, int], int] = {}
-            for triangle in faces:
-                for i in range(3):
-                    a, b = int(triangle[i]), int(triangle[(i + 1) % 3])
-                    key = (min(a, b), max(a, b))
-                    counts[key] = counts.get(key, 0) + 1
-            open_edges = sum(1 for count in counts.values() if count == 1)
-            self.assertEqual(open_edges, 0, part.name)
-            a = part.vertices[part.triangles[:, 0]]
-            b = part.vertices[part.triangles[:, 1]]
-            c = part.vertices[part.triangles[:, 2]]
-            volume = float(np.einsum("ij,ij->i", a, np.cross(b, c)).sum() / 6.0)
-            self.assertGreater(volume, 0.0, part.name)
+        """The exported plate is one closed, outward-facing solid.
+
+        The parts are slices of a single solid, so a part on its own is open where
+        it meets its neighbour — the export has to be checked assembled, which is
+        also how an importing slicer sees it.
+        """
+        points, faces, _extruders = plate_mesh(self.plate)
+        open_edges, non_manifold = edge_health(points, faces)
+        self.assertEqual(open_edges, 0)
+        self.assertEqual(non_manifold, 0)
+        self.assertGreater(signed_volume(points, faces), 0.0)
 
     def test_the_printed_volume_matches_the_reported_volume(self):
         cell = self.plate.pixel_size_mm**2

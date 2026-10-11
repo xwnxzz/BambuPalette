@@ -377,8 +377,43 @@ def projects_dir() -> Path:
     return path
 
 
+def _downloads_candidates() -> list[Path]:
+    """Places Windows is likely to keep the user's downloads, best first.
+
+    ``%USERPROFILE%`` is asked before :func:`Path.home` because the latter can
+    answer with a roaming or mapped profile while Explorer keeps using the local
+    one.  Only the *display* name of the folder is translated on a Chinese
+    Windows, so ``Downloads`` is the real name on every locale.
+    """
+    candidates: list[Path] = []
+    profile = os.environ.get("USERPROFILE")
+    if profile:
+        candidates.append(Path(profile) / "Downloads")
+    try:
+        candidates.append(Path.home() / "Downloads")
+    except RuntimeError:  # pragma: no cover - no home directory at all
+        pass
+    return candidates
+
+
 def exports_dir() -> Path:
-    """Default directory offered by the export dialogs."""
+    """Default directory offered by the export dialogs.
+
+    The exports have to be *findable*.  They used to land in
+    ``%LOCALAPPDATA%\\BambuPalette\\exports`` — a hidden folder that Windows
+    Explorer does not show by default and that no user would think to open, so
+    the file they had just saved appeared to have vanished.  The user's own
+    downloads folder is offered instead, which is where they asked for it and
+    where the next step (dragging the file into Bambu Studio) happens anyway.
+
+    A folder is only offered after a real write has been confirmed in it; a
+    Downloads folder redirected onto a locked or disconnected drive falls back
+    to the private folder so the dialog never opens somewhere the save will be
+    refused.
+    """
+    for candidate in _downloads_candidates():
+        if candidate.is_dir() and _write_probe(candidate) is None:
+            return candidate
     path = data_dir() / "exports"
     path.mkdir(parents=True, exist_ok=True)
     return path
