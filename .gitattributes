@@ -14,3 +14,8 @@
 # Vendored upstream sources under tools/reference/ are verbatim copies; leave
 # them byte-for-byte identical to upstream (including their line endings).
 tools/reference/** -text
+
+# Same rule for the one vendored data file that ships inside the package:
+# NOTICE.md quotes its upstream SHA-256, so a line-ending rewrite would make
+# that quotation false.
+app/mesh/orca_project_template.json -text

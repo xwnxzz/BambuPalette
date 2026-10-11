@@ -12,6 +12,7 @@ Run with::
 
 from __future__ import annotations
 
+import json
 import sys
 import unittest
 import xml.etree.ElementTree as ET
@@ -141,17 +142,74 @@ class ThreeMfTests(ExportTestCase):
                 elif name == "Metadata/model_settings.config":
                     ET.fromstring(archive.read(name))
 
-    def test_there_is_no_project_settings_config(self):
-        """Bambu Studio must not be handed a partial project config.
+    def test_application_names_a_client_bambu_studio_trusts(self):
+        """``Application`` is the switch that makes the project config count.
 
-        Measured against 02.08.02.61: any partial ``project_settings.config``
-        makes ``Plater::load_files`` print 「3mf文件配置无效，仅加载几何数据」 and
-        then paint the plate from its own spools.  With the entry absent the
-        loader keeps the mesh's colour data and there is no dialog at all, which
-        is why the writer stopped emitting it.
+        Measured on 02.08.02.61, one build per fresh process: ``BambuPalette``
+        and ``BambuStudio-BambuPalette-1.6.7`` both make it discard
+        ``Metadata/project_settings.config`` and report 「3mf文件配置无效，仅加载
+        几何数据」, while ``BambuStudio-2.3.0`` and ``BambuStudio-02.07.01.62``
+        are accepted.  The part after the dash has to parse as a version.
         """
+        from app.mesh.threemf import THREEMF_APPLICATION, THREEMF_GENERATOR
+
+        root = self._model()
+        values = {
+            item.get("name"): item.text
+            for item in root.iter()
+            if _local(item.tag) == "metadata"
+        }
+        self.assertEqual(values.get("Application"), THREEMF_APPLICATION)
+        self.assertTrue(THREEMF_APPLICATION.startswith("BambuStudio-"))
+        version = THREEMF_APPLICATION.split("-", 1)[1]
+        self.assertRegex(version, r"^\d+(\.\d+)+$")
+        # The honest writer name is still recorded, in slice_info.config.
         with zipfile.ZipFile(self._write()) as archive:
-            self.assertNotIn("Metadata/project_settings.config", archive.namelist())
+            header = archive.read("Metadata/slice_info.config").decode("utf-8")
+        self.assertIn(f'value="{THREEMF_GENERATOR}"', header)
+
+    def test_the_project_config_carries_the_palette(self):
+        """The colour list Bambu Studio reads is our palette, in slot order."""
+        with zipfile.ZipFile(self._write()) as archive:
+            names = archive.namelist()
+            self.assertIn("Metadata/project_settings.config", names)
+            settings = json.loads(
+                archive.read("Metadata/project_settings.config").decode("utf-8")
+            )
+        expected = [
+            self._by_extruder()[slot] for slot in sorted(self._by_extruder())
+        ]
+        self.assertEqual(settings["filament_colour"], expected)
+
+    def test_every_per_filament_array_matches_the_palette_length(self):
+        """A short array is what makes Bambu Studio call the config invalid.
+
+        The template is the Blender 3MF add-on's stock Orca/Bambu project: 511
+        keys, most arrays holding one entry per filament.  Each has to be
+        resized to our filament count exactly as ``orca.py`` does.
+        """
+        from app.mesh.threemf import _PER_FILAMENT_ARRAYS
+
+        with zipfile.ZipFile(self._write()) as archive:
+            settings = json.loads(
+                archive.read("Metadata/project_settings.config").decode("utf-8")
+            )
+        count = len(self._by_extruder())
+        self.assertGreater(count, 0)
+        resized = [
+            key
+            for key, value in settings.items()
+            if isinstance(value, list)
+            and value
+            and (key.startswith("filament_") or key in _PER_FILAMENT_ARRAYS)
+        ]
+        self.assertTrue(resized, "the template should supply per-filament arrays")
+        wrong = {key: len(settings[key]) for key in resized if len(settings[key]) != count}
+        self.assertEqual(wrong, {})
+        # And the document has to stay complete — a handful of keys is rejected.
+        self.assertGreater(len(settings), 400)
+        # Bambu's own spelling, or it substitutes the value and says so.
+        self.assertEqual(settings["ensure_vertical_shell_thickness"], "enabled")
 
     def _model(self):
         with zipfile.ZipFile(self._write()) as archive:

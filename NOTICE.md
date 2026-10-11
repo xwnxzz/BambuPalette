@@ -152,7 +152,34 @@ SOFTWARE.
 
 ---
 
-## 8. 字体
+## 8. 工程配置模板：blender 3MF Import/Export 插件
+
+`app/mesh/orca_project_template.json` 取自 **3MF Import/Export**（blender 插件）：
+
+- 项目：<https://github.com/Clonephaze/3MF-Blender-Add-on---Maintained>
+- 作者：Clonephaze（`blender_manifest.toml` 记 `maintainer = "Clonephaze"`，
+  `copyright = ["2025 Clonephaze", "2020 Ghostkeeper"]`）
+- 版本：2.7.7
+- 授权：**GPL-3.0-or-later**（与本程序相同，见 `LICENSE`）
+- 原始文件：`export_3mf/../orca_project_template.json`（48,055 B）
+- SHA-256：`ac769fab14765d8758ae3213058f9ce19383dee1176eed00d602fd0c693c0663`
+
+文件本身是 OrcaSlicer / Bambu Studio 的一份**通用工程设置模板**（511 个键的
+切片参数，例如 `printer_model = "Bambu Lab A1"`、`print_settings_id =
+"0.20mm Standard @BBL A1"`），不含任何个人数据或机器相关数据。本程序把它原样
+打包，导出 3MF 时只改写与耗材有关的部分：`filament_colour` 换成用户的配色，
+其余「每个耗材一项」的数组按耗材数量补齐或截断。改写的逻辑
+（`app/mesh/threemf.py::_project_settings`）照 `export_3mf/orca.py` 的
+`generate_project_settings()` 写成。
+
+`<metadata name="Application">` 里的 `BambuStudio-2.3.0` 同样来自该插件
+（`export_3mf/orca.py` 的注释写明了理由：Bambu Studio 只有认出这个标记才会把
+`Metadata/project_settings.config` 当成工程配置读进去）。这只是兼容性标记，
+`Metadata/slice_info.config` 里记录的写出程序仍然是 `BambuPalette`。
+
+---
+
+## 9. 字体
 
 界面使用系统自带字体：**Microsoft YaHei UI**、Segoe UI（Windows 内置），
 等宽内容使用 Consolas / Cascadia Mono。本程序不打包、不重新分发任何字体文件。

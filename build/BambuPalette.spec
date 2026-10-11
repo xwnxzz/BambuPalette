@@ -132,7 +132,12 @@ a = Analysis(
     [str(ROOT / "build" / "launcher.py")],
     pathex=[str(ROOT)],
     binaries=[],
-    datas=[(str(ROOT / "assets" / "logo.ico"), "assets")],
+    datas=[
+        (str(ROOT / "assets" / "logo.ico"), "assets"),
+        # The exporter reads this beside app/mesh/threemf.py; frozen, that file
+        # lives in _internal/app/mesh/, so it has to be collected the same way.
+        (str(ROOT / "app" / "mesh" / "orca_project_template.json"), "app/mesh"),
+    ],
     hiddenimports=["numpy"],
     hookspath=[],
     hooksconfig={},

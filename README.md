@@ -94,7 +94,7 @@
 8. 生成的模型是**一整块**跟着图片轮廓走的平面底板，上面按颜色涂不同的颜色（不是切成好几块）：
    - 3MF 里颜色直接写进模型本身（`<basematerials>` + 每个三角面的 Bambu `paint_color`），Bambu Studio 打开就是匹配到的那些颜色，不会再被 AMS 里随便哪个耗材的颜色顶掉；
    - 模型是**一个真正水密的实心体**（`0` 个开放边、`0` 个非流形边）：底板下表面、按颜色分区的上表面、外侧立墙拼成一个闭合曲面，**没有内部墙、没有重合面**。Bambu Studio 打开时不会再报「发现 N 个开放边 / N 非流形边」；
-   - 包里**故意不带** `Metadata/project_settings.config`：Bambu Studio 只认它自己写的那份完整工程配置，任何「部分配置」都会被判为无效——然后弹「3mf文件配置无效，仅加载几何数据」，并**用 AMS 里现有的耗材**去涂模型。不带这个文件，它就走标准 3MF 那条路，颜色照样读得对，而且**一个弹窗都没有**；
+   - 包里带着一份**完整的**工程配置 `Metadata/project_settings.config`，Bambu Studio 打开时会**一个弹窗都不弹**，并且用它当工程读：耗材列表就是你的配色（白 / 红 / 金 / 青 / 黑），不会再被 AMS 里随便哪个耗材的颜色顶掉。这份配置的来路与改写方式见 [NOTICE.md](NOTICE.md) 第 8 节；
    - OBJ + MTL 是给别的软件用的（Blender、ZBrush、切片软件等）；
 
 ### 界面风格（参考 Lumina Studio）
@@ -298,8 +298,8 @@ samples/      示例图片、界面截图、示例模型
 ## 六、已知限制
 
 - **3MF 已经在真实的 Bambu Studio 里验证过了**（见下节），验证的是「能被正确读入、几何与挤出机号完整保留、**按顶点索引数**没有开放边/非流形边、顶点逐面颜色与往返前完全一致」；实际切片打印效果还需要你自己试一次。
-- 打开导出的 3MF 时，Bambu Studio 会弹一句「**3mf文件配置无效，仅加载几何数据**」。这是它对**任何没有完整 Bambu 工程配置的 3MF** 说的通告：手写的一个普通立方体也会弹同一句，所以它跟本程序生成的文件无关，也没法在文件里消掉（对照实验见 [docs/算法说明.md](docs/算法说明.md) 第 32 节）。它只影响**打印设置**（工艺 / 机器预设），**不影响颜色**——颜色是几何里逐三角面的 `paint_color`，点一下「确认」再选你要的预设即可。
-- 3MF 里**不带** `Metadata/project_settings.config`，所以 Bambu Studio 打开时用的是**它当前选中的**打印机/工艺预设，而不会把你在本程序里填的耗材名字、品牌带过去。颜色的对应关系是准的（每个色块就是程序里匹配到的那个颜色），但「这一格用哪一卷料」还是要你按程序里给的配方去 Bambu Studio 里对号入座。
+- 打开导出的 3MF 时，Bambu Studio **不再弹任何对话框**（1.6.6 及以前会弹「3mf文件配置无效，仅加载几何数据」，原因与修法见 [docs/算法说明.md](docs/算法说明.md) 第 33 节）。
+- 工程配置里带的机器 / 工艺预设是**模板里那份**（`Bambu Lab A1` + `0.20mm Standard @BBL A1`），所以打开后 Bambu Studio 左上角的打印机会变成 **Bambu Lab A1**。**切片前记得切回你自己的机器**——这一点和从 Makerworld 下载的别人的工程文件是一样的。耗材列表里的 5 个颜色始终是你导出时的那 5 个。
 - 混色只在**同一种耗材种类**之间成立（Bambu Studio 本身也是如此，种类不同不允许混色）。程序不会阻止你给不同种类的耗材算混色，但去 Bambu Studio 里会发现混不了。
 - 图片匹配是逐像素取最接近的颜色，颜色数量上限 48；照片类图片建议 8–16 色，否则打印出来会非常碎。
 - 底板是按像素矩形拼出来的，分辨率很高时三角形会比较多（示例图 150 mm 宽约 2 千个三角形），切片正常，但如果要更精细可以适当调低「最大边长」。
@@ -324,20 +324,20 @@ samples/      示例图片、界面截图、示例模型
 实测结果（示例文件 [samples/sample-plate.3mf](samples/sample-plate.3mf)）：
 
 ```
-source      :   21,068 B  1,008 vertices  2,012 triangles  1 parts  5 paint codes
+source      :   31,363 B  1,008 vertices  2,012 triangles  1 parts  5 paint codes
               part 1: extruder None  混色底板示例
-              filaments: (none)
+              filaments: #F2F0EB #C8342E #D9A441 #2FA8B8 #17181C
               paints: 0C×266  1C×472  2C×27  4×1,188  8×59
               mesh: 0 open edges  0 non-manifold edges
-round trip  :   41,207 B  1,008 vertices  2,012 triangles  1 parts  1 meshes
+round trip  :   51,711 B  1,008 vertices  2,012 triangles  1 parts  1 meshes
               part 1: extruder None  混色底板示例
-              filaments: #00AE42
+              filaments: #F2F0EB #C8342E #D9A441 #2FA8B8 #17181C
               paints: 0C×266  1C×472  2C×27  4×1,188  8×59
 
 BAMBU ROUND TRIP OK
 ```
 
-源文件 `filaments: (none)` 是**故意的**：包里不带 `Metadata/project_settings.config`（原因见 §二第 8 条和 [docs/算法说明.md](docs/算法说明.md) 第 31、32 节）。颜色靠 `<basematerials>` + `paint_color`，五个编码和逐项计数在往返前后完全一致。开放边 / 非流形边这两项一旦不是 0，脚本会直接判 FAIL——它们是用户在 Bambu Studio 里一眼就能看见的两行红字。
+源文件的 `filaments:` 读的是模型里的 `<basematerials>`（`BambuPalette` 的读入路径只认那里），工程配置里的耗材表在 `Metadata/project_settings.config`，两者写的是同一组颜色（见 §二第 8 条和 [docs/算法说明.md](docs/算法说明.md) 第 33 节）。颜色靠 `<basematerials>` + `paint_color`，五个编码和逐项计数在往返前后完全一致。开放边 / 非流形边这两项一旦不是 0，脚本会直接判 FAIL——它们是用户在 Bambu Studio 里一眼就能看见的两行红字。
 
 > 这一步曾经抓出一个真实缺陷：最早的 3MF 是照抄 Bambu Studio 自己导出工程的布局（每个部件一个 `3D/Objects/object_N.model`，用 3MF production 扩展的 `<component p:path=…>` 跨文件引用）。Bambu Studio 2.8 会**保留元数据却把全部 component 丢掉**，回读出来 `face_count="0"`、几何全空。改成标准 core 3MF（网格全部内联在 `3D/3dmodel.model` 里，component 只按 `objectid` 引用）之后往返完全一致。现在 `tests/test_export.py` 里有专门的回归测试守着这条：不许出现 `3D/Objects/` 条目，且每个 `<component>` 必须能解析到真正带网格的对象。
 

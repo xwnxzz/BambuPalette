@@ -74,17 +74,29 @@ __all__ = [
     "paint_code",
 ]
 
-#: The program that wrote the file, as recorded in ``Application``.
-#:
-#: It stays ``BambuPalette`` on purpose.  Impersonating Bambu Studio
-#: (``Application = "BambuStudio-…"``) was tried and rejected: the GUI survives
-#: it but adds its 「自定义的预设」 G-code safety warning, and the headless
-#: ``--export-3mf`` path dies with an access violation (0xC0000005) on every
-#: such file, whether the config beside it is full, minimal or empty.
+#: The program that wrote the file, as recorded in ``slice_info.config``.
 THREEMF_GENERATOR = "BambuPalette"
 
 #: Recorded as ``<metadata name="Application">``.
-THREEMF_APPLICATION = THREEMF_GENERATOR
+#:
+#: It has to name a Bambu/Orca client, version included, or Bambu Studio
+#: refuses to read ``Metadata/project_settings.config`` at all and reports
+#: 「3mf文件配置无效，仅加载几何数据」.  ``BambuStudio-<name>`` is not enough
+#: either — the part after the dash has to parse as a version.
+#:
+#: Measured on Bambu Studio 02.08.02.61 by opening one variant per fresh
+#: process and measuring the dialogs it puts up (``_gui_probe.ps1``):
+#:
+#:   * ``BambuPalette``                        -> 「配置无效」
+#:   * ``BambuStudio-BambuPalette-1.6.7``      -> 「配置无效」
+#:   * ``BambuStudio-2.3.0``                   -> config read, accepted
+#:   * ``BambuStudio-02.07.01.62``             -> config read, accepted
+#:
+#: ``2.3.0`` is what the Blender 3MF add-on writes (``export_3mf/orca.py``
+#: :773-785), so it is the value with the most third-party mileage behind it.
+#: The string is a compatibility marker, not a claim: ``slice_info.config``
+#: below still records ``BambuPalette`` as the writer.
+THREEMF_APPLICATION = "BambuStudio-2.3.0"
 
 #: The version stamped into the ``slice_info`` header.  Free text — nothing the
 #: importer needs reads it — but it names the real writer, and it is taken from
@@ -393,39 +405,91 @@ def _project_filaments(
 
 
 # ---------------------------------------------------------------------------
-# Why there is no Metadata/project_settings.config
+# Metadata/project_settings.config
 # ---------------------------------------------------------------------------
-# This package used to carry a hand-written project config — the filament list,
-# the nozzle size, the vendor and material names — because Bambu Studio paints a
-# plate from its *project* filaments, not from the mesh.  It was the wrong lever.
+# Bambu Studio paints a plate from its *project* filaments, and it only reads
+# that project — the filament list, the colours, the process preset — out of
+# ``Metadata/project_settings.config``.  Two things are needed for it to be
+# honoured, and both were found by bisecting one variant per fresh Bambu Studio
+# process (an earlier round reused one process for several files and never
+# reliably dismissed the modal, so its conclusions were wrong):
 #
-# `Plater::load_files` runs the config through `check_project_config`, and when
-# that returns false it drops the config whole and reports, in the user's words,
-# 「3mf文件配置无效，仅加载几何数据」.  Measured against the installed
-# Bambu Studio 02.08.02.61, by opening each variant in the GUI and screenshotting
-# the result:
+#   1. ``Application`` must name a Bambu/Orca client (see THREEMF_APPLICATION).
+#   2. The config must be complete.  A five-key one is rejected outright.
 #
-#   * 26-key config (what shipped)          -> 「配置无效」 dialog, plate in
-#                                              Bambu's spool colours
-#   * 10-key config (filament list only)    -> same dialog
-#   * config with nozzle_diameter and
-#     extruder_type matched in length       -> same dialog
-#   * config with extruder_type removed     -> same dialog
-#   * `{}` (empty config)                   -> NO dialog, correct colours
-#   * no project_settings.config at all     -> NO dialog, correct colours
-#
-# So the check rejects *any* partial config, and a complete one is a 555-key
-# document only Bambu Studio itself writes.  With no config the loader falls
-# back to its standard-3MF path — `The 3mf is not from Bambu Lab, load geometry
-# data and color data only.` — which is exactly the behaviour wanted: the
-# colours come from the mesh's `<basematerials>` and `paint_color`, and the
-# plate opens silently in the right colours.
-#
-# The other route, claiming to be Bambu Studio (`Application = BambuStudio-…`,
-# which is what makes the importer accept a config), was measured too and
-# rejected: the GUI survives it but adds a 「自定义的预设」 G-code safety warning,
-# and `bambu-studio.exe --export-3mf` crashes with 0xC0000005 on every file
-# tagged that way — with a full config, a ten-key one and an empty one alike.
+# And the config has to name presets that exist on the reader's machine, or
+# Bambu Studio puts up its 「自定义的预设 …请确认这些预设中的 G-codes 是否安全」
+# warning.  That is why the template below is the Blender 3MF add-on's
+# stock-preset document rather than a hand-written one: ``Bambu Lab A1 0.4
+# nozzle``, ``Generic PETG @BBL A1`` and ``0.20mm Standard @BBL A1`` ship with
+# every Bambu Studio install.
+_PROJECT_TEMPLATE_PATH = Path(__file__).with_name("orca_project_template.json")
+
+#: Array-valued keys that take one entry per filament but do not start with
+#: ``filament_``.  Transcribed from ``generate_project_settings`` in the Blender
+#: 3MF add-on's ``export_3mf/orca.py`` (:1230-1242), which resizes these
+#: alongside the ``filament_*`` ones.
+_PER_FILAMENT_ARRAYS = (
+    "activate_air_filtration",
+    "activate_chamber_temp_control",
+    "additional_cooling_fan_speed",
+    "chamber_temperature",
+    "close_fan_the_first_x_layers",
+    "complete_print_exhaust_fan_speed",
+    "cool_plate_temp",
+    "cool_plate_temp_initial_layer",
+    "default_filament_colour",
+    "eng_plate_temp",
+    "eng_plate_temp_initial_layer",
+    "hot_plate_temp",
+    "hot_plate_temp_initial_layer",
+    "nozzle_temperature",
+    "nozzle_temperature_initial_layer",
+    "textured_plate_temp",
+    "textured_plate_temp_initial_layer",
+)
+
+
+#: Values the stock Orca template spells differently from Bambu Studio's own
+#: profile schema.  Bambu Studio substitutes them on load and then tells the
+#: user 「此配置可能由新版本的 Bambu Studio 生成。部分数值已被替换，请检查：…」
+#: — one more dialog for nothing.  ``ensure_vertical_shell_thickness`` is the
+#: only one measured; ``ensure_all`` is Orca's spelling, ``enabled`` is Bambu's.
+_VALUE_ALIASES = {
+    "ensure_vertical_shell_thickness": {"ensure_all": "enabled"},
+}
+
+
+def _project_settings(colours: Sequence[str]) -> str:
+    """``Metadata/project_settings.config`` carrying our plate's colours.
+
+    Starts from the stock Orca/Bambu project template and rewrites only what
+    describes the filaments: ``filament_colour`` becomes the palette, and every
+    array that holds one entry per filament is padded (repeating its last entry)
+    or truncated to match.  Everything else — printer, process, the g-code
+    blocks — is left exactly as the stock preset wrote it, which is what keeps
+    Bambu Studio from treating the file as carrying custom presets.
+    """
+    settings = json.loads(_PROJECT_TEMPLATE_PATH.read_text(encoding="utf-8"))
+    palette = [colour.upper() for colour in colours]
+    count = len(palette)
+    settings["filament_colour"] = palette
+    for key in list(settings):
+        value = settings[key]
+        if not isinstance(value, list) or not value:
+            continue
+        if key == "filament_colour":
+            continue
+        if not (key.startswith("filament_") or key in _PER_FILAMENT_ARRAYS):
+            continue
+        if len(value) < count:
+            settings[key] = value + [value[-1]] * (count - len(value))
+        elif len(value) > count:
+            settings[key] = value[:count]
+    for key, aliases in _VALUE_ALIASES.items():
+        if key in settings and settings[key] in aliases:
+            settings[key] = aliases[settings[key]]
+    return json.dumps(settings, indent=4, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
@@ -469,9 +533,12 @@ def write_3mf(
         archive.writestr(
             "Metadata/model_settings.config", _model_settings(plate, name)
         )
-        # No Metadata/project_settings.config — see the comment above.  Bambu
-        # Studio rejects a partial project config and then paints the plate from
-        # its own spools; leaving the entry out makes it keep the mesh colours.
+        # The project config is what carries the colours into Bambu Studio's own
+        # filament list.  See the comment above for what it has to contain.
+        archive.writestr(
+            "Metadata/project_settings.config",
+            _project_settings([slot.color_hex for slot in slots]),
+        )
         archive.writestr(
             "Metadata/filament_sequence.json",
             json.dumps(

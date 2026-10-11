@@ -16,6 +16,7 @@ also printed.  Exit code 0 means everything passed.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import zipfile
@@ -103,6 +104,42 @@ def run_selftest(*, report_path: Path | None = None) -> int:
             _exports == _downloads[0],
             "the export dialog opens in the downloads folder, not a hidden data folder",
         )
+
+    # Objective "Bambu 报错": the exported 3MF carries a complete project config,
+    # and the template it is built from has to be found from inside the bundle —
+    # a data file read through ``__file__`` is exactly the thing a frozen build
+    # gets wrong.
+    from .mesh.threemf import (
+        THREEMF_APPLICATION,
+        _PROJECT_TEMPLATE_PATH,
+        _project_settings,
+    )
+
+    lines.append(f"template    {_PROJECT_TEMPLATE_PATH}")
+    check(_PROJECT_TEMPLATE_PATH.is_file(), "the project-config template ships with the app")
+    check(
+        THREEMF_APPLICATION.startswith("BambuStudio-")
+        and THREEMF_APPLICATION.split("-", 1)[1][:1].isdigit(),
+        f"Application names a client Bambu Studio reads the config for ({THREEMF_APPLICATION})",
+    )
+    _config = json.loads(_project_settings(["#112233", "#445566"]))
+    check(
+        _config.get("filament_colour") == ["#112233", "#445566"],
+        "the project config takes the palette it is given",
+    )
+    _sized = {
+        key: len(value)
+        for key, value in _config.items()
+        if isinstance(value, list) and value and key.startswith("filament_")
+    }
+    check(
+        bool(_sized) and set(_sized.values()) == {2},
+        "every per-filament array is resized to the palette length",
+    )
+    check(
+        _config.get("ensure_vertical_shell_thickness") == "enabled",
+        "the one value Bambu Studio spells differently is written its way",
+    )
 
     from .core.engines import ENGINES, ENGINE_BAMBU, ENGINE_MIXER
     from .core.image_matching import MatchSettings, build_palette, match_image
