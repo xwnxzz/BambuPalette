@@ -59,6 +59,7 @@ from ..spectral import color as _color
 from ..core.triples import (
     TRIPLE_CACHE_PREFIX,
     CombinedColours,
+    OrderedCombinedColours,
     TripleCatalog,
     load_triple_cache,
     mix_sidecar_path,
@@ -71,6 +72,7 @@ from .filament_dialog import FilamentDialog
 from .mix_detail import MixDetail
 from .mix_grid import MixGrid
 from .picture_page import PicturePage
+from .selectable import selectable_text
 from .swatch import ColorField, swatch_icon
 
 _HEX_QUERY = re.compile(r"^[0-9a-fA-F]{1,6}$")
@@ -204,8 +206,10 @@ class MainWindow(QMainWindow):
             "程序会找出最接近的混色配方"
         )
         self._target_color.colorChanged.connect(self._on_target_color_changed)
-        self._find_button = QPushButton("找最接近的混色")
-        self._find_button.setToolTip("先选一个目标颜色；再按 CIEDE2000 在当前显示的全部颜色里找最接近的配方")
+        self._find_button = QPushButton("找最接近的颜色")
+        self._find_button.setToolTip(
+            "先选一个目标颜色；再按 CIEDE2000 在当前显示的全部颜色里找最接近的一个"
+        )
         self._find_button.setEnabled(False)
         self._find_button.clicked.connect(self._on_find_nearest)
 
@@ -224,7 +228,7 @@ class MainWindow(QMainWindow):
         target_row.addWidget(self._target_color)
         target_row.addWidget(self._find_button)
         target_row.addStretch(1)
-        target_row.addWidget(QLabel("双击某个混色 = 只看这一对耗材"))
+        target_row.addWidget(QLabel("双击两色混色 = 只看这一对耗材"))
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self._build_library_panel())
@@ -284,9 +288,20 @@ class MainWindow(QMainWindow):
         outer.addWidget(body, 1)
         self.setCentralWidget(central)
 
+        # The bottom line carries the one long sentence that explains how the
+        # whole table is built.  It is a single unwrapped line of ~1400 px, so
+        # without an Ignored horizontal policy its minimumSizeHint would become
+        # the window's minimum width — and, before it moved here, the splitter's
+        # handle could not be dragged at all because the grid panel was pinned to
+        # that same width.  Ignored lets it shrink; the tooltip keeps the whole
+        # sentence reachable when the window is narrow.
         self._status = QLabel("")
         self._status.setProperty("role", "hint")
-        self.statusBar().addWidget(self._status)
+        self._status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.statusBar().addWidget(self._status, 1)
+
+        # Every hint, recipe and status line is text worth pasting elsewhere.
+        selectable_text(self)
 
     def _wrap(self, widget: QWidget, title: str, header_extra: QWidget | None = None) -> QWidget:
         frame = QFrame()
@@ -374,8 +389,6 @@ class MainWindow(QMainWindow):
         self._grid.recipeSelected.connect(self._on_grid_selected)
         self._grid.recipeActivated.connect(self._on_grid_activated)
         self._grid.selectionCleared.connect(self._on_grid_cleared)
-        self._grid_info = QLabel("")
-        self._grid_info.setProperty("role", "hint")
 
         # 「全部颜色」: the two-filament mixes, the three-filament mixes and the
         # spool colours themselves are one list, deduplicated across all of them.
@@ -401,7 +414,6 @@ class MainWindow(QMainWindow):
         layout.setSpacing(6)
         layout.addWidget(self._filter_bar)
         layout.addWidget(self._grid, 1)
-        layout.addWidget(self._grid_info)
         return self._wrap(panel, "全部颜色")
 
     def _build_menus(self) -> None:
@@ -707,11 +719,10 @@ class MainWindow(QMainWindow):
         """Say what the pending catalogue build is about to do."""
         count = len(self.library)
         total = count * (count - 1) // 2 * len(MIX_RATIOS)
-        self._status.setText(f"正在计算 {total:,} 个混色，请稍候…")
-        self._grid_info.setText("正在计算混色表…")
         # The grid's own empty state blames the library ("add two spools"); while
         # the calculation is running that is simply untrue.
         self._grid.setEmptyText("正在计算混色表…")
+        self._set_status_text(f"正在计算 {total:,} 个混色，请稍候…")
         if not self._build_notice:
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
             self._build_notice = True
@@ -892,9 +903,7 @@ class MainWindow(QMainWindow):
         self._triple_timer.start()
 
     def _announce_triples(self) -> None:
-        text = f"正在计算三色混色：{self._triples.recipe_total:,} 条配方，请稍候…"
-        self._status.setText(text)
-        self._grid_info.setText(text)
+        self._set_status_text(f"正在计算三色混色：{self._triples.recipe_total:,} 条配方，请稍候…")
         self._grid.setEmptyText("正在计算三色混色…")
         if not self._build_notice:
             self._build_notice = True
@@ -909,14 +918,11 @@ class MainWindow(QMainWindow):
         done = catalog.mixed_done
         total = catalog.recipe_total
         percent = (done * 100 // total) if total else 100
-        text = f"正在计算三色混色：{done:,} / {total:,}（{percent}%）"
-        self._status.setText(text)
-        self._grid_info.setText(text)
+        self._set_status_text(f"正在计算三色混色：{done:,} / {total:,}（{percent}%）")
         if not finished:
             return
         self._stop_triple_timer()
-        self._status.setText("正在排序去重…")
-        self._grid_info.setText("正在排序去重…")
+        self._set_status_text("正在排序去重…")
         QApplication.processEvents()
         catalog.finish()
         self._rebuild_combined()
@@ -983,6 +989,16 @@ class MainWindow(QMainWindow):
                 self._grid.setSelectedIndex(index, scroll=False)
         self._update_status()
 
+    def _set_status_text(self, text: str) -> None:
+        """Write the bottom line, keeping the full sentence in the tooltip.
+
+        The label is a single unwrapped line with an Ignored width policy, so a
+        long sentence is clipped rather than forcing the window wider.  The
+        tooltip is what makes the hidden tail reachable.
+        """
+        self._status.setText(text)
+        self._status.setToolTip(text)
+
     def _update_status(self) -> None:
         count = len(self.library)
         pairs = count * (count - 1) // 2
@@ -991,20 +1007,12 @@ class MainWindow(QMainWindow):
         colours = self._catalog.colour_count if self._catalog is not None else 0
         triples = self._triples if (self._triples is not None and self._triples.built) else None
         everything = self._combined.colour_count if self._combined is not None else colours
-        parts = [f"耗材 {count} 种", f"母材组合 {pairs} 对", f"混色 {double_recipes} 个"]
-        if colours and colours != double_recipes:
-            parts.append(f"去掉重复后 {colours} 个颜色")
-        if triples is not None:
-            parts.append(f"三色混色 {triples.recipe_count:,} 个配比")
-            parts.append(f"全部颜色 {everything:,} 个")
-        elif self._triple_timer is not None:
-            parts.append("正在计算三色混色")
-        if shown != everything:
-            parts.append(f"当前显示 {shown} 个")
-        if self._build_seconds:
-            parts.append(f"计算用时 {self._build_seconds * 1000:.0f} ms")
-        self._status.setText(" · ".join(parts))
 
+        # The bottom line explains how the table is built: how many ratios each
+        # two- and three-spool combination contributes, and how many distinct
+        # colours that leaves.  It replaced a 「#RRGGBB = 配料」 line that could
+        # only ever name the FIRST recipe of the selected colour, which for a
+        # three-colour mix silently dropped the third spool.
         note = "每两种耗材 81 个配比（10%–90%）"
         made = double_recipes
         if triples is not None:
@@ -1014,9 +1022,17 @@ class MainWindow(QMainWindow):
         if count:
             note += f" · 含 {count} 种耗材本色"
         note += f" · 去重后共 {everything:,} 个颜色"
-        if self._pair_filter is None:
+        if self._pair_filter is not None:
+            note += " · 已筛选"
+        else:
             note += f" · 已按「{self._sort_combo.currentText()}」排列"
-        self._grid_info.setText(note)
+        if shown != everything:
+            note += f" · 当前显示 {shown:,} 个"
+        if self._triple_timer is not None:
+            note += " · 正在计算三色混色"
+        elif self._build_seconds:
+            note += f" · 计算用时 {self._build_seconds * 1000:.0f} ms"
+        self._set_status_text(note)
         self._update_filter_bar(shown, everything, count)
 
     def _update_filter_bar(self, shown: int, everything: int, count: int) -> None:
@@ -1080,41 +1096,29 @@ class MainWindow(QMainWindow):
     def _on_grid_selected(self, cell) -> None:
         # A spool cell is not a mix, so it has no pair to explain: it gets the
         # single-colour view instead of a fabricated 100% : 0% recipe.
+        #
+        # The bottom line is deliberately left alone: it explains how the whole
+        # table is built, and the detail panel already spells out the selected
+        # colour — every one of its spools, which a one-line summary could not.
         if getattr(cell, "pair_index", 0) < 0 and hasattr(cell, "filament"):
             self._detail.showFilament(cell.filament)
-            self._status.setText(
-                f"{cell.color_hex}  =  {cell.filament.display_name}（耗材本色，不是混色）"
-            )
             return
         self._detail.showColour(cell)
-        first = cell.recipes[0] if getattr(cell, "recipes", None) else None
-        if first is None:
-            # A spool's own colour is produced by no mixture at all, so there is
-            # no pair to name — say whose colour it is instead of indexing into
-            # an empty recipe tuple.
-            names = "、".join(f.display_name for f in getattr(cell, "filaments", ()))
-            self._status.setText(
-                f"{cell.color_hex}  =  {names}（耗材本色，不是混色）"
-                if names
-                else f"{cell.color_hex}（没有可复现的配方）"
-            )
-            return
-        filament_a = self.library.get(first.a_id)
-        filament_b = self.library.get(first.b_id)
-        if filament_a and filament_b:
-            more = f"  等 {cell.recipe_count} 条配方" if getattr(cell, "recipe_count", 1) > 1 else ""
-            self._status.setText(
-                f"{cell.color_hex}  =  {filament_a.display_name}（{filament_a.color_hex}）{first.percent_a}%"
-                f"  +  {filament_b.display_name}（{filament_b.color_hex}）{first.percent_b}%{more}"
-            )
 
     def _on_grid_activated(self, cell) -> None:
-        """Double-click: a colour jumps to its first parent pair, a spool has none."""
+        """Double-click: only a two-filament mix has one parent pair to jump to.
+
+        A three-filament mix is made by three spools at once.  Filtering to its
+        first two would show the 81 two-colour ratios of a DIFFERENT colour —
+        which is exactly the 「配方是三色，双击后却变成两色」 report.  So a
+        triple (and a spool) only refreshes the detail panel.
+        """
         if getattr(cell, "pair_index", 0) < 0 and hasattr(cell, "filament"):
             self._detail.showFilament(cell.filament)
             return
         first = cell.recipes[0] if getattr(cell, "recipes", None) else None
-        if first is None:
+        # ``TripleRecipe`` is the only recipe shape carrying a third spool.
+        if first is None or hasattr(first, "percent_c"):
             self._detail.showColour(cell)
             return
         self._show_pair(first.a_id, first.b_id)
@@ -1126,70 +1130,85 @@ class MainWindow(QMainWindow):
 
     # -- nearest colour ----------------------------------------------------------
     def nearest_recipe(self, target_hex: str):
-        """The catalogue entry whose predicted colour is closest to ``target_hex``."""
-        if self._catalog is None or not self._recipes:
+        """The catalogue entry whose predicted colour is closest to ``target_hex``.
+
+        EVERY colour in the table is a candidate, the spool colours included.
+        Skipping them is what made this button lie: asking for #FFFFFF answered
+        #E5E5E5 (ΔE00 5.40) while pure #FFFFFF was sitting in the very same grid
+        at ΔE00 0.
+        """
+        view = self._recipes
+        if self._catalog is None or not len(view):
             return None
         target = _color.hex_to_rgb(target_hex)
-        # Millions of colours: the store's own Lab table and its vectorised
-        # CIEDE2000 sort are the only affordable way to answer this.  Walking a
-        # Python list of four million colours here would hang the window.
-        if self._combined is not None and len(self._recipes) == len(self._combined):
+        if self._combined is not None and isinstance(view, OrderedCombinedColours):
+            # Millions of colours: the store's own Lab table plus one vectorised
+            # CIEDE2000 argsort is the only affordable way to answer this.
+            # ``order`` is a stable sort on the exact distance, so its first
+            # entry is the nearest colour — no shortlist, no skipping.
             order = self._combined.order(SORT_SIMILARITY, target)
-            for position in order[:16]:
-                cell = self._combined[int(position)]
-                # Spool cells carry no ratio at all, so they are skipped: this
-                # button answers "which mix should I dial in".
-                if cell.recipe_count:
-                    return cell
+            if len(view) != len(self._combined):
+                # A search narrowed the table: keep only what is on screen.  The
+                # mask preserves the sort order, so the first survivor is still
+                # the nearest visible colour.
+                order = order[np.isin(order, view.indices)]
+            if len(order):
+                return self._combined[int(order[0])]
             return None
-        # Spool cells carry no predicted Lab (they have no ratio), so they are
-        # skipped: this button answers "which mix should I dial in".
-        mixes = [cell for cell in self._recipes if getattr(cell, "pair_index", 0) >= 0]
-        if not mixes:
-            return None
-        lab_target = _color.lab_from_rgb(target)
-        labs = np.array([recipe.lab for recipe in mixes], dtype=np.float64)
-        rough = np.linalg.norm(labs - lab_target, axis=1)
-        shortlist = np.argsort(rough)[:64]
+        # The short lists (one pair's 81 recipes, or a search inside it) have no
+        # Lab table to sort, so measure every candidate against the target.
+        lab_target = tuple(_color.lab_from_rgb(target))
         best = None
         best_distance = float("inf")
-        for index in shortlist:
-            recipe = mixes[int(index)]
-            distance = _color.delta_e_2000(recipe.lab, tuple(lab_target))
+        for cell in view:
+            lab = getattr(cell, "lab", None)
+            if lab is None:
+                continue
+            distance = _color.delta_e_2000(lab, lab_target)
             if distance < best_distance:
                 best_distance = distance
-                best = recipe
+                best = cell
         return best
 
     # -- misc --------------------------------------------------------------------
     def _on_target_color_changed(self, value: str) -> None:
-        """The 找最接近的混色 button is only meaningful once a colour is chosen."""
+        """The 找最接近的颜色 button is only meaningful once a colour is chosen."""
         chosen = bool(value) and self._target_color.isSet()
         self._find_button.setEnabled(chosen)
         if not chosen:
             self._find_button.setToolTip(
-                "先选一个目标颜色；再按 CIEDE2000 在当前显示的全部颜色里找最接近的配方"
+                "先选一个目标颜色；再按 CIEDE2000 在当前显示的全部颜色里找最接近的一个"
             )
         else:
             self._find_button.setToolTip(
-                f"在当前显示的全部颜色里，按 CIEDE2000 找出最接近 {value} 的配方"
+                f"在当前显示的全部颜色里，按 CIEDE2000 找出最接近 {value} 的那一个"
             )
 
     def _on_find_nearest(self) -> None:
         target = self._target_color.hex()
         if not target:
-            self._status.setText("请先点「目标颜色」选一个想打印出来的颜色。")
+            self._set_status_text("请先点「目标颜色」选一个想打印出来的颜色。")
             return
-        if not self._recipes:
-            self._status.setText("还没有可搜索的混色，请先添加至少两种耗材。")
+        if not len(self._recipes):
+            self._set_status_text("还没有可搜索的颜色，请先添加至少一种耗材。")
             return
         best = self.nearest_recipe(target)
         if best is None:
-            self._status.setText("没有找到匹配的混色。")
+            self._set_status_text("没有找到匹配的颜色。")
             return
         distance = _color.delta_e_2000(best.lab, tuple(_color.lab_from_rgb(_color.hex_to_rgb(target))))
         self._grid.selectRecipe(best)
-        self._status.setText(f"最接近 {target} 的混色是 {best.color_hex}（色差 ΔE00 = {distance:.2f}）")
+        # A spool's own colour is a legitimate answer — and the most accurate one
+        # whenever the target IS a colour the user owns — so say so instead of
+        # presenting it as a mixture.
+        if getattr(best, "recipe_count", 1):
+            self._set_status_text(
+                f"最接近 {target} 的颜色是 {best.color_hex}（色差 ΔE00 = {distance:.2f}）"
+            )
+        else:
+            self._set_status_text(
+                f"最接近 {target} 的颜色就是耗材本色 {best.color_hex}（色差 ΔE00 = {distance:.2f}）"
+            )
 
     def _on_about(self) -> None:
         try:

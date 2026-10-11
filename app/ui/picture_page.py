@@ -65,6 +65,7 @@ from .colour_picker import (
     entry_recipe_text,
     hex_of,
 )
+from .selectable import selectable_text
 from .swatch import swatch_pixmap
 
 __all__ = ["PicturePage", "PictureView", "ColourList"]
@@ -104,6 +105,7 @@ class PictureView(QWidget):
         self._highlight: QPixmap | None = None
         self._selected = -1
         self._show_matched = True
+        self._plain = False
         self._scale = 1.0
         self._origin = QPointF(0.0, 0.0)
 
@@ -117,6 +119,12 @@ class PictureView(QWidget):
         self.update()
 
     def setSelected(self, index: int) -> None:
+        if self._plain:
+            # 原图 must never react to the selection: the whole point of the
+            # panel is to show what the user uploaded, next to what the match
+            # made of it.  Dimming it made the upload look like a washed-out
+            # copy of the preview.
+            return
         if index == self._selected:
             return
         self._selected = int(index)
@@ -125,6 +133,18 @@ class PictureView(QWidget):
 
     def setShowMatched(self, matched: bool) -> None:
         self._show_matched = bool(matched)
+        self.update()
+
+    def setPlain(self, plain: bool) -> None:
+        """Show the uploaded picture untouched, ignoring selection and preview.
+
+        Used by the 原图 panel: it always draws ``source``, so it stays the
+        user's own file no matter which colour is selected on the right.
+        """
+        self._plain = bool(plain)
+        if self._plain:
+            self._selected = -1
+            self._highlight = None
         self.update()
 
     def result(self) -> MatchResult | None:
@@ -154,15 +174,15 @@ class PictureView(QWidget):
         return QRectF(self._origin.x(), self._origin.y(), draw_w, draw_h)
 
     def _base_image(self) -> QImage | None:
-        if self._show_matched:
-            return self._matched
-        return self._source
+        if self._plain or not self._show_matched:
+            return self._source
+        return self._matched
 
     def _dim_pixmap(self) -> QPixmap | None:
         """The picture with everything but the selected colour faded out."""
         result = self._result
-        if result is None or self._selected < 0 or self._highlight is not None:
-            return self._highlight
+        if self._plain or result is None or self._selected < 0 or self._highlight is not None:
+            return None
         height, width = result.indices.shape
         canvas = np.zeros((height, width, 4), dtype=np.uint8)
         keep = result.indices == self._selected
@@ -219,7 +239,7 @@ class PictureView(QWidget):
 
     def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt naming
         result = self._result
-        if result is None:
+        if self._plain or result is None:
             return
         rect = self._target_rect()
         if not rect.contains(event.position()):
@@ -441,6 +461,7 @@ class MergeDialog(QDialog):
         box.addWidget(self._list, 1)
         box.addWidget(buttons)
         self.resize(430, 340)
+        selectable_text(self)
 
     def chosen(self) -> int:
         """Position inside the list this dialog was opened with, or -1."""
@@ -579,10 +600,11 @@ class PicturePage(QWidget):
 
         # 原图 and 预览 sit side by side so the user can compare what they
         # imported with what the printer will actually lay down.  The original
-        # never shows the matched render, so it stays a true reference.
+        # panel is in PLAIN mode: it draws the uploaded file itself and ignores
+        # the selection entirely, so it stays a true reference instead of a
+        # washed-out copy of the preview.
         self._original_view = PictureView()
-        self._original_view.setShowMatched(False)
-        self._original_view.regionClicked.connect(self._on_region_clicked)
+        self._original_view.setPlain(True)
 
         self._list = ColourList()
         self._list.colourSelected.connect(self._on_colour_selected)

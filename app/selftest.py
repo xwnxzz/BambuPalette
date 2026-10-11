@@ -540,6 +540,98 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         else:
             check(False, "the 3MF is a zip package")
 
+    # 「混色配方」页面：长说明搬到状态栏，右边面板不再被那条文字钉死宽度。
+    from PySide6.QtWidgets import QLabel as _QLabel
+    from PySide6.QtWidgets import QSizePolicy as _QSizePolicy
+    from PySide6.QtWidgets import QSplitter as _QSplitter
+
+    from .spectral import color as _selftest_colour
+
+    check(not hasattr(window, "_grid_info"), "the overflowing one-line note is gone")
+    check(
+        "每两种耗材" in window._status.text() and "10%" in window._status.text(),
+        f"the bottom line carries the rules, got {window._status.text()[:60]!r}",
+    )
+    check(
+        window._status.sizePolicy().horizontalPolicy() == _QSizePolicy.Policy.Ignored,
+        "the bottom line can never pin the window's width",
+    )
+    recipe_splitter = window._tabs.widget(0).findChild(_QSplitter)
+    if recipe_splitter is not None:
+        pinned = [
+            recipe_splitter.widget(index).minimumSizeHint().width()
+            for index in range(recipe_splitter.count())
+        ]
+        check(
+            max(pinned) < 720,
+            f"every 混色配方 pane can still be dragged, pinned widths {pinned}",
+        )
+
+    # 「找最接近的颜色」把耗材本色也算进去：问一个自己就有的颜色，答案就是它。
+    if spool_rows:
+        own = spool_rows[0]
+        answer = window.nearest_recipe(own.color_hex)
+        check(answer is not None, "找最接近的颜色 answers for a spool's own colour")
+        if answer is not None:
+            gap = _selftest_colour.delta_e_2000(
+                answer.lab,
+                tuple(_selftest_colour.lab_from_rgb(_selftest_colour.hex_to_rgb(own.color_hex))),
+            )
+            check(gap <= 1e-6, f"the spool's own colour answers itself, ΔE00 {gap:.4f}")
+        window._target_color.setValue(own.color_hex)
+        window._find_button.click()
+        app.processEvents()
+        check(
+            "耗材本色" in window._status.text(),
+            f"the answer says so when it is a raw spool, got {window._status.text()[:60]!r}",
+        )
+        window._clear_filters()
+        app.processEvents()
+
+    # 提示、配方、状态栏全是要粘进 Bambu Studio 的文本，都该能用鼠标选中。
+    selectable_flag = Qt.TextInteractionFlag.TextSelectableByMouse
+    blind = [
+        label.text()[:32]
+        for label in window.findChildren(_QLabel)
+        if label.text().strip() and not (label.textInteractionFlags() & selectable_flag)
+    ]
+    check(not blind, f"every label in the window can be selected, blind: {blind[:4]}")
+
+    # A three-filament recipe must NOT be narrowed to its first two spools: that
+    # showed a different colour's 81 two-colour ratios.  The window was built
+    # with auto_triples=False to keep every count above deterministic, so the
+    # table is asked for explicitly here.
+    window._auto_triples = True
+    window._ensure_triples()
+    for _ in range(20000):
+        if window._triples is not None and window._triples.built:
+            break
+        app.processEvents()
+    check(
+        window._triples is not None and window._triples.built,
+        "the three-filament table can be built on demand",
+    )
+    combined = window._combined
+    triple_only = None
+    if combined is not None and window._triples is not None:
+        entries = window._triples.colours()
+        for position in range(min(len(entries), 800)):
+            found = combined.index_of_key(f"colour|{entries[position].color_hex}")
+            if found >= 0 and combined.pair_colour_at(found) is None:
+                triple_only = combined[found]
+                break
+    check(triple_only is not None, "the triple table holds a colour no two-colour mix reaches")
+    if triple_only is not None:
+        first_recipe = triple_only.recipes[0]
+        check(hasattr(first_recipe, "percent_c"), "that colour is reached by a three-filament recipe")
+        window._on_grid_activated(triple_only)
+        app.processEvents()
+        check(window._pair_filter is None, "double-clicking a triple does not filter to two spools")
+        check(
+            window._detail.colour() is triple_only,
+            "double-clicking a triple keeps showing that same colour",
+        )
+
     # Render the real window once, so a broken Qt platform plugin or a missing
     # font shows up here rather than in front of the user.
     shot = None

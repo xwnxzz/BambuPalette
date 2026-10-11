@@ -1114,6 +1114,15 @@ class OrderedCombinedColours(Sequence):
             self._rank = rank
         return int(self._rank[found])
 
+    @property
+    def indices(self) -> np.ndarray:
+        """当前视图在整张表里的颜色下标（只读，别就地改它）。
+
+        「找最接近的颜色」需要拿它和整张表的相似度排序做一次 ``np.isin``，
+        这样即使搜索把四百万个颜色筛到几十个，也只需一次向量运算。
+        """
+        return self._order
+
     def restrict(self, mask) -> "OrderedCombinedColours":
         """只留下 ``mask``（随便什么顺序的颜色下标）里的那些，顺序不变。
 

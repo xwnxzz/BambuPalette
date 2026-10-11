@@ -11,9 +11,14 @@ def build_application(argv=None):
     from PySide6.QtWidgets import QApplication
 
     from .core.paths import resource_path
-    from .ui import theme
+    from .ui import selectable, theme
 
     app = QApplication.instance() or QApplication(argv if argv is not None else sys.argv)
+    # Hints, recipes and status lines all end up pasted into Bambu Studio, so
+    # every label must be selectable with the mouse — including the recipe rows
+    # that only come into existence after a colour is picked.  An app-level
+    # filter catches those; see app/ui/selectable.py.
+    selectable.install(app)
     app.setApplicationName("BambuPalette")
     app.setOrganizationName("BambuPalette")
     app.setStyle("Fusion")

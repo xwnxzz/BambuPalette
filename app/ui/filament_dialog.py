@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 from ..core.library import COMMON_BRANDS, COMMON_MATERIAL_TYPES, Filament
 from ..spectral import color as _color
 from . import theme
+from .selectable import selectable_text
 from .swatch import ColorField, SwatchLabel, is_unset
 
 
@@ -94,6 +95,9 @@ class FilamentDialog(QDialog):
         layout.addWidget(buttons)
 
         self._color.colorChanged.connect(self._on_color_changed)
+
+        # The hint spells out the RGB / CIELAB numbers the user may want to copy.
+        selectable_text(self)
 
         if filament is not None:
             self._name.setText(filament.name)

@@ -467,8 +467,8 @@ def main() -> int:
         f"{len(missing)} missing)",
     )
     check(
-        "三色混色" in triple_window._grid_info.text(),
-        f"the footer explains the triple table, got {triple_window._grid_info.text()!r}",
+        "三色混色" in triple_window._status.text(),
+        f"the bottom line explains the triple table, got {triple_window._status.text()!r}",
     )
     cache_file = triple_window._triples_path()
     check(cache_file.is_file(), f"the triple table is cached at {cache_file.name}")
@@ -511,6 +511,65 @@ def main() -> int:
         any(c.color_hex.upper() == spare.color_hex.upper() and c.filaments for c in triple_window._combined),
         "the new spool's own colour is in 「全部颜色」",
     )
+    # Issue 1: double-clicking a THREE-colour mix used to filter the grid to its
+    # first two spools, i.e. it swapped the colour under the cursor for a
+    # different one's 81 two-colour ratios.  A triple-only colour must stay put.
+    combined_store = triple_window._combined
+    triple_only = None
+    triple_catalogue = triple_window._triples.colours()
+    for position in range(min(len(triple_catalogue), 800)):
+        found = combined_store.index_of_key(f"colour|{triple_catalogue[position].color_hex}")
+        if found >= 0 and combined_store.pair_colour_at(found) is None:
+            triple_only = combined_store[found]
+            break
+    check(triple_only is not None, "the triple table holds a colour no two-colour mix reaches")
+    if triple_only is not None:
+        first_recipe = triple_only.recipes[0]
+        check(
+            hasattr(first_recipe, "percent_c"),
+            f"that colour's first recipe is a three-spool one, got {first_recipe!r}",
+        )
+        check(
+            first_recipe.ratio_text.count("+") == 2,
+            f"a three-colour recipe names all three spools, got {first_recipe.ratio_text!r}",
+        )
+        triple_window._pair_filter = None
+        triple_window._on_grid_activated(triple_only)
+        app.processEvents()
+        check(
+            triple_window._pair_filter is None,
+            "double-clicking a three-colour mix does not fall back to two spools",
+        )
+        check(
+            triple_window._detail.colour() is triple_only,
+            "double-clicking a three-colour mix keeps it in the detail panel",
+        )
+        # The bottom line carries the table's own explanation, never a one-line
+        # recipe that could only ever name the first two spools.
+        check(
+            "配比" in triple_window._status.text(),
+            f"the bottom line is the table note, got {triple_window._status.text()!r}",
+        )
+    # Issue 4: the right-hand pane could not be dragged — it snapped.  A QLabel
+    # holding the ~1400 px one-line note had no word wrap, and a non-wrapping
+    # QLabel's minimumSizeHint IS that full width, so the grid pane pinned the
+    # splitter.  The note now lives in the status bar with an Ignored width
+    # policy, so no pane can be wider than the window by accident.
+    from PySide6.QtWidgets import QSizePolicy, QSplitter  # noqa: E402
+
+    splitter = triple_window._tabs.widget(0).findChild(QSplitter)
+    check(splitter is not None, "the 混色配方 page still has its splitter")
+    if splitter is not None:
+        pinned = [splitter.widget(i).minimumSizeHint().width() for i in range(splitter.count())]
+        check(
+            max(pinned) < 720,
+            f"no pane is pinned wider than the window by a label, got {pinned}",
+        )
+        check(
+            triple_window._status.sizePolicy().horizontalPolicy()
+            == QSizePolicy.Policy.Ignored,
+            "the bottom line lets the window shrink instead of pinning its width",
+        )
     triple_window.close()
 
     # --- the grid's flat layout, exercised with a stub -------------------------
@@ -1020,12 +1079,51 @@ def main() -> int:
     # already aimed at something they never chose.
     check(window._target_color.hex() == "", "the 目标颜色 field starts with no preset colour")
     check(not window._target_color.isSet(), "the target colour reports itself unset")
-    check(not window._find_button.isEnabled(), "找最接近的混色 is disabled until a colour is entered")
+    check(not window._find_button.isEnabled(), "找最接近的颜色 is disabled until a colour is entered")
     window._target_color.setValue("#808080")
-    check(window._find_button.isEnabled(), "entering a colour enables 找最接近的混色")
+    check(window._find_button.isEnabled(), "entering a colour enables 找最接近的颜色")
     window._on_find_nearest()
     app.processEvents()
-    check(window._detail.recipe() is not None, "找最接近的混色 selects a recipe")
+    check(window._detail.recipe() is not None, "找最接近的颜色 selects a recipe")
+
+    # Issue 3: the search used to skip the spool colours themselves, so asking
+    # for a colour the user already owned answered a WORSE mixture (asked for
+    # #FFFFFF, answered #E5E5E5 at ΔE00 5.40).  The true nearest now wins.
+    from app.spectral import color as _nearest_color  # noqa: E402
+
+    def _gap(cell, target_hex: str) -> float:
+        lab = _nearest_color.lab_from_rgb(_nearest_color.hex_to_rgb(target_hex))
+        return _nearest_color.delta_e_2000(cell.lab, tuple(lab))
+
+    for spool in list(window.library.filaments)[:3]:
+        answer = window.nearest_recipe(spool.color_hex)
+        check(answer is not None, f"{spool.color_hex} is findable")
+        if answer is not None:
+            check(
+                _gap(answer, spool.color_hex) <= 1e-6,
+                f"asking for the spool colour {spool.color_hex} answers an exact match, "
+                f"got {answer.color_hex} at ΔE00 {_gap(answer, spool.color_hex):.2f}",
+            )
+    _spools = list(window.library.filaments)
+    if len(_spools) >= 2:
+        _sample = window._catalog.pair_recipes(_spools[0].id, _spools[1].id)[0]
+        _answer = window.nearest_recipe(_sample.color_hex)
+        check(
+            _answer is not None and _gap(_answer, _sample.color_hex) <= 1e-6,
+            f"asking for the mix {_sample.color_hex} answers itself, got "
+            f"{None if _answer is None else _answer.color_hex}",
+        )
+    # ... and the answer is never a colour that is no longer on screen.
+    window._search.setText("#8080")
+    app.processEvents()
+    _on_screen = {cell.key for cell in window._recipes}
+    _answer = window.nearest_recipe("#808080")
+    check(
+        _answer is None or _answer.key in _on_screen,
+        "the nearest colour is always one of the colours currently on screen",
+    )
+    window._clear_filters()
+    app.processEvents()
 
     # --- the add/edit dialog builds a valid filament ---------------------------
     from app.ui.filament_dialog import FilamentDialog  # noqa: E402
@@ -1089,6 +1187,46 @@ def main() -> int:
         order = [rows.item(i).data(Qt.ItemDataRole.UserRole) for i in range(rows.count())]
         expected = [last] + [i for i in range(len(result.palette)) if i != last]
         check(order == expected, "every other colour keeps its original order")
+
+        # Issue 6: 原图 must stay the uploaded picture.  It used to grey out the
+        # moment a colour was selected, so it looked like a washed-out copy of
+        # 预览 instead of the user's own file.
+        check(page._original_view._plain, "原图 is in plain mode")
+        check(
+            page._original_view._selected == -1,
+            f"selecting a colour does not touch 原图, got selected={page._original_view._selected}",
+        )
+        check(
+            page._original_view._dim_pixmap() is None,
+            "原图 never draws the dimming overlay",
+        )
+        check(
+            page._original_view._base_image() is page._original_view._source,
+            "原图 draws the uploaded image, not the matched render",
+        )
+        check(
+            page._original_view._source is page._source_qimage,
+            "原图 shares the uploaded picture the matcher was given",
+        )
+        # ... and the 预览 keeps reacting to the selection.
+        check(page._view._selected == last, "预览 still highlights the chosen colour")
+        check(page._view._dim_pixmap() is not None, "预览 still dims everything else")
+        # Issue 5: every hint and recipe is text people paste into Bambu Studio.
+        selectable_flag = Qt.TextInteractionFlag.TextSelectableByMouse
+
+        def _unselectable(root):
+            return [
+                w.text()[:40]
+                for w in root.findChildren(QLabel)
+                if w.text().strip() and not (w.textInteractionFlags() & selectable_flag)
+            ]
+
+        labels = [w for w in window.findChildren(QLabel) if w.text().strip()]
+        check(bool(labels), "the main window has text labels to check")
+        blind = _unselectable(window)
+        check(not blind, f"every label in the main window can be selected, blind: {blind[:6]}")
+        blind_page = _unselectable(page)
+        check(not blind_page, f"every label on 图像转换 can be selected, blind: {blind_page[:6]}")
 
         page._on_region_clicked(0)
         app.processEvents()

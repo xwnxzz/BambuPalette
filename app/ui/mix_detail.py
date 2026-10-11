@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import theme
+from .selectable import selectable
 from .swatch import SwatchLabel
 
 #: How many stops the pair bar samples from the active mixing engine.
@@ -361,9 +362,14 @@ class MixDetail(QWidget):
         # eighteen rows into a few pixels and print them on top of each other.
         # Without wrapping the column has a real minimum and the page scrolls.
         text.setWordWrap(False)
+        # These rows only exist after a colour is picked, so the app-wide label
+        # filter has not necessarily seen them; the text is exactly what people
+        # paste into Bambu Studio, so mark it selectable here as well.
+        selectable(text)
         key = QLabel("—", self._formula_box)
         key.setProperty("role", "mono")
         key.setVisible(False)
+        selectable(key)
 
         line = QHBoxLayout()
         line.setContentsMargins(0, 0, 0, 0)

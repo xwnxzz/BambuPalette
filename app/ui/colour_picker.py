@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
 from ..core.image_matching import PaletteEntry, sort_palette
 from ..core.mixes import SORT_CHOICES_WITH_SIMILARITY, SORT_SIMILARITY
 from ..spectral import color as _color
+from .selectable import selectable_text
 from .swatch import swatch_pixmap
 
 RECIPE_PREFIX = "配方"
@@ -405,6 +406,9 @@ class ColourPickerDialog(QDialog):
         box.addWidget(buttons)
 
         self._rebuild()
+        # 「#RRGGBB 配方」 lines are exactly the text users paste into Bamboo
+        # Studio, so every label in this dialog has to be selectable.
+        selectable_text(self)
 
     # -- data -------------------------------------------------------------
     def chosen(self) -> PaletteEntry | None:
