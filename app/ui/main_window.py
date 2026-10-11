@@ -273,12 +273,37 @@ class MainWindow(QMainWindow):
         tabs.addTab(mix_page, "混色配方")
         tabs.addTab(self._picture_page, "图像转换")
         self._tabs = tabs
+        # Connected only once _tabs exists: adding the first tab already emits
+        # currentChanged, and the slot reads self._tabs.
+        tabs.currentChanged.connect(self._on_tab_changed)
 
         body = QWidget()
         layout = QVBoxLayout(body)
         layout.setContentsMargins(16, 12, 16, 10)
         layout.setSpacing(10)
         layout.addWidget(tabs, 1)
+
+        # The bottom line carries the one long sentence that explains how the
+        # whole table is built, plus the transient 「正在计算…」 / 「最接近…」
+        # messages.  It is a single line of ~1400 px at a normal font size, so
+        # two things matter:
+        #
+        # * it must be allowed to shrink (``Ignored`` horizontally), or its
+        #   minimumSizeHint becomes the window's minimum width — before it moved
+        #   here it lived in the grid panel and pinned that panel so hard the
+        #   splitter handle could not be dragged at all;
+        # * it must wrap, and live in a layout that honours the wrapped height,
+        #   or a 1020 px window silently clips the tail of the sentence.
+        #
+        # That is why it is the last row of the page body rather than an item in
+        # a QStatusBar: a status bar is one line high and would clip the second
+        # line the moment the sentence wraps.  The tooltip still carries the
+        # whole text for anyone who would rather hover than read.
+        self._status = QLabel("")
+        self._status.setProperty("role", "hint")
+        self._status.setWordWrap(True)
+        self._status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Minimum)
+        layout.addWidget(self._status)
 
         central = QWidget()
         outer = QVBoxLayout(central)
@@ -287,18 +312,6 @@ class MainWindow(QMainWindow):
         outer.addWidget(topbar)
         outer.addWidget(body, 1)
         self.setCentralWidget(central)
-
-        # The bottom line carries the one long sentence that explains how the
-        # whole table is built.  It is a single unwrapped line of ~1400 px, so
-        # without an Ignored horizontal policy its minimumSizeHint would become
-        # the window's minimum width — and, before it moved here, the splitter's
-        # handle could not be dragged at all because the grid panel was pinned to
-        # that same width.  Ignored lets it shrink; the tooltip keeps the whole
-        # sentence reachable when the window is narrow.
-        self._status = QLabel("")
-        self._status.setProperty("role", "hint")
-        self._status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        self.statusBar().addWidget(self._status, 1)
 
         # Every hint, recipe and status line is text worth pasting elsewhere.
         selectable_text(self)
@@ -989,12 +1002,16 @@ class MainWindow(QMainWindow):
                 self._grid.setSelectedIndex(index, scroll=False)
         self._update_status()
 
+    def _on_tab_changed(self, index: int) -> None:
+        """The colour-table note belongs to 混色配方, so re-evaluate it."""
+        self._update_status()
+
     def _set_status_text(self, text: str) -> None:
         """Write the bottom line, keeping the full sentence in the tooltip.
 
-        The label is a single unwrapped line with an Ignored width policy, so a
-        long sentence is clipped rather than forcing the window wider.  The
-        tooltip is what makes the hidden tail reachable.
+        The label wraps, so a long sentence folds onto a second line instead of
+        forcing the window wider or being clipped — but its tail is still worth
+        keeping in the tooltip for a single-glance read.
         """
         self._status.setText(text)
         self._status.setToolTip(text)
@@ -1032,6 +1049,11 @@ class MainWindow(QMainWindow):
             note += " · 正在计算三色混色"
         elif self._build_seconds:
             note += f" · 计算用时 {self._build_seconds * 1000:.0f} ms"
+        if self._tabs.currentIndex() != 0:
+            # The sentence is about the colour table.  On 图像转换 it describes
+            # nothing the reader can see, and the picture page has a status line
+            # of its own right above this one.
+            note = ""
         self._set_status_text(note)
         self._update_filter_bar(shown, everything, count)
 

@@ -553,9 +553,9 @@ def main() -> int:
     # Issue 4: the right-hand pane could not be dragged — it snapped.  A QLabel
     # holding the ~1400 px one-line note had no word wrap, and a non-wrapping
     # QLabel's minimumSizeHint IS that full width, so the grid pane pinned the
-    # splitter.  The note now lives in the status bar with an Ignored width
-    # policy, so no pane can be wider than the window by accident.
-    from PySide6.QtWidgets import QSizePolicy, QSplitter  # noqa: E402
+    # splitter.  The note now lives at the bottom of the page body with an
+    # Ignored width policy, so no pane can be wider than the window by accident.
+    from PySide6.QtWidgets import QSizePolicy, QSplitter, QStatusBar  # noqa: E402
 
     splitter = triple_window._tabs.widget(0).findChild(QSplitter)
     check(splitter is not None, "the 混色配方 page still has its splitter")
@@ -570,6 +570,33 @@ def main() -> int:
             == QSizePolicy.Policy.Ignored,
             "the bottom line lets the window shrink instead of pinning its width",
         )
+    # And it must WRAP: at the minimum window size a one-line status bar clipped
+    # the tail of the sentence mid-glyph.  So it is a wrapping label in the body
+    # layout (which honours height-for-width), not an item in a QStatusBar.
+    check(triple_window._status.wordWrap(), "the bottom line wraps instead of clipping")
+    check(
+        triple_window._status.sizePolicy().hasHeightForWidth(),
+        "the layout is told the wrapped height, so the second line is not cut off",
+    )
+    check(
+        triple_window.findChild(QStatusBar) is None,
+        "the window has no one-line status bar to clip the sentence",
+    )
+
+    # The sentence is about the colour table, so 图像转换 must not show it.
+    tab_note = triple_window._status.text()
+    triple_window._tabs.setCurrentIndex(1)
+    app.processEvents()
+    check(
+        triple_window._status.text() == "",
+        f"the colour-table sentence is hidden on 图像转换, got {triple_window._status.text()[:40]!r}",
+    )
+    triple_window._tabs.setCurrentIndex(0)
+    app.processEvents()
+    check(
+        triple_window._status.text() == tab_note,
+        "switching back to 混色配方 restores the colour-table sentence",
+    )
     triple_window.close()
 
     # --- the grid's flat layout, exercised with a stub -------------------------

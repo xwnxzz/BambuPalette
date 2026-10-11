@@ -544,6 +544,7 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     from PySide6.QtWidgets import QLabel as _QLabel
     from PySide6.QtWidgets import QSizePolicy as _QSizePolicy
     from PySide6.QtWidgets import QSplitter as _QSplitter
+    from PySide6.QtWidgets import QStatusBar as _QStatusBar
 
     from .spectral import color as _selftest_colour
 
@@ -555,6 +556,24 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     check(
         window._status.sizePolicy().horizontalPolicy() == _QSizePolicy.Policy.Ignored,
         "the bottom line can never pin the window's width",
+    )
+    check(window._status.wordWrap(), "the bottom line wraps instead of clipping its tail")
+    check(
+        window.findChild(_QStatusBar) is None,
+        "the sentence is not in a one-line status bar that would cut it off",
+    )
+    tab_note = window._status.text()
+    window._tabs.setCurrentIndex(1)
+    app.processEvents()
+    check(
+        window._status.text() == "",
+        f"the colour-table sentence is hidden on 图像转换, got {window._status.text()[:40]!r}",
+    )
+    window._tabs.setCurrentIndex(0)
+    app.processEvents()
+    check(
+        window._status.text() == tab_note,
+        "switching back to 混色配方 restores the colour-table sentence",
     )
     recipe_splitter = window._tabs.widget(0).findChild(_QSplitter)
     if recipe_splitter is not None:
