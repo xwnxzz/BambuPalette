@@ -621,6 +621,24 @@ def main() -> int:
         "the target colour tooltip says 颜色配方 too",
     )
 
+    # The version has to be readable without opening 关于: it is the same string
+    # the exe's file properties carry (build/BambuPalette.spec parses app/__init__.py).
+    from app import __version__ as _version
+
+    about = triple_window._about_text()
+    check(
+        _version in about,
+        f"关于 names the running version {_version!r}",
+    )
+    check(
+        about.startswith("BambuPalette"),
+        "关于 still opens with the product name",
+    )
+    check(
+        "BambuPalette.exe 的文件属性里也写着同一个版本号。" in about,
+        "关于 points at the exe's file properties",
+    )
+
     # A spool's own colour must hide EVERY parent row, not just the second one:
     # row 3 kept the 「耗材丝3 … 12%」 text from the previous three-colour recipe,
     # so a raw spool looked like it was mixed from two unrelated spools.
@@ -1525,6 +1543,10 @@ def main() -> int:
             check(page._undo_button.isEnabled(), "a replacement can be undone with 撤销")
             check(page._replace_button.isEnabled(), "更换颜色 is live right next to 删除")
             check(
+                page._replace_button.property("accent") in (None, "false"),
+                "更换颜色 is a plain button like 删除 / 合并, not a blue one",
+            )
+            check(
                 "手动更换" in page._status.text(),
                 f"the status line reports the manual replacement: {page._status.text()}",
             )
@@ -1561,6 +1583,67 @@ def main() -> int:
             doomed_pixels = int(placed[doomed])
             page._list.select([doomed])
             check(page._delete_button.isEnabled(), "删除 lights up once a colour is picked")
+
+            # 「多选」: on, two plain clicks keep BOTH colours (the whole point is
+            # not having to know about Ctrl).  Off, one click replaces the other.
+            from PySide6.QtWidgets import QAbstractItemView as _QAbstractItemView
+
+            check(page._multi_button.isCheckable(), "多选 is a toggle")
+            check(not page._multi_button.isChecked(), "多选 starts off")
+            check(
+                page._list._list.selectionMode()
+                == _QAbstractItemView.SelectionMode.ExtendedSelection,
+                "off means the familiar Ctrl+click list",
+            )
+            page._multi_button.setChecked(True)
+            app.processEvents()
+            check(
+                page._list._list.selectionMode()
+                == _QAbstractItemView.SelectionMode.MultiSelection,
+                "多选 switches the list to plain-click multi-selection",
+            )
+            rows = [page._list._list.item(i) for i in range(page._list._list.count())]
+            rows[0].setSelected(True)
+            rows[1].setSelected(True)
+            app.processEvents()
+            check(
+                len(page._list.selected_indices()) == 2,
+                f"two plain clicks select two colours: {page._list.selected_indices()}",
+            )
+            check(page._merge_button.isEnabled(), "合并 lights up from a plain multi-selection")
+            page._multi_button.setChecked(False)
+            app.processEvents()
+            check(
+                len(page._list.selected_indices()) == 2,
+                "the selection survives turning 多选 back off",
+            )
+            check(
+                page._list._list.selectionMode()
+                == _QAbstractItemView.SelectionMode.ExtendedSelection,
+                "turning 多选 off restores Ctrl+click behaviour",
+            )
+            page._list.select([doomed])
+
+            # The row reads in the order the work happens: how to change the
+            # selection, then what to do with it, then how to take it back.
+            from PySide6.QtWidgets import QHBoxLayout as _QHBoxLayout
+            from PySide6.QtWidgets import QPushButton as _QPushButton
+
+            edit_row = next(
+                layout
+                for layout in page.findChildren(_QHBoxLayout)
+                if layout.indexOf(page._multi_button) >= 0
+            )
+            labels = [
+                edit_row.itemAt(position).widget().text()
+                for position in range(edit_row.count())
+                if isinstance(edit_row.itemAt(position).widget(), _QPushButton)
+            ]
+            check(
+                labels == ["多选", "删除", "合并", "更换颜色…", "撤销", "恢复"],
+                f"the edit row reads 多选 删除 合并 更换颜色… 撤销 恢复, got {labels}",
+            )
+
             page._on_delete_colours()
             app.processEvents()
             check(

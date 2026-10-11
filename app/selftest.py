@@ -461,6 +461,10 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         check(page._detail.can_restore(), "the panel knows the colour was hand-picked")
         check(page._undo_button.isEnabled(), "a replacement can be undone with 撤销")
         check(page._replace_button.isEnabled(), "a selected colour can be swapped")
+        check(
+            page._replace_button.property("accent") in (None, "false"),
+            "更换颜色 is a plain button like 删除 / 合并, not a blue one",
+        )
         page._undo()
         app.processEvents()
         check(
@@ -478,6 +482,26 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         before_colours = len(page.result.palette)
         doomed = int(np.bincount(page.result.indices[page.result.indices >= 0].ravel()).argmax())
         doomed_count = int((page.result.indices == doomed).sum())
+        page._list.select([doomed])
+        check(page._multi_button.isCheckable(), "多选 is a toggle")
+        check(not page._multi_button.isChecked(), "多选 starts off")
+        page._multi_button.setChecked(True)
+        app.processEvents()
+        rows = [page._list._list.item(i) for i in range(page._list._list.count())]
+        rows[0].setSelected(True)
+        rows[1].setSelected(True)
+        app.processEvents()
+        check(
+            len(page._list.selected_indices()) == 2,
+            f"多选 lets two plain clicks keep two colours: {page._list.selected_indices()}",
+        )
+        check(page._merge_button.isEnabled(), "合并 lights up from a plain multi-selection")
+        page._multi_button.setChecked(False)
+        app.processEvents()
+        check(
+            len(page._list.selected_indices()) == 2,
+            "the selection survives turning 多选 back off",
+        )
         page._list.select([doomed])
         page._on_delete_colours()
         app.processEvents()
@@ -607,6 +631,19 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         "颜色配方" in window._target_color.toolTip(),
         "the target colour tooltip says 颜色配方 too",
     )
+
+    # The version must be readable without opening 关于, and it is the same string
+    # build/BambuPalette.spec parses out of app/__init__.py for the exe resource.
+    from . import __version__ as _version
+
+    about = window._about_text()
+    check(_version in about, f"关于 names the running version {_version!r}")
+    check(about.startswith("BambuPalette"), "关于 still opens with the product name")
+    check(
+        "BambuPalette.exe 的文件属性里也写着同一个版本号。" in about,
+        "关于 points at the exe's file properties",
+    )
+    check(window._find_button.isEnabled(), "找最接近的颜色 is clickable before a target is picked")
 
     # A spool's own colour has exactly ONE parent — itself.  Row 3 used to keep
     # showing the previous three-colour recipe's 「耗材丝3 … 12%」, so a raw spool

@@ -9,9 +9,69 @@ The ICC polynomial coefficients are baked into ``app/spectral/icc_profile.py``,
 so the bundle needs no data files at runtime.
 """
 
+from PyInstaller.utils.win32.versioninfo import (
+    FixedFileInfo,
+    StringFileInfo,
+    StringStruct,
+    StringTable,
+    VarFileInfo,
+    VarStruct,
+    VSVersionInfo,
+)
+
 from pathlib import Path
+import re
 
 ROOT = Path(SPECPATH).resolve().parent
+
+
+def app_version() -> tuple[str, tuple[int, int, int, int]]:
+    """Read ``__version__`` from ``app/__init__.py`` so the exe can never drift.
+
+    The Windows version resource is baked into the exe at build time, so a
+    literal here would silently rot the moment the source version moved.
+    """
+    text = (ROOT / "app" / "__init__.py").read_text(encoding="utf-8")
+    match = re.search(r'^__version__\s*=\s*"([^"]+)"', text, re.MULTILINE)
+    if match is None:  # pragma: no cover - a broken tree should fail the build
+        raise RuntimeError("app/__init__.py has no __version__")
+    text_version = match.group(1)
+    numbers = [int(part) for part in re.findall(r"\d+", text_version)[:4]]
+    numbers += [0] * (4 - len(numbers))
+    return text_version, tuple(numbers)  # type: ignore[return-value]
+
+
+VERSION_TEXT, VERSION_PARTS = app_version()
+
+# The four-part form Windows shows in 文件属性 → 详细信息.  Keeping it in sync
+# with the string version is the whole point of parsing it above.
+VERSION_INFO = VSVersionInfo(
+    ffi=FixedFileInfo(
+        filevers=VERSION_PARTS,
+        prodvers=VERSION_PARTS,
+        mask=0x3F,
+        flags=0x0,
+        OS=0x40004,
+        fileType=0x1,
+        subtype=0x0,
+        date=(0, 0),
+    ),
+    kids=[
+        StringFileInfo([
+            StringTable("080404B0", [
+                StringStruct("CompanyName", "BambuPalette"),
+                StringStruct("FileDescription", "BambuPalette 混色耗材色彩管理器"),
+                StringStruct("FileVersion", VERSION_TEXT),
+                StringStruct("InternalName", "BambuPalette"),
+                StringStruct("LegalCopyright", "MIT License"),
+                StringStruct("OriginalFilename", "BambuPalette.exe"),
+                StringStruct("ProductName", "BambuPalette"),
+                StringStruct("ProductVersion", VERSION_TEXT),
+            ]),
+        ]),
+        VarFileInfo([VarStruct("Translation", [0x0804, 1200])]),
+    ],
+)
 
 EXCLUDES = [
     # Qt modules this application never touches.  Trimming them keeps the
@@ -91,6 +151,7 @@ exe = EXE(
     exclude_binaries=True,
     name="BambuPalette",
     icon=str(ROOT / "assets" / "logo.ico"),
+    version=VERSION_INFO,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

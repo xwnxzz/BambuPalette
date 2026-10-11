@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .. import __version__
 from ..core import paths, settings
 from ..core.engines import DEFAULT_ENGINE, ENGINE_CHOICES, get_engine
 from ..core.library import (
@@ -1235,15 +1236,20 @@ class MainWindow(QMainWindow):
                 f"最接近 {target} 的颜色就是耗材本色 {best.color_hex}（色差 ΔE00 = {distance:.2f}）"
             )
 
-    def _on_about(self) -> None:
+    def _about_text(self) -> str:
+        """The 关于 text, version line included.
+
+        Split out of ``_on_about`` so the automatic checks can read it without
+        a modal dialog: the version shown here and the one in the exe's file
+        properties both come from ``app.__version__``.
+        """
         try:
             location = paths.library_path()
         except OSError as exc:
             location = f"（不可用：{exc}）"
-        QMessageBox.information(
-            self,
-            "关于与算法来源",
-            "BambuPalette（混色耗材色彩管理器）\n\n"
+        return (
+            f"BambuPalette（混色耗材色彩管理器）  版本 {__version__}\n"
+            f"BambuPalette.exe 的文件属性里也写着同一个版本号。\n\n"
             "「Bambu 混色预览」（默认）复刻自 Bambu Studio 2.8.2\n"
             "（v02.08.02.61）src/slic3r/GUI/MixedFilamentDialog.cpp 中的\n"
             "blend_colors()/blend_n_colors()，它们调用 libslic3r 的\n"
@@ -1260,5 +1266,8 @@ class MainWindow(QMainWindow):
             "Color Consortium，profile ID 5436fbfce5f7414dc520bb6e5d9c1516，\n"
             "SHA-256 8291983e…2e4）估计，实现参考\n"
             "ratdoux/OrcaSlicer-FullSpectrum（AGPL-3.0）。\n\n"
-            "耗材档案保存在：" + str(location),
+            "耗材档案保存在：" + str(location)
         )
+
+    def _on_about(self) -> None:
+        QMessageBox.information(self, "关于与算法来源", self._about_text())

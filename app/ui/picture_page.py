@@ -366,6 +366,27 @@ class ColourList(QWidget):
             if item is not None:
                 item.setSelected(int(item.data(Qt.ItemDataRole.UserRole)) in wanted)
 
+    def setMultiSelect(self, on: bool) -> None:
+        """Make a plain click ADD to the selection instead of replacing it.
+
+        Ctrl+click did this already, but a modifier nobody was told about is not
+        a feature — the page puts a 「多选」 toggle in front of the buttons
+        instead.  The mode is changed on the widget (we never fake a selection),
+        so the same ``itemSelectionChanged`` path keeps 删除 / 合并 in sync.
+        """
+        mode = (
+            QAbstractItemView.SelectionMode.MultiSelection
+            if on
+            else QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        if self._list.selectionMode() == mode:
+            return
+        keep = self.selected_indices()
+        self._list.setSelectionMode(mode)
+        # Qt is free to drop the selection while the mode changes; put it back
+        # through the widget so the buttons still agree with what is highlighted.
+        self.select(keep)
+
     def _refresh(self) -> None:
         result = self._result
         # Everything that touches the view happens while suppressed: selecting
@@ -649,11 +670,22 @@ class PicturePage(QWidget):
         self._merge_button.clicked.connect(self._on_merge_colours)
 
         self._replace_button = QPushButton("更换颜色…")
-        self._replace_button.setProperty("accent", "true")
+        # Deliberately NOT accented, exactly like 删除 / 合并 / 撤销 / 恢复 next to
+        # it: these five are all plain actions on the selection, and the only
+        # blue button on this page is 生成 3MF, which is the one that finishes
+        # the job.  A blue 更换颜色 read as "this is the important one".
         self._replace_button.setToolTip(
             "从「全部颜色」里另选一个颜色替换选中的这个色块（撤销可以退回来）"
         )
         self._replace_button.clicked.connect(self._on_replace)
+
+        self._multi_button = QPushButton("多选")
+        self._multi_button.setCheckable(True)
+        self._multi_button.setToolTip(
+            "打开后，单击就是把颜色加进选择、再单击取消这一种，不用按住 Ctrl；"
+            "关掉就回到「一次只选一种」。打开时按钮会变成蓝色。"
+        )
+        self._multi_button.toggled.connect(self._on_multi_toggled)
 
         self._undo_button = QPushButton("撤销")
         self._undo_button.setToolTip("撤销上一步：删除、合并或更换颜色（Ctrl+Z）")
@@ -665,6 +697,7 @@ class PicturePage(QWidget):
 
         actions = QHBoxLayout()
         actions.setSpacing(6)
+        actions.addWidget(self._multi_button)
         actions.addWidget(self._delete_button)
         actions.addWidget(self._merge_button)
         actions.addWidget(self._replace_button)
@@ -1060,6 +1093,15 @@ class PicturePage(QWidget):
             self._detail.clear()
         self._update_actions()
         self._announce_edits()
+
+    def _on_multi_toggled(self, on: bool) -> None:
+        """「多选」：click to add a colour, click again to drop it — no Ctrl."""
+        self._list.setMultiSelect(on)
+        # Accent while it is ON, so "clicks add up" is never a guess.
+        self._multi_button.setProperty("accent", "true" if on else "false")
+        style = self._multi_button.style()
+        style.unpolish(self._multi_button)
+        style.polish(self._multi_button)
 
     def _update_actions(self) -> None:
         """ 删除 needs one colour, 合并 needs two, and the history drives the rest."""

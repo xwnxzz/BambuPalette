@@ -2,6 +2,6 @@
 
 from __future__ import annotations
 
-__version__ = "1.6.2"
+__version__ = "1.6.3"
 APP_NAME = "BambuPalette"
 APP_NAME_ZH = "混色耗材色彩管理器"
