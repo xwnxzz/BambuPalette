@@ -1,10 +1,19 @@
 """Filesystem locations for user data, caches and exports.
 
-The application stores its filament library in the per-user application data
-directory so the packaged ``.exe`` keeps working when it is installed somewhere
-read-only.  Dropping a file named ``portable.txt`` next to the executable (or
-next to this package when running from source) switches to portable mode, which
-keeps everything in a ``data`` folder beside the executable instead.
+A packaged copy keeps its spools in a ``data`` folder beside its own executable.
+Unzipping a new version therefore starts from an empty library instead of
+inheriting whatever the previous copy left behind, and two copies never share
+one library.  When that folder cannot be written to — Program Files, a directory
+carrying a low integrity label, an anti-virus lock — the copy falls back to
+per-copy directories under the profile, the temporary directory and the home
+directory, told apart by the name of the program folder (see
+:func:`installation_tag`).
+
+Running from source keeps the older profile-first order, so a checkout does not
+scatter data next to its code.  Dropping a file named ``portable.txt`` next to
+the executable (or next to this package when running from source) switches to
+portable mode: the same ``data`` folder beside the program, and never a library
+from the profile.
 
 Creating that directory can be refused for reasons that have nothing to do with
 this program — an anti-virus lock, a roaming-profile redirection, a directory
@@ -23,6 +32,7 @@ because that is the only question the rest of the program ever asks.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import sys
@@ -59,6 +69,34 @@ def executable_dir() -> Path:
     if is_frozen():
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent.parent.parent
+
+
+def installation_tag() -> str:
+    """Short, filesystem-safe name for *this* copy of the program.
+
+    Each extracted copy owns its library, so the fallback locations have to be
+    per-copy too: two folders that both happen to be called ``BambuPalette``
+    would otherwise share one library, which is exactly the sharing this release
+    removes.  The folder name stays in front — with the program's own name
+    stripped, so the result does not read ``BambuPalette-BambuPalette-1.6.11`` —
+    because that is what a human sees when they go looking for the file; the
+    digest keeps copies with the same folder name apart.
+    """
+    root = executable_dir()
+    stem = "".join(ch if (ch.isalnum() or ch in "-_.") else "-" for ch in root.name)
+    for prefix in (APP_DIR_NAME, *LEGACY_APP_DIR_NAMES):
+        if stem.casefold().startswith(prefix.casefold()):
+            stem = stem[len(prefix) :].lstrip("-_. ")
+            break
+    # Windows silently drops trailing dots/spaces, so never end the name with one.
+    stem = stem.rstrip("-_. ")[:40].rstrip("-_. ") or "copy"
+    digest = hashlib.sha1(str(root).casefold().encode("utf-8")).hexdigest()[:6]
+    return f"{stem}-{digest}"
+
+
+def _tagged(base: Path, tag: str) -> Path:
+    """*base* itself, or a sibling named after the copy when *tag* is set."""
+    return base if not tag else base.with_name(f"{base.name}-{tag}")
 
 
 def resource_path(*parts: str) -> Path:
@@ -173,25 +211,30 @@ def _candidate_roots() -> list[Path]:
     if forced is not None:
         return [forced]
 
-    roots: list[Path] = []
     portable = portable_mode()
-    if portable:
+    roots: list[Path] = []
+    if is_frozen():
+        # A packaged copy is a program of its own: its spools live in a ``data``
+        # folder beside its own executable, and it never reads a library out of
+        # the profile.  This is what makes "unzip the new version" start empty,
+        # and what keeps two copies from sharing one library.
         roots.append(executable_dir() / "data")
+        tag = installation_tag()
+    else:
+        if portable:
+            roots.append(executable_dir() / "data")
+        tag = ""
+
+    # Fallbacks, in the same order as before.  A packaged copy gets per-copy
+    # directories as well, so it stays independent of every other copy even when
+    # its own folder cannot be written to.
     local = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
     if local:
-        roots.append(Path(local) / APP_DIR_NAME)
+        roots.append(_tagged(Path(local) / APP_DIR_NAME, tag))
     scratch = os.environ.get("TEMP") or os.environ.get("TMP")
     if scratch:
-        roots.append(Path(scratch) / APP_DIR_NAME)
-    roots.append(Path.home() / f".{APP_DIR_NAME.lower()}")
-    if not portable and is_frozen():
-        # Last resort for the packaged application: a ``data`` folder beside the
-        # executable.  This is the one place that is still writable when the
-        # process runs at a lower integrity level than the user profile
-        # directories, which is exactly the case where every location above is
-        # refused.  Only when frozen, so running from source cannot quietly
-        # start writing into the project tree.
-        roots.append(executable_dir() / "data")
+        roots.append(_tagged(Path(scratch) / APP_DIR_NAME, tag))
+    roots.append(_tagged(Path.home() / f".{APP_DIR_NAME.lower()}", tag))
 
     unique: list[Path] = []
     seen: set[str] = set()
@@ -201,6 +244,30 @@ def _candidate_roots() -> list[Path]:
             seen.add(key)
             unique.append(root)
     return unique
+
+
+def legacy_shared_library() -> Path | None:
+    """The per-machine library an earlier version would have left behind.
+
+    Copies used to read and write one file in the profile — ``BambuPalette``
+    after the rename, ``FilamentColorStudio`` before it — so unzipping a fresh
+    copy showed the previous copy's spools.  Neither file is read any more, but
+    they hold *the user's* spools, so the 「导入」 dialog offers the folder of
+    whichever is still there instead of making the user guess a path Explorer
+    never showed them.
+    """
+    local = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+    if not local:
+        return None
+    base = Path(local)
+    for name in (APP_DIR_NAME, *LEGACY_APP_DIR_NAMES):
+        candidate = base / name / "filament-library.json"
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:  # pragma: no cover - defensive
+            continue
+    return None
 
 
 def _write_probe(directory: Path, attempts: int = 4) -> str | None:
@@ -276,10 +343,12 @@ def _usable(base: Path) -> str | None:
 def data_dir() -> Path:
     """Root directory for all persisted application state.
 
-    Falls back to the temporary directory, the home directory and finally the
-    executable's own folder when the preferred location cannot be written,
-    seeding the fallback with whatever library already exists so a transient
-    lock never looks like data loss.
+    A packaged copy keeps everything in a ``data`` folder beside its own
+    executable, so a freshly unzipped copy has an empty library and no copy
+    shares another's spools.  That folder, the copy's own profile/temporary/home
+    directories are tried in order, and a library already written to a fallback
+    is preferred over an empty first choice so that a transient lock never looks
+    like data loss.
     """
     problems: list[str] = []
     roots = _candidate_roots()
@@ -321,8 +390,8 @@ def data_dir() -> Path:
     raise DataDirectoryError(
         "找不到可写的数据目录，无法保存耗材档案。\n已尝试：\n"
         f"{detail}\n"
-        "请检查磁盘空间和杀毒软件拦截；也可以在程序旁边放一个 portable.txt，"
-        "让数据保存在程序目录下。"
+        "请检查磁盘空间和杀毒软件拦截。（从源码运行时，也可以在程序旁边放一个 "
+        "portable.txt，把数据固定到程序目录下。）"
     )
 
 

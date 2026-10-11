@@ -14,7 +14,7 @@ from pathlib import Path
 
 import numpy as np
 from PySide6.QtCore import QSize, Qt, QTimer
-from PySide6.QtGui import QAction, QBrush, QColor, QKeySequence, QShortcut
+from PySide6.QtGui import QBrush, QColor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -135,7 +135,6 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1020, 640)
 
         self._build_ui()
-        self._build_menus()
         self._reload_library()
 
     # -- construction ------------------------------------------------------------
@@ -162,6 +161,14 @@ class MainWindow(QMainWindow):
         self._add_button.setProperty("accent", "true")
         self._add_button.clicked.connect(self._on_add)
 
+        # 1.6.11 deleted the 文件 / 视图 / 帮助 menus: every action in them is
+        # already a button on this page (添加耗材 here, 导入/导出 in 我的耗材,
+        # 显示全部颜色 above the grid), so the only thing the menus still owned was
+        # 关于与算法来源 — the algorithm credits, the version and the path of the
+        # spool archive.  That one moved here instead of disappearing with them.
+        self._about_button = QPushButton("关于")
+        self._about_button.clicked.connect(self._on_about)
+
         # Lumina Studio's topbar: the brand block on the left, the primary action
         # on the right, on a white bar closed by a hairline.
         topbar = QFrame()
@@ -170,6 +177,7 @@ class MainWindow(QMainWindow):
         head_row.setContentsMargins(16, 10, 16, 10)
         head_row.setSpacing(10)
         head_row.addLayout(head, 1)
+        head_row.addWidget(self._about_button, 0, Qt.AlignmentFlag.AlignVCenter)
         head_row.addWidget(self._add_button, 0, Qt.AlignmentFlag.AlignVCenter)
 
         # engine / sort / search controls
@@ -350,6 +358,13 @@ class MainWindow(QMainWindow):
         self._import_button.clicked.connect(self._on_import)
         self._export_button = QPushButton("导出")
         self._export_button.clicked.connect(self._on_export)
+        # Sitting in the panel header, next to the title, keeps the destructive
+        # one away from 编辑 / 删除 / 导入 / 导出, where a mis-click would cost
+        # one spool instead of all of them.  It is disabled while there is
+        # nothing to clear.
+        self._clear_button = QPushButton("清空耗材库")
+        self._clear_button.clicked.connect(self._on_clear_library)
+        self._clear_button.setEnabled(False)
 
         row_one = QHBoxLayout()
         row_one.setSpacing(6)
@@ -387,7 +402,7 @@ class MainWindow(QMainWindow):
         self._backspace_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         self._backspace_shortcut.activated.connect(self._on_delete)
 
-        return self._wrap(panel, "我的耗材")
+        return self._wrap(panel, "我的耗材", self._clear_button)
 
     def _build_grid_panel(self) -> QWidget:
         self._grid = MixGrid()
@@ -425,35 +440,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._filter_bar)
         layout.addWidget(self._grid, 1)
         return self._wrap(panel, "全部颜色")
-
-    def _build_menus(self) -> None:
-        file_menu = self.menuBar().addMenu("文件(&F)")
-        for text, slot, shortcut in (
-            ("添加耗材…", self._on_add, "Ctrl+N"),
-            ("导入耗材档案…", self._on_import, None),
-            ("导出耗材档案…", self._on_export, None),
-        ):
-            action = QAction(text, self)
-            if shortcut:
-                action.setShortcut(QKeySequence(shortcut))
-            action.triggered.connect(slot)
-            file_menu.addAction(action)
-        file_menu.addSeparator()
-        quit_action = QAction("退出", self)
-        quit_action.setShortcut(QKeySequence.StandardKey.Quit)
-        quit_action.triggered.connect(self.close)
-        file_menu.addAction(quit_action)
-
-        view_menu = self.menuBar().addMenu("视图(&V)")
-        clear_action = QAction("显示全部颜色", self)
-        clear_action.setShortcut(QKeySequence("Ctrl+0"))
-        clear_action.triggered.connect(self._clear_filters)
-        view_menu.addAction(clear_action)
-
-        help_menu = self.menuBar().addMenu("帮助(&H)")
-        about_action = QAction("关于与算法来源", self)
-        about_action.triggered.connect(self._on_about)
-        help_menu.addAction(about_action)
 
     # -- library -----------------------------------------------------------------
     def _reload_library(self) -> None:
@@ -493,6 +479,7 @@ class MainWindow(QMainWindow):
         has_any = len(self.library) > 0
         self._library_hint.setVisible(not has_any)
         self._list.setVisible(has_any)
+        self._clear_button.setEnabled(has_any)
         self._rebuild_catalog()
         self._save_library()
 
@@ -502,6 +489,48 @@ class MainWindow(QMainWindow):
         except (LibraryError, OSError) as exc:
             # OSError covers DataDirectoryError: no usable location at all.
             self._status.setText(f"保存失败：{exc}")
+
+    def _on_clear_library(self) -> None:
+        """Throw the whole archive away — the only honest way to start empty.
+
+        Spools are not shipped with the program and are not a preset: they live
+        in one archive (``paths.library_path()``) that belongs to *this* copy —
+        ``data\\filament-library.json`` beside the executable for a packaged
+        build.  The confirmation shows the user that file, so starting over does
+        not mean hunting for a path Explorer never showed them.
+        """
+        count = len(self.library)
+        if count == 0:
+            return
+        try:
+            location = paths.library_path()
+        except OSError as exc:
+            location = f"（路径不可用：{exc}）"
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("清空耗材库")
+        box.setText(f"要删掉「我的耗材」里全部 {count} 条耗材吗？")
+        # Named buttons instead of the stock Yes / No: the safe answer has to be
+        # the one that says what it does, and it is the one Enter presses.
+        box.setInformativeText(
+            f"耗材档案：\n{location}\n\n"
+            "它就在这一份程序自己的数据文件夹里——不跟着安装包发布，也不和别的"
+            "副本共用。复制或解压一份新的程序，那一份从空库开始；想让它接着用，"
+            "先把这里的耗材「导出」，再到那一份里「导入」。\n\n"
+            "清空之后不能撤销；想留个备份就先点「导出」。"
+        )
+        clear = box.addButton("清空", QMessageBox.ButtonRole.DestructiveRole)
+        cancel = box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cancel)
+        box.exec()
+        if box.clickedButton() is not clear:
+            return
+        removed = len(self.library)
+        self.library.clear()
+        self._reload_library()
+        self._status.setText(
+            f"已清空耗材库（{removed} 条）。接下来点「添加耗材」新建，或「导入」一份档案。"
+        )
 
     def _selected_filament(self) -> Filament | None:
         item = self._list.currentItem()
@@ -660,8 +689,27 @@ class MainWindow(QMainWindow):
         self._reload_library()
         self._select_filament(copy.id)
 
+    def _import_start_dir(self) -> Path:
+        """Where 「导入」 opens: our own data folder, or the old shared one.
+
+        Before 1.6.11 every copy read and wrote one library in the profile.  A
+        copy that has not been given spools yet opens at that file's folder
+        instead of a path Explorer never showed, because the spools in it are the
+        user's — importing them is one click from there.
+        """
+        try:
+            ours = paths.library_path()
+        except OSError:
+            return paths.default_start_dir()
+        legacy = paths.legacy_shared_library()
+        if legacy is not None and not ours.is_file():
+            return legacy.parent
+        return paths.default_start_dir()
+
     def _on_import(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "导入耗材档案", str(paths.default_start_dir()), "JSON 文件 (*.json)")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "导入耗材档案", str(self._import_start_dir()), "JSON 文件 (*.json)"
+        )
         if not path:
             return
         try:

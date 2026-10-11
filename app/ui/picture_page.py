@@ -14,13 +14,13 @@ choose; all Qt file dialogs default to the app's own exports directory.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QEventLoop, QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QImage, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSpinBox,
@@ -45,6 +46,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .. import __version__
 from ..core import paths
 from ..core.image_matching import (
     MatchResult,
@@ -53,9 +55,19 @@ from ..core.image_matching import (
     TriplePalette,
     build_palette,
     match_image,
+    spool_usage,
 )
 from ..core.library import FilamentLibrary
-from ..core.mixes import MixCatalog
+from ..core.mixes import DEFAULT_ENGINE, MixCatalog
+from ..core.project import (
+    PROJECT_FILTER,
+    PROJECT_SUFFIX,
+    ProjectError,
+    ProjectState,
+    load_project,
+    render_preview,
+    save_project,
+)
 from ..mesh.objfile import write_obj
 from ..mesh.plate import PlateModel, PlateSettings, build_plate
 from ..mesh.threemf import MAX_PAINTED_FILAMENTS, slots_from_palette, write_3mf
@@ -90,6 +102,14 @@ DEFAULT_MAX_COLOURS = MAX_PAINTED_FILAMENTS
 #: 一次打印最常用的卷数（AMS 四槽）。0 才是「不限」，默认值必须是真数字。
 DEFAULT_SPOOL_CAP = 4
 
+#: 「重新匹配」 on a real library takes 1.3–3.0 s (measured: 41 卷 + 三色池 =
+#: 3.03 s，其中 1.38 s 是 CIEDE2000 搜索、1.47 s 是「耗材上限」合并）。进度条只在
+#: 慢到值得看的时候才出现：小图匹配几十毫秒就完了，点一下闪一下比不显示更烦人。
+BUSY_DELAY_MS = 200
+#: The bar's internal resolution.  Percentages land on it without rounding to
+#: 「0% 卡住」, and a plain 0–100 range is too coarse while the search walks.
+PROGRESS_STEPS = 1000
+
 #: The one always-visible line under the toolbar.  It replaces the hover
 #: tooltips this page used to carry: a black pop-up that covered the picture was
 #: worse than no explanation at all, so the two facts a user cannot guess (the
@@ -98,7 +118,9 @@ PAGE_HINT = (
     f"{ZOOM_HINT}\n"
     f"颜色数量最多 {MAX_PAINTED_FILAMENTS} 是 Bambu Studio 自己的限制：一个工程里只认 "
     f"{MAX_PAINTED_FILAMENTS} 个耗材位，第 {MAX_PAINTED_FILAMENTS + 1} 种颜色在切片时会被"
-    "丢掉（我们已经就这条限制向拓竹提了工单）。耗材上限 0 表示不限制；带透明区域的图片不能用抖动。"
+    "丢掉（我们已经就这条限制向拓竹提了工单）。耗材上限 0 表示不限制；带透明区域的图片不能用抖动。\n"
+    "改到一半可以存成工程接着改：Ctrl+S 保存（第一次会问存哪儿），Ctrl+Shift+S 换一个文件名；"
+    "工程里装着原图、这张预览、用到的颜色和耗材，下次「打开工程」就回到现在这一步。"
 )
 
 
@@ -776,6 +798,13 @@ class PicturePage(QWidget):
         self._image: Image.Image | None = None
         self._image_name: str = "混色底板"
         self._source_qimage: QImage | None = None
+        #: The ``.bpproj`` this picture came from, or the one it was last saved
+        #: to.  Ctrl+S overwrites it without asking; ``None`` means the next save
+        #: has to ask where to put the file.
+        self._project_path: Path | None = None
+        #: True while there are edits that are not in ``_project_path`` yet, so
+        #: 「打开工程」 can warn before throwing them away.
+        self._dirty = False
         # ``_base`` is the untouched match; ``_result`` is the base plus whatever
         # the user did to it.  Everything the user does is stored as an edit
         # against the ORIGINAL palette indices, never by mutating the pixels, so
@@ -790,7 +819,7 @@ class PicturePage(QWidget):
         #: ``source -> target``, original indices: the source's pixels are
         #: printed with the target's colour.
         self._merged: dict[int, int] = {}
-        #: ``original index -> PaletteEntry``, the 「更换颜色…」 replacements.
+        #: ``original index -> PaletteEntry``, the 「更换颜色」 replacements.
         self._replaced: dict[int, PaletteEntry] = {}
         self._undo_stack: list[tuple] = []
         self._redo_stack: list[tuple] = []
@@ -815,12 +844,22 @@ class PicturePage(QWidget):
 
     # -- construction -----------------------------------------------------
     def _build_ui(self) -> None:
-        self._import_button = QPushButton("导入图片…")
+        self._import_button = QPushButton("导入图片")
         self._import_button.setProperty("accent", "true")
         self._import_button.clicked.connect(self._on_import)
 
         self._rematch_button = QPushButton("重新匹配")
         self._rematch_button.clicked.connect(self._on_rematch)
+
+        # 打开 / 保存工程 sit next to 导入图片: all three are file actions on the
+        # picture, and a session that is put down and picked up again is the
+        # whole point of the project file.  Neither is accented — the blue
+        # button on this page is 生成 3MF, the one that finishes the job.
+        self._open_project_button = QPushButton("打开工程")
+        self._open_project_button.clicked.connect(self._on_open_project)
+
+        self._save_project_button = QPushButton("保存工程")
+        self._save_project_button.clicked.connect(lambda: self._on_save_project())
 
         self._colour_count = QSpinBox()
         self._colour_count.setRange(2, MAX_PAINTED_FILAMENTS)
@@ -841,6 +880,8 @@ class PicturePage(QWidget):
         top = QHBoxLayout()
         top.setSpacing(8)
         top.addWidget(self._import_button)
+        top.addWidget(self._open_project_button)
+        top.addWidget(self._save_project_button)
         top.addWidget(QLabel("颜色数量:"))
         top.addWidget(self._colour_count)
         top.addWidget(QLabel("耗材上限:"))
@@ -922,7 +963,7 @@ class PicturePage(QWidget):
         self._merge_button = QPushButton("合并")
         self._merge_button.clicked.connect(self._on_merge_colours)
 
-        self._replace_button = QPushButton("更换颜色…")
+        self._replace_button = QPushButton("更换颜色")
         # Deliberately NOT accented, exactly like 删除 / 合并 / 撤销 / 恢复 next to
         # it: these five are all plain actions on the selection, and the only
         # blue button on this page is 生成 3MF, which is the one that finishes
@@ -955,6 +996,11 @@ class PicturePage(QWidget):
         self._undo_shortcut.activated.connect(self._undo)
         self._redo_shortcut = QShortcut(QKeySequence("Ctrl+Y"), self)
         self._redo_shortcut.activated.connect(self._redo)
+        # Ctrl+S 保存到现有工程（没有就问存哪儿），Ctrl+Shift+S 另存为一份。
+        self._save_shortcut = QShortcut(QKeySequence.StandardKey.Save, self)
+        self._save_shortcut.activated.connect(lambda: self._on_save_project())
+        self._save_as_shortcut = QShortcut(QKeySequence("Ctrl+Shift+S"), self)
+        self._save_as_shortcut.activated.connect(lambda: self._on_save_project(ask=True))
 
         list_box = QWidget()
         list_layout = QVBoxLayout(list_box)
@@ -965,12 +1011,23 @@ class PicturePage(QWidget):
 
         self._detail = ColourDetail()
 
+        # 「用到了哪些耗材」: the colour list says which colours the print needs,
+        # this says which rolls to put in the AMS and how much of each they
+        # contribute.  It is its own line of text rather than a column in the
+        # list because a mixed colour is printed FROM two or three spools — the
+        # two lists do not line up row for row and never could.
+        self._usage = QLabel("")
+        self._usage.setProperty("role", "hint")
+        self._usage.setTextFormat(Qt.TextFormat.RichText)
+        self._usage.setWordWrap(True)
+        self._usage.setMinimumHeight(58)
+
         # The list tells the user which colours the print needs; the detail
         # panel explains the one they clicked. Stacked, because both matter and
         # the right column is narrow.
         #
         # The detail panel is taller than its share of a short window (two
-        # cards, a recipe, a hint and two buttons), and a 「更换颜色…」 button
+        # cards, a recipe, a hint and two buttons), and a 「更换颜色」 button
         # that is off the bottom of the screen is the same as no button, so it
         # gets a scroll area of its own.
         detail_scroll = QScrollArea()
@@ -979,13 +1036,30 @@ class PicturePage(QWidget):
         detail_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         detail_scroll.setWidget(self._detail)
 
+        # Same treatment for 用到的耗材: a 41-spool library can put a dozen rolls
+        # on that list, and three of them are the common case — scroll rather
+        # than clip, so the row for the roll that is missing from the AMS is
+        # reachable instead of hidden under the bottom edge.
+        usage_scroll = QScrollArea()
+        usage_scroll.setWidgetResizable(True)
+        usage_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        usage_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        usage_scroll.setWidget(self._usage)
+        self._usage_scroll = usage_scroll
+
         right = QSplitter(Qt.Orientation.Vertical)
         right.addWidget(self._wrap(list_box, "这个模型需要的颜色"))
         right.addWidget(self._wrap(detail_scroll, "选中的颜色"))
+        # 「用到的耗材」 goes last: it answers the printer's question (which rolls
+        # to load) rather than the picture's, and it is the one line here that
+        # stays readable at a glance while the user edits.
+        right.addWidget(self._wrap(usage_scroll, "用到的耗材"))
         right.setStretchFactor(0, 3)
         right.setStretchFactor(1, 2)
+        right.setStretchFactor(2, 1)
         right.setCollapsible(1, False)
-        right.setSizes([420, 340])
+        right.setCollapsible(2, False)
+        right.setSizes([360, 290, 180])
 
         pictures = QSplitter(Qt.Orientation.Horizontal)
         # 原图 and 预览 both zoom and pan with the same gesture; the hint is a
@@ -1011,6 +1085,20 @@ class PicturePage(QWidget):
         self._status.setProperty("role", "hint")
         self._status.setWordWrap(True)
 
+        # The progress bar lives beside the status line it is described by.  It
+        # is hidden until a match has been running for BUSY_DELAY_MS, and the
+        # step message goes into the status label rather than into the bar, so
+        # there is one text surface and nothing jumps when the bar appears.
+        self._progress = QProgressBar()
+        self._progress.setRange(0, PROGRESS_STEPS)
+        self._progress.setTextVisible(False)
+        self._progress.setFixedHeight(10)
+        self._progress.setVisible(False)
+        self._busy_timer = QTimer(self)
+        self._busy_timer.setSingleShot(True)
+        self._busy_timer.setInterval(BUSY_DELAY_MS)
+        self._busy_timer.timeout.connect(self._show_progress)
+
         # The always-visible explanation line.  It never changes, so it is a
         # plain label rather than something the code rewrites.
         self._page_hint = QLabel(PAGE_HINT)
@@ -1023,6 +1111,7 @@ class PicturePage(QWidget):
         layout.addLayout(top)
         layout.addWidget(self._page_hint)
         layout.addWidget(splitter, 1)
+        layout.addWidget(self._progress)
         layout.addWidget(self._status)
         layout.addLayout(bottom)
 
@@ -1041,6 +1130,7 @@ class PicturePage(QWidget):
     def _set_controls_enabled(self, enabled: bool) -> None:
         for widget in (
             self._rematch_button,
+            self._save_project_button,
             self._width_spin,
             self._base_spin,
             self._colour_spin,
@@ -1116,6 +1206,10 @@ class PicturePage(QWidget):
             image = source
         self._image = image.convert("RGBA")
         self._source_qimage = _to_qimage(self._image)
+        # A freshly imported picture is not the project that was open before it,
+        # so Ctrl+S has to ask where this one goes.
+        self._project_path = None
+        self._dirty = False
         self._sync_dither_state()
         self._on_rematch()
 
@@ -1145,6 +1239,154 @@ class PicturePage(QWidget):
         except Exception as error:  # pragma: no cover - the dialog is interactive
             QMessageBox.warning(self, "无法读取图片", str(error))
 
+    # -- 工程：存下来，下次接着改 -----------------------------------------
+    def _on_open_project(self) -> None:
+        """Open a ``.bpproj`` and put the page back the way it was saved."""
+        if self._dirty and not self._confirm_discard("打开另一个工程"):
+            return
+        start = str(self._project_path or paths.exports_dir())
+        name, _ = QFileDialog.getOpenFileName(self, "打开工程", start, PROJECT_FILTER)
+        if not name:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        self._status.setText("正在打开工程…")
+        QApplication.processEvents()
+        try:
+            state = load_project(Path(name), library=self._library)
+        except ProjectError as error:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.warning(self, "打开工程失败", str(error))
+            return
+        except Exception as error:  # pragma: no cover - defensive
+            QApplication.restoreOverrideCursor()
+            QMessageBox.warning(self, "打开工程失败", str(error))
+            return
+        QApplication.restoreOverrideCursor()
+        self._adopt_project(state, Path(name))
+
+    def _adopt_project(self, state: ProjectState, path: Path) -> None:
+        """Make ``state`` the page's picture, match and edit state."""
+        self._image = state.image.convert("RGBA")
+        self._image_name = state.image_name or "混色底板"
+        self._source_qimage = _to_qimage(self._image)
+        self._base = state.base
+        self._deleted = set(state.deleted)
+        self._merged = dict(state.merged)
+        self._replaced = dict(state.replaced)
+        self._undo_stack = []
+        self._redo_stack = []
+        self._plate = None
+        self._project_path = path
+        # The controls go back to the settings the file was matched with, so
+        # 「重新匹配」 reproduces the picture the user saved rather than quietly
+        # re-running it against whatever this window happened to be set to.
+        settings = state.base.settings
+        self._colour_count.setValue(int(settings.max_colours))
+        self._max_dimension.setValue(int(settings.max_dimension))
+        self._dither.setChecked(bool(settings.dither))
+        self._spool_cap.setValue(int(settings.max_spools))
+        self._sync_dither_state()
+        self._width_spin.setValue(float(state.plate.target_width_mm))
+        self._base_spin.setValue(float(state.plate.base_thickness_mm))
+        self._colour_spin.setValue(float(state.plate.colour_thickness_mm))
+        self._stale = False
+        self._apply_edits()
+        if 0 <= int(state.plate.base_index) < self._base_combo.count():
+            self._base_combo.setCurrentIndex(int(state.plate.base_index))
+        self._set_controls_enabled(True)
+        edits = []
+        if self._deleted:
+            edits.append(f"删除 {len(self._deleted)} 种")
+        if self._merged:
+            edits.append(f"合并 {len(self._merged)} 种")
+        if self._replaced:
+            edits.append(f"更换 {len(self._replaced)} 种")
+        tail = f"；里面记着{'、'.join(edits)}颜色" if edits else ""
+        self._status.setText(
+            f"已打开工程 {path.name}"
+            + (f"（保存于 {state.saved_at}）" if state.saved_at else "")
+            + f"：{self._image_name} {state.image.width}×{state.image.height} 像素，"
+            f"现在打 {len(self._result.palette) if self._result else 0} 种颜色{tail}。"
+            "接着改就行，Ctrl+S 保存。"
+        )
+        self._dirty = False
+
+    def _on_save_project(self, ask: bool = False) -> None:
+        """Write the project file — the original picture plus every edit so far.
+
+        ``ask`` (Ctrl+Shift+S) always opens the dialog; otherwise the file the
+        project came from is overwritten, which is what Ctrl+S means everywhere
+        else, and the dialog appears only when there is no such file yet.
+        """
+        if self._base is None or self._result is None or self._image is None:
+            self._status.setText("先导入并匹配一张图片，再保存工程。")
+            return
+        target = None if ask else self._project_path
+        if target is None:
+            suggested = f"{self._image_name}{PROJECT_SUFFIX}"
+            # 存在「下载」里，和导出的模型一样：存进程序自己的数据目录等于让人找
+            # 不到——工程文件是要拿去接着改、发给别人的东西。
+            start = str(
+                (self._project_path.with_name(suggested))
+                if self._project_path
+                else (paths.exports_dir() / suggested)
+            )
+            name, _ = QFileDialog.getSaveFileName(self, "保存工程", start, PROJECT_FILTER)
+            if not name:
+                return
+            target = Path(name)
+        engine = self._catalog.engine.id if self._catalog is not None else DEFAULT_ENGINE
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        self._status.setText("正在保存工程…")
+        QApplication.processEvents()
+        try:
+            written = save_project(
+                target,
+                image=self._image,
+                image_name=self._image_name,
+                base=self._base,
+                live=self._result,
+                deleted=self._deleted,
+                merged=self._merged,
+                replaced=self._replaced,
+                engine=engine,
+                plate=self._plate_settings(),
+                library=self._library,
+                version=__version__,
+                preview=render_preview(self._result),
+            )
+        except Exception as error:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.warning(self, "保存工程失败", str(error))
+            return
+        QApplication.restoreOverrideCursor()
+        self._project_path = written
+        self._dirty = False
+        spools = len(spool_usage(self._result, self._library))
+        self._status.setText(
+            f"已保存工程 {written.name}（{written.parent}）："
+            f"原图 + 预览 + {len(self._result.palette)} 种颜色 + {spools} 卷耗材。"
+            "下次「打开工程」就回到这一步。"
+        )
+
+    def _confirm_discard(self, action: str) -> bool:
+        """Ask before edits that are not in the project file yet are lost."""
+        box = QMessageBox(self)
+        box.setWindowTitle("还有没保存的改动")
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setText(f"这张图改过、还没存进工程。要直接{action}吗？")
+        box.setInformativeText("没保存的删除 / 合并 / 更换颜色都会丢掉。想留着就先 Ctrl+S。")
+        keep = box.addButton("先保存", QMessageBox.ButtonRole.AcceptRole)
+        drop = box.addButton("不保存", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(keep)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is keep:
+            self._on_save_project()
+            return not self._dirty
+        return clicked is drop
+
     def _settings(self) -> MatchSettings:
         return MatchSettings(
             max_colours=int(self._colour_count.value()),
@@ -1157,7 +1399,7 @@ class PicturePage(QWidget):
         """The full 全部颜色 list, built once per library.
 
         At 41 spools this is 66,461 ``PaletteEntry`` objects and ~0.5 s to
-        build.  It is needed both by the match and by the 「更换颜色…」 menu, and
+        build.  It is needed both by the match and by the 「更换颜色」 menu, and
         that menu is opened once per colour the user swaps — so rebuilding it
         every time was pure waste.  ``setLibrary`` drops the cache.
 
@@ -1192,6 +1434,33 @@ class PicturePage(QWidget):
             self._triple_head = head
         return self._triple_palette
 
+    def _begin_match(self) -> None:
+        """Arm the progress bar; it appears only if the match is slow enough."""
+        self._progress.setValue(0)
+        self._busy_timer.start()
+        self._set_controls_enabled(False)
+
+    def _end_match(self) -> None:
+        """Put the bar away.  The controls come back with the new result."""
+        self._busy_timer.stop()
+        self._progress.setVisible(False)
+        self._progress.setValue(0)
+
+    def _show_progress(self) -> None:
+        self._progress.setVisible(True)
+
+    def _report_match(self, message: str, fraction: float) -> None:
+        """One step of :func:`match_image`, drawn while the match is running.
+
+        ``processEvents`` is what makes the bar move at all — the match is a
+        plain synchronous call — and it excludes user input so a click cannot
+        start a second match inside the first one, which is the only way this
+        can go wrong.
+        """
+        self._progress.setValue(int(max(0.0, min(1.0, fraction)) * PROGRESS_STEPS))
+        self._status.setText(f"正在匹配：{message}…")
+        QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+
     def _on_rematch(self) -> None:
         if self._image is None:
             return
@@ -1202,17 +1471,28 @@ class PicturePage(QWidget):
         if not palette:
             self._status.setText("调色板是空的，请先添加耗材。")
             return
+        self._begin_match()
         try:
-            result = match_image(self._image, palette, self._settings())
+            result = match_image(
+                self._image, palette, self._settings(), progress=self._report_match
+            )
         except Exception as error:  # pragma: no cover - defensive
             QMessageBox.warning(self, "匹配失败", str(error))
+            # The controls were switched off for the match, and this path has no
+            # new result to switch them back on with.
+            self._set_controls_enabled(self._result is not None)
             return
+        finally:
+            self._end_match()
         self._base = result
         self._deleted = set()
         self._merged = {}
         self._replaced = {}
         self._undo_stack = []
         self._redo_stack = []
+        # A new match is a new picture: whatever the project file holds is now
+        # one step behind.
+        self._dirty = True
         self._plate = None
         self._list.setLibrary(self._library)
         self._apply_edits()
@@ -1299,6 +1579,9 @@ class PicturePage(QWidget):
         # than anyone retraces by hand.
         del self._undo_stack[:-64]
         self._redo_stack.clear()
+        # Every user edit comes through here, which is what makes this the one
+        # place that has to remember 「不是工程文件里那一版了」.
+        self._dirty = True
 
     def _resolve(self) -> tuple[dict[int, int], set[int]]:
         """``(index remap, indices that vanish)`` after the merges and deletions.
@@ -1382,7 +1665,7 @@ class PicturePage(QWidget):
 
         ``keep`` is an ORIGINAL palette index to keep selected across the
         rebuild; without it the colour that is currently selected is followed
-        through the edit, so 「更换颜色…」 and 撤销 both leave the user where they
+        through the edit, so 「更换颜色」 and 撤销 both leave the user where they
         were instead of jumping back to the top of the list.
         """
         anchor = keep
@@ -1436,6 +1719,7 @@ class PicturePage(QWidget):
         self._redo_button.setEnabled(bool(self._redo_stack))
 
     def _announce_edits(self) -> None:
+        self._update_usage()
         result = self._result
         if result is None:
             return
@@ -1449,7 +1733,7 @@ class PicturePage(QWidget):
         if not parts:
             self._status.setText(
                 "匹配完成：{0}×{1} 像素，{2} 种颜色。点击右侧颜色看图片高光，"
-                "点击图片看它属于哪种颜色；点「更换颜色…」可以手动换掉不合适的颜色，"
+                "点击图片看它属于哪种颜色；点「更换颜色」可以手动换掉不合适的颜色，"
                 "多选颜色后可以「删除」（留空不打印）或「合并」。".format(
                     result.width, result.height, len(result.palette)
                 )
@@ -1463,6 +1747,34 @@ class PicturePage(QWidget):
             f"（占 {printed / total * 100:.1f}%）。导出的 3MF / OBJ 就照这样切，"
             "Ctrl+Z 撤销、Ctrl+Y 恢复。"
         )
+
+    def _update_usage(self) -> None:
+        """Show which rolls this version of the picture spends, largest first.
+
+        The percentages are shares of material, not of pixels: 「白 10% + 金 90%」
+        uses nine times as much gold as white, so this is the line that tells
+        the user which spools to actually load.
+        """
+        uses = spool_usage(self._result, self._library)
+        # Back to the top: after an edit the biggest roll is the answer the user
+        # came for, and it must not stay scrolled out of sight.
+        bar = self._usage_scroll.verticalScrollBar()
+        bar.setValue(bar.minimum())
+        if not uses:
+            self._usage.setText(
+                "匹配完成后，这里列出这一版用到了哪几卷耗材，以及各卷占的色料比例。"
+            )
+            return
+        rows = []
+        for use in uses:
+            chip = (
+                f'<span style="background-color:{use.color_hex};">&nbsp;&nbsp;&nbsp;</span> '
+                if use.color_hex
+                else ""
+            )
+            missing = "" if use.filament is not None else "（耗材库里已经没有这一卷）"
+            rows.append(f"{chip}{use.display_name}{missing} <b>{use.share:.1%}</b>")
+        self._usage.setText(f"共 {len(uses)} 卷<br>" + "<br>".join(rows))
 
     def _on_delete_colours(self) -> None:
         picked = self._list.selected_indices()
@@ -1507,6 +1819,7 @@ class PicturePage(QWidget):
             return
         self._redo_stack.append(self._snapshot())
         self._restore(self._undo_stack.pop())
+        self._dirty = True
         self._apply_edits()
         self._status.setText("已撤销上一步。Ctrl+Y 可以再做回来。")
 
@@ -1515,6 +1828,7 @@ class PicturePage(QWidget):
             return
         self._undo_stack.append(self._snapshot())
         self._restore(self._redo_stack.pop())
+        self._dirty = True
         self._apply_edits()
         self._status.setText("已恢复刚才撤销的那一步。")
 

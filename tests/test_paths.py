@@ -564,6 +564,110 @@ class SteadyStateRootTests(DataDirTestCase):
             self.assertEqual(paths.data_dir(), fallback)
 
 
+class PackagedCopyTests(DataDirTestCase):
+    """A packaged copy owns its library, and a fresh copy starts empty.
+
+    Until 1.6.11 every copy read and wrote one file in the profile, so unzipping
+    a new version opened with the previous version's spools in 「我的耗材」, and two
+    copies could never differ.  A packaged copy now keeps its spools in a ``data``
+    folder beside its own executable, and its fallbacks are per-copy as well.
+    """
+
+    def _program(self, name: str) -> Path:
+        program = self.root / name
+        program.mkdir()
+        (program / "BambuPalette.exe").write_bytes(b"MZ")
+        return program
+
+    def _frozen_at(self, program: Path):
+        """Pretend this process is the packaged program living in *program*."""
+        return mock.patch.multiple(
+            paths, is_frozen=lambda: True, executable_dir=lambda: program
+        )
+
+    def test_a_packaged_copy_keeps_its_library_beside_itself(self) -> None:
+        program = self._program("BambuPalette-1.6.11-win64")
+        self.env(LOCALAPPDATA=self.root / "profile", TEMP=self.root / "scratch")
+
+        with self._frozen_at(program):
+            resolved = paths.data_dir()
+
+        self.assertEqual(resolved, program / "data")
+        self.assertTrue(resolved.is_dir())
+
+    def test_a_fresh_copy_does_not_inherit_the_shared_library(self) -> None:
+        shared = self.root / "profile" / "BambuPalette"
+        shared.mkdir(parents=True)
+        (shared / "filament-library.json").write_text(
+            json.dumps(_library(), ensure_ascii=False), encoding="utf-8"
+        )
+        program = self._program("BambuPalette-1.6.11-win64")
+        self.env(LOCALAPPDATA=self.root / "profile", TEMP=self.root / "scratch")
+
+        with self._frozen_at(program):
+            resolved = paths.data_dir()
+
+        self.assertEqual(resolved, program / "data")
+        self.assertFalse((resolved / "filament-library.json").exists())
+
+    def test_each_copy_has_its_own_fallback_when_its_folder_is_read_only(self) -> None:
+        first = self._program("BambuPalette-a")
+        second = self._program("BambuPalette-b")
+        self.env(LOCALAPPDATA=self.root / "profile", TEMP=self.root / "scratch")
+
+        def probe(directory: Path, attempts: int = 4) -> str | None:
+            return "拒绝访问。" if directory.name == "data" else None
+
+        with mock.patch.object(paths, "_write_probe", probe):
+            with self._frozen_at(first):
+                one = paths.data_dir()
+            with self._frozen_at(second):
+                two = paths.data_dir()
+
+        self.assertEqual(one.parent, self.root / "profile")
+        self.assertIn("BambuPalette-a", one.name)
+        self.assertNotEqual(one, two)
+
+    def test_the_tag_separates_folders_with_the_same_name(self) -> None:
+        left = self.root / "left" / "BambuPalette"
+        right = self.root / "right" / "BambuPalette"
+        left.mkdir(parents=True)
+        right.mkdir(parents=True)
+
+        with self._frozen_at(left):
+            first = paths.installation_tag()
+        with self._frozen_at(right):
+            second = paths.installation_tag()
+
+        # The folder is *called* BambuPalette, so nothing is left of the name to
+        # put in front of the digest — "copy-<digest>" is the honest answer.
+        self.assertTrue(first.startswith("copy-"), first)
+        self.assertTrue(second.startswith("copy-"), second)
+        self.assertNotEqual(first, second)
+
+    def test_the_tag_keeps_a_versioned_folder_name_readable(self) -> None:
+        program = self.root / "BambuPalette-1.6.11-win64"
+        program.mkdir(parents=True)
+
+        with self._frozen_at(program):
+            tag = paths.installation_tag()
+
+        # `BambuPalette` is stripped so the data folder reads
+        # `BambuPalette-1.6.11-win64-<digest>`, not the doubled name.
+        self.assertTrue(tag.startswith("1.6.11-win64-"), tag)
+        self.assertEqual(len(tag.rsplit("-", 1)[-1]), 6)
+
+    def test_the_old_shared_library_is_offered_for_importing(self) -> None:
+        shared = self.root / "profile" / "BambuPalette"
+        shared.mkdir(parents=True)
+        self.env(LOCALAPPDATA=self.root / "profile")
+
+        self.assertIsNone(paths.legacy_shared_library())
+
+        (shared / "filament-library.json").write_text("{}", encoding="utf-8")
+        self.assertEqual(paths.legacy_shared_library(), shared / "filament-library.json")
+
+
 class WriteProbeTests(DataDirTestCase):
     """Existence is not writability — the check that stops the startup hang.
 

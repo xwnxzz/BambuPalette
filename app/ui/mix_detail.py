@@ -27,6 +27,20 @@ BAR_STOPS = 129
 MAX_RECIPE_ROWS = 50
 
 
+def _hex_ok(value: str) -> bool:
+    """True when ``value`` is a colour the mixing engine can be asked about.
+
+    ``showRecipe`` writes "?" for a parent spool that has been deleted, and that
+    is exactly what used to reach this widget.
+    """
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    if len(text) == 7 and text[0] == "#":
+        text = text[1:]
+    return len(text) == 6 and all(character in "0123456789abcdefABCDEF" for character in text.lower())
+
+
 class PairBar(QWidget):
     """The whole 0 %→100 % sweep of one pair, with the recipe marked.
 
@@ -44,6 +58,17 @@ class PairBar(QWidget):
         self.setFixedHeight(self._height)
 
     def setPair(self, hex_a: str, hex_b: str, percent_a: float, engine) -> None:
+        """Draw the sweep of one pair.
+
+        Deleting a spool while its mixture is on screen leaves the panel holding
+        a recipe with a parent that no longer exists — there is no sweep to draw
+        then, and the flat grey bar says that better than an exception over a hex
+        nobody can parse.
+        """
+        if not (_hex_ok(hex_a) and _hex_ok(hex_b)):
+            self._marker = max(0.0, min(1.0, percent_a / 100.0))
+            self.clear()
+            return
         weights = [(i / (BAR_STOPS - 1)) for i in range(BAR_STOPS)]
         self._stops = [QColor(engine.mix_hex(hex_a, hex_b, weight * 100.0)) for weight in weights]
         self._marker = max(0.0, min(1.0, percent_a / 100.0))

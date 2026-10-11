@@ -47,6 +47,12 @@ _SHORTLIST = 24
 #: with two colours.
 _INDEX_DTYPE = np.int32
 
+#: The exact-colour pass is a Python loop of CIEDE2000 calls and is by far the
+#: longest step of a match (1.3–1.5 s for a 41-spool library).  Reporting every
+#: ``_PROGRESS_ROWS`` colours is what keeps a progress bar moving during it
+#: instead of standing still for a second and a half.
+_PROGRESS_ROWS = 4
+
 
 def _report(progress: ProgressFn | None, message: str, fraction: float) -> None:
     if progress is not None:
@@ -320,6 +326,74 @@ class MatchResult:
         return self.counts / float(max(1, self.printed_pixels))
 
 
+@dataclass(frozen=True)
+class SpoolUse:
+    """One spool a match actually consumes, and how much of it.
+
+    ``share`` is a fraction of the material laid down, not of the pixels: a
+    region printed with 「白 10% + 金 90%」 spends ten times as much 金 as 白, so
+    counting regions (or pixels) per colour answers a different question than
+    「这一版要拆哪几卷」.  See :func:`spool_usage`.
+    """
+
+    filament_id: str
+    share: float
+    filament: Filament | None = None
+
+    @property
+    def color_hex(self) -> str:
+        if self.filament is not None:
+            return self.filament.color_hex
+        return ""
+
+    @property
+    def display_name(self) -> str:
+        if self.filament is not None:
+            return self.filament.display_name
+        # A spool the library no longer has — a project file opened on another
+        # machine, a spool the user cleared out — still has to be named: the
+        # short id is the honest answer.
+        return self.filament_id[:8]
+
+
+def spool_usage(
+    result: MatchResult | None, library: FilamentLibrary | None
+) -> list[SpoolUse]:
+    """How much of each spool one match spends, largest first.
+
+    Every kept colour is either a spool on its own (100% of that spool) or a
+    two/three-filament recipe (its percentages), and the per-colour shares add
+    up to 1.  Splitting each share by the recipe's percentages therefore gives
+    the spool totals the printer will actually load — which is what 「用到了哪些
+    耗材」 has to mean if it is to decide which rolls go in the AMS.
+    """
+    if result is None or not result.palette:
+        return []
+    printed = max(1, int(result.printed_pixels))
+    totals: dict[str, float] = {}
+    for index, entry in enumerate(result.palette):
+        share = int(result.counts[index]) / printed
+        parts = tuple(entry.parts)
+        if not parts:
+            recipe = entry.recipe
+            if recipe is not None:
+                parts = ((recipe.a_id, recipe.percent_a), (recipe.b_id, recipe.percent_b))
+            elif entry.filament_ids:
+                parts = ((entry.filament_ids[0], 100),)
+        for filament_id, percent in parts:
+            parent = str(filament_id)
+            totals[parent] = totals.get(parent, 0.0) + share * percent / 100.0
+    ordered = sorted(totals.items(), key=lambda item: (-item[1], item[0]))
+    return [
+        SpoolUse(
+            filament_id=filament_id,
+            share=share,
+            filament=library.get(filament_id) if library is not None else None,
+        )
+        for filament_id, share in ordered
+    ]
+
+
 #: How many palette rows the nearest-colour search looks at per block.  The
 #: three-filament pool is millions of colours, so the distance to every one of
 #: them is computed in blocks and only the best few per target are carried
@@ -375,11 +449,15 @@ def _nearest_entries(
     labs: np.ndarray,
     entries: Sequence[PaletteEntry],
     table: np.ndarray | None = None,
+    on_row: Callable[[int, int], None] | None = None,
 ) -> np.ndarray:
     """Index of the palette entry closest to each row of ``labs``.
 
     A Euclidean pass in Lab narrows the field, then CIEDE2000 picks the winner so
     the answer agrees with the ΔE the UI reports.
+
+    ``on_row`` is called with ``(rows_done, rows_total)`` as the exact pass
+    walks the colours — it is the only step long enough to need saying so.
     """
     if not entries:
         return np.zeros(len(labs), dtype=np.int64)
@@ -402,8 +480,9 @@ def _nearest_entries(
         head_indices = _shortlist_indices(table[:head_size], targets, _SHORTLIST)
         best_indices = np.concatenate([best_indices, head_indices], axis=1)
 
-    out = np.zeros(len(labs), dtype=np.int64)
-    for row in range(len(targets)):
+    rows = len(targets)
+    out = np.zeros(rows, dtype=np.int64)
+    for row in range(rows):
         candidates = best_indices[row]
         best_index = int(candidates[0])
         best = float("inf")
@@ -413,6 +492,8 @@ def _nearest_entries(
                 best = value
                 best_index = int(index)
         out[row] = best_index
+        if on_row is not None and (row % _PROGRESS_ROWS == _PROGRESS_ROWS - 1 or row == rows - 1):
+            on_row(row + 1, rows)
     return out
 
 
@@ -1035,11 +1116,20 @@ def match_image(
     colours, classes = reduce_colours(image, config, mask)
     colours, classes = _merge_similar_colours(colours, classes, config.merge_delta_e)
 
-    _report(progress, "在耗材与混色库里寻找最接近的颜色", 0.55)
+    _report(progress, "在耗材与混色库里寻找最接近的颜色", 0.35)
     labs = _color.lab_from_rgb(colours)
-    chosen = _nearest_entries(labs, palette, _palette_table(palette))
 
-    _report(progress, "按像素分配颜色", 0.80)
+    def _search_rows(rows_done: int, rows_total: int) -> None:
+        # The exact pass is the long one: keep the bar moving through it.
+        _report(
+            progress,
+            "在耗材与混色库里寻找最接近的颜色",
+            0.35 + 0.35 * rows_done / max(1, rows_total),
+        )
+
+    chosen = _nearest_entries(labs, palette, _palette_table(palette), _search_rows)
+
+    _report(progress, "按像素分配颜色", 0.75)
     indices = np.where(mask, chosen[classes], -1).astype(_INDEX_DTYPE)
 
     # Drop palette entries the picture never used, then renumber largest first.
@@ -1059,16 +1149,19 @@ def match_image(
     # 「图片 #xxxxxx → 匹配 #yyyyyy」 and the user can judge the match.
     means = None
     ordered_counts = counts[order]
+    _report(progress, "合并相近颜色", 0.85)
     kept, ordered_counts, final = _merge_indistinguishable(
         kept, ordered_counts, final, config.merge_delta_e
     )
     # 「最多用 N 卷料」 comes after the merge: folding two invisible shades
     # together frees spools for free, so the budget should only have to work on
     # colours that actually survived.
+    _report(progress, "按「耗材上限」合并颜色", 0.90)
     budgeted = _fit_spool_budget(kept, final, config.max_spools, palette)
     if budgeted is not None:
         kept, ordered_counts, final = budgeted
     if len(kept):
+        _report(progress, "统计每种颜色的像素", 0.96)
         pixels = np.asarray(image.convert("RGB"), dtype=np.float64).reshape(-1, 3)
         flat = final.reshape(-1)
         valid = flat >= 0

@@ -79,14 +79,36 @@ class _StubChooser:
         return (str(self._target), "")
 
 
+class _StubButton:
+    """A stand-in for a QMessageBox button: identity is what the code compares."""
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
 class _StubMessageBox:
-    """Stands in for ``QMessageBox`` — ``exec()`` would block with no user."""
+    """Stands in for ``QMessageBox`` — ``exec()`` would block with no user.
+
+    ``answer`` is the text of the button the fake user presses.  The destructive
+    one is the default because that is what someone who pressed 清空耗材库 and
+    then confirmed meant; a check that wants the safe path sets it to 取消.
+    """
 
     class Icon:  # noqa: D106
         Information = 0
+        Warning = 1
+
+    class ButtonRole:  # noqa: D106
+        AcceptRole = 0
+        DestructiveRole = 2
+        RejectRole = 3
+
+    answer = "清空"
 
     def __init__(self, *args, **kwargs) -> None:
-        pass
+        self.buttons: dict[str, _StubButton] = {}
+        self.informative = ""
+        self.default: _StubButton | None = None
 
     def setWindowTitle(self, *args) -> None:
         pass
@@ -97,8 +119,22 @@ class _StubMessageBox:
     def setText(self, *args) -> None:
         pass
 
+    def setInformativeText(self, text: str, *args) -> None:
+        self.informative = text
+
+    def addButton(self, text: str, *args) -> _StubButton:
+        button = _StubButton(text)
+        self.buttons[text] = button
+        return button
+
+    def setDefaultButton(self, button: _StubButton) -> None:
+        self.default = button
+
     def exec(self) -> int:
         return 0
+
+    def clickedButton(self) -> _StubButton | None:
+        return self.buttons.get(self.answer)
 
     @staticmethod
     def warning(*args, **kwargs) -> int:  # noqa: D102
@@ -1856,8 +1892,8 @@ def main() -> int:
                 if isinstance(edit_row.itemAt(position).widget(), _QPushButton)
             ]
             check(
-                labels == ["多选", "删除", "合并", "更换颜色…", "撤销", "恢复"],
-                f"the edit row reads 多选 删除 合并 更换颜色… 撤销 恢复, got {labels}",
+                labels == ["多选", "删除", "合并", "更换颜色", "撤销", "恢复"],
+                f"the edit row reads 多选 删除 合并 更换颜色 撤销 恢复, got {labels}",
             )
 
             page._on_delete_colours()
@@ -1994,6 +2030,227 @@ def main() -> int:
                 _picture_page.QFileDialog = original_dialog
                 _picture_page.QMessageBox = original_box
 
+            # --- a match says what it is doing (m08102 item 2) ------------------
+            # The exact-colour pass is a Python loop of CIEDE2000 calls: 41 spools
+            # means 1.3–1.5 s of a frozen window.  The bar is deliberately NOT put
+            # on screen at once — a 50 ms match would only flash it.
+            check(
+                page._progress.isHidden(),
+                "the progress bar is hidden once a match is finished",
+            )
+            check(
+                page._progress.maximum() == _picture_page.PROGRESS_STEPS,
+                "the bar counts thousandths, so even a slow step moves it",
+            )
+            page._begin_match()
+            check(page._busy_timer.isActive(), "the busy delay is armed when a match starts")
+            check(page._progress.isHidden(), "… and a fast match never flashes the bar")
+            page._show_progress()
+            check(
+                not page._progress.isHidden(),
+                "the bar appears once the match outlasts the delay",
+            )
+            page._report_match("在耗材与混色库里寻找最接近的颜色", 0.42)
+            check(
+                page._progress.value() == int(0.42 * _picture_page.PROGRESS_STEPS),
+                f"a report moves the bar, got {page._progress.value()}",
+            )
+            check(
+                page._status.text() == "正在匹配：在耗材与混色库里寻找最接近的颜色…",
+                f"the status line names the step, got {page._status.text()!r}",
+            )
+            page._end_match()
+            check(
+                page._progress.isHidden() and page._progress.value() == 0,
+                "finishing hides the bar and resets it",
+            )
+
+            # A real match has to walk that bar forward, stage by stage.
+            reports: list[tuple[str, float]] = []
+            remember_report = page._report_match
+
+            def _record(message: str, fraction: float) -> None:
+                reports.append((message, fraction))
+                remember_report(message, fraction)
+
+            page._report_match = _record  # type: ignore[method-assign]
+            try:
+                page._on_rematch()
+                app.processEvents()
+            finally:
+                page._report_match = remember_report  # type: ignore[method-assign]
+            check(len(reports) >= 9, f"every stage of the match reports itself, got {len(reports)}")
+            check(
+                all(later[1] >= earlier[1] for earlier, later in zip(reports, reports[1:])),
+                f"progress never goes backwards: {[round(f, 3) for _m, f in reports]}",
+            )
+            check(reports[-1][1] == 1.0, f"the last report is the end, got {reports[-1][1]}")
+            check(
+                sum(1 for message, _f in reports if "寻找最接近" in message) > 1,
+                "the long colour search reports row by row, not only when it is over",
+            )
+            check(page._progress.isHidden(), "the bar is gone when the match ends")
+            check(app.overrideCursor() is None, "no wait cursor is left over after a match")
+
+            # --- which rolls the picture spends (m08102 item 3) -----------------
+            from PySide6.QtWidgets import QLabel as _QLabel  # noqa: PLC0415
+
+            from app.core.image_matching import spool_usage as _spool_usage  # noqa: PLC0415
+
+            uses = _spool_usage(page.result, library)
+            check(bool(uses), "the match says which spools it spends")
+            usage_text = page._usage.text()
+            check(
+                f"共 {len(uses)} 卷" in usage_text,
+                f"the panel counts the rolls, got {usage_text!r}",
+            )
+            check(
+                all(use.display_name in usage_text for use in uses),
+                "every spool it spends is named in the panel",
+            )
+            check("%" in usage_text, "each spool says how much of the material it takes")
+            check(
+                page._usage.textFormat() == Qt.TextFormat.RichText
+                and "background-color" in usage_text,
+                "each spool is shown with its own colour",
+            )
+            # The label lives inside a scroll area inside the card (a 41-spool
+            # library needs the scrollbar), so the card is one level further up.
+            usage_panel = page._usage_scroll.parent()
+            check(
+                any(label.text() == "用到的耗材" for label in usage_panel.findChildren(_QLabel)),
+                "the panel is titled 用到的耗材",
+            )
+            # An edit has to refresh the list, not leave the previous sentence up.
+            usage_saved = page._usage.text()
+            page._on_colour_selected(0)
+            page._on_delete_colours()
+            app.processEvents()
+            check(page._usage.text() != usage_saved, "an edit refreshes the spool list")
+            page._undo()
+            app.processEvents()
+            check(page._usage.text() == usage_saved, "undo puts the spool list back")
+
+            # --- one project file per picture (m08102 item 5) -------------------
+            import json  # noqa: PLC0415
+            from PySide6.QtGui import QKeySequence as _QKeySequence  # noqa: PLC0415
+
+            project = TEMP / "roundtrip.bpproj"
+            _picture_page.QFileDialog = _StubChooser(project)
+            _picture_page.QMessageBox = _StubMessageBox
+            check(page._project_path is None, "the picture tab starts with no project file")
+            page._on_save_project()
+            app.processEvents()
+            check(project.is_file(), "保存工程 wrote the project file")
+            check(zipfile.is_zipfile(project), "a project is a real zip container")
+            with zipfile.ZipFile(project) as package:
+                members = set(package.namelist())
+                check(
+                    {"工程.json", "原图.png", "预览.png", "基线.npy"} <= members,
+                    f"the project holds the picture, the preview and the document, got {sorted(members)}",
+                )
+                document = json.loads(package.read("工程.json").decode("utf-8"))
+            check(document["app"] == "BambuPalette", "the document names the program")
+            check(
+                len(document["spools"]) == len(uses),
+                "the document lists the spools this picture needs",
+            )
+            check(
+                all(row["color_hex"] for row in document["spools"]),
+                "… with their colours, so the file is readable on a machine that lacks them",
+            )
+            check(page._project_path == project, "the page remembers where it saved")
+            check(page._dirty is False, "saving clears the unsaved flag")
+            check("已保存工程" in page._status.text(), f"saving says so: {page._status.text()!r}")
+
+            saved_colours = len(page._result.palette)
+            saved_printed = page._result.printed_pixels
+            page._on_colour_selected(0)
+            page._on_delete_colours()
+            app.processEvents()
+            edited_colours = len(page._result.palette)
+            edited_printed = page._result.printed_pixels
+            check(page._dirty is True, "an edit marks the project unsaved")
+            check(edited_colours == saved_colours - 1, "the edit really changed the picture")
+
+            # 取消 on 「要保存吗」 must leave the edit exactly where it is.
+            _StubMessageBox.answer = "取消"
+            page._on_open_project()
+            app.processEvents()
+            check(page._project_path == project, "cancelling the question keeps the project")
+            check(
+                len(page._result.palette) == edited_colours,
+                "cancelling does not throw the edit away",
+            )
+            # 不保存 opens the file — i.e. the picture it was saved with.
+            _StubMessageBox.answer = "不保存"
+            page._on_open_project()
+            app.processEvents()
+            check(
+                len(page._result.palette) == saved_colours
+                and page._result.printed_pixels == saved_printed,
+                "打开工程 restores the picture that was saved",
+            )
+            check(page._dirty is False, "an opened project is not dirty")
+            check("已打开工程" in page._status.text(), f"opening says so: {page._status.text()!r}")
+            # 先保存 writes the edit first, then reopens it.
+            page._on_colour_selected(0)
+            page._on_delete_colours()
+            app.processEvents()
+            _StubMessageBox.answer = "先保存"
+            page._on_open_project()
+            app.processEvents()
+            check(page._dirty is False, "先保存 writes the edit before opening")
+            check(
+                len(page._result.palette) == saved_colours - 1,
+                "… and the reopened project is that edited picture",
+            )
+            check(
+                page._result.printed_pixels != saved_printed or edited_printed == saved_printed,
+                "the reopened picture is the one that was written",
+            )
+            _StubMessageBox.answer = "清空"
+
+            # The save dialog cannot produce a file we are then unable to open.
+            _picture_page.QFileDialog = _StubChooser(TEMP / "noext")
+            page._on_save_project(ask=True)
+            app.processEvents()
+            check((TEMP / "noext.bpproj").is_file(), "a name without .bpproj still saves openable")
+            check(
+                page._save_shortcut.key() == _QKeySequence(_QKeySequence.StandardKey.Save),
+                "Ctrl+S is bound to 保存工程",
+            )
+            check(
+                page._save_as_shortcut.key().toString() == "Ctrl+Shift+S",
+                f"Ctrl+Shift+S asks for another name, got {page._save_as_shortcut.key().toString()}",
+            )
+            _picture_page.QFileDialog = original_dialog
+            _picture_page.QMessageBox = original_box
+
+            # --- no menu bar left, and 关于 is a button (m08102 item 6) ---------
+            from PySide6.QtWidgets import QMenuBar as _QMenuBar  # noqa: PLC0415
+
+            check(
+                not window.findChildren(_QMenuBar),
+                "文件 / 视图 / 帮助 are gone — there is no menu bar left",
+            )
+            check(window._about_button.text() == "关于", "关于 is a plain button now")
+            check(window._about_button.isVisible(), "关于 sits where the menus used to be")
+            check(
+                "BambuPalette" in window._about_text(),
+                "关于 still says what the program is, and where the algorithms come from",
+            )
+
+            # A spool can be deleted while its mixture is still in the detail
+            # panel — that panel then holds a recipe whose parent is gone, which
+            # used to reach the 0→100 % bar as "?" and raise out of hex_to_rgb
+            # (清空耗材库 did exactly that).
+            window._detail._bar.setPair("?", "?", 50, window._catalog.engine)
+            check(
+                window._detail._bar._stops == [],
+                "a recipe whose parent is gone draws a flat bar instead of raising",
+            )
+
     # --- the picture page only re-matches when it is on screen -----------------
     # At 41 spools a re-match is ~0.7 s against 66,461 candidates; spending it
     # while the 颜色配方 tab is showing buys the user nothing.
@@ -2035,7 +2292,70 @@ def main() -> int:
     app.processEvents()
     check(bare._recipes == [], "an empty library produces no mixes")
     check(bare._detail.recipe() is None, "an empty library shows no recipe")
+    check(
+        not bare._clear_button.isEnabled(),
+        "清空耗材库 is dead while there is nothing to clear",
+    )
     bare.close()
+
+    # --- 清空耗材库 asks first, and really empties this copy's archive ----------
+    # m08102 item 1: the spools a fresh copy shows are not a preset, and since
+    # 1.6.11 they belong to this copy alone, so the way to start empty is a button.
+    from app.ui import main_window as _main_window  # noqa: PLC0415
+
+    check(window._clear_button.isEnabled(), "清空耗材库 is live while there are spools")
+    clear_box = _main_window.QMessageBox
+    _main_window.QMessageBox = _StubMessageBox
+    try:
+        _StubMessageBox.answer = "取消"
+        before_clear = len(window.library)
+        window._on_clear_library()
+        app.processEvents()
+        check(len(window.library) == before_clear, "取消 keeps every spool")
+        _StubMessageBox.answer = "清空"
+        window._on_clear_library()
+        app.processEvents()
+        check(len(window.library) == 0, "清空 really empties the archive")
+        check(not window._clear_button.isEnabled(), "the button goes dead afterwards")
+        check(not window._list.isVisible(), "the empty list hides itself")
+        check(window._library_hint.isVisible(), "the empty hint comes back")
+        check(
+            "已清空耗材库" in window._status.text(),
+            f"it says what happened: {window._status.text()!r}",
+        )
+        check(len(FilamentLibrary.load()) == 0, "the archive on disk is empty too")
+    finally:
+        _main_window.QMessageBox = clear_box
+        _StubMessageBox.answer = "清空"
+
+    # --- 「导入」opens where the old shared archive lives ------------------------
+    # 1.6.11: copies no longer share one library, so a copy that has not been
+    # given spools yet offers the old per-machine file's folder — a path Explorer
+    # never showed — instead of somewhere unrelated.
+    from app.core import paths as _paths_module  # noqa: PLC0415
+
+    legacy_file = TEMP / "legacy-library.json"
+    legacy_file.write_text("{}", encoding="utf-8")
+    ours_missing = TEMP / "no-library-yet.json"
+    ours_missing.unlink(missing_ok=True)
+    saved_legacy = _paths_module.legacy_shared_library
+    saved_library_path = _paths_module.library_path
+    _paths_module.legacy_shared_library = lambda: legacy_file
+    _paths_module.library_path = lambda: ours_missing
+    try:
+        check(
+            window._import_start_dir() == legacy_file.parent,
+            "导入 opens at the old shared archive while this copy has none",
+        )
+        ours_missing.write_text("{}", encoding="utf-8")
+        check(
+            window._import_start_dir() == TEMP,
+            "and uses this copy's own folder once it has an archive",
+        )
+    finally:
+        _paths_module.legacy_shared_library = saved_legacy
+        _paths_module.library_path = saved_library_path
+        ours_missing.unlink(missing_ok=True)
 
     window.close()
 
