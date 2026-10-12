@@ -2285,8 +2285,20 @@ def main() -> int:
                 ),
                 "… and 「用到的耗材」 follows that plan",
             )
+            # m00830 item 2: the preview must not keep the old picture's highlight.
+            page._select(0)
+            app.processEvents()
+            check(page._view._selected == 0, "a clicked colour is what the preview highlights")
             _QTest.mouseClick(buttons[0], Qt.MouseButton.LeftButton)
             app.processEvents()
+            check(
+                page._view._selected == -1
+                and page._list.current() == -1
+                and not page._list.selected_indices()
+                and page._view._dim_pixmap() is None,
+                "switching 方案 clears the preview's highlight block and outline "
+                f"(view={page._view._selected}, row={page._list.current()})",
+            )
             check(
                 page._plan_key == page._plans[0].key
                 and page._base is page._plans[0].result,

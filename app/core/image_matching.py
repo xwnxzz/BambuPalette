@@ -300,6 +300,14 @@ class MatchResult:
     # matched spool/mix against, so it must travel with the result rather than be
     # recomputed from a differently-sized image later.
     means: np.ndarray | None = None
+    # ΔE00 of every colour the picture was reduced to against the colour this
+    # plan prints for it, and the pixels behind each of those colours, both shape
+    # (kept colours,).  ``means`` answers "what colour is this block" for the
+    # preview; these two answer "how wrong is this plan" at the resolution the
+    # picture was reduced to, so painting a thin brown line with the background
+    # costs what it costs instead of hiding inside a block average.
+    source_values: np.ndarray | None = None
+    source_counts: np.ndarray | None = None
 
     @property
     def total_pixels(self) -> int:
@@ -1265,7 +1273,6 @@ def _budget_fits(
     objective: BudgetObjective = _objective_closest,
     *,
     region_rgb: np.ndarray | None = None,
-    blend_regions: bool = True,
     limit: int = 1,
     require: frozenset[str] = frozenset(),
     avoid: frozenset[str] = frozenset(),
@@ -1289,14 +1296,21 @@ def _budget_fits(
     filter are instructions about this machine, not preferences to trade against
     picture quality.
 
-    ``region_rgb`` is the picture colour behind each colour of ``kept``.  It is
-    what makes the ranking agree with the numbers the page prints: a colour the
-    cap refuses is printed with the closest colour it can afford, and the block
-    that results is the average of everything folded into it, so a plan has to be
-    scored on those averages.  Scoring the refused colour against its substitute
-    instead — the obvious shortcut — offered 「最不像的色块优先」 a plan whose worst
-    block was ΔE00 22 where 「总体最接近」 had 9.65, and made 「小色块优先」 lose on
-    the very count it is named after.
+    ``region_rgb`` is the picture colour behind each colour of ``kept``, and it is
+    what makes the ranking agree with the numbers the page prints: a plan is
+    scored on **every colour of the picture** — the ΔE00 between that colour and
+    the colour this plan prints for it, weighted by its pixels — which is exactly
+    the quantity :func:`match_fidelity_report` shows.
+
+    Scoring the refused colours against the colour that replaces them is not the
+    same thing, and averaging them is worse still.  Folding a colour into a block
+    and judging the block by its mean lets a thin dark line disappear: the mean of
+    a pale block barely moves, so the plan that paints the eyebrows with the
+    background measured better than the plan that keeps them (1.6.14 shipped
+    that, and the reporter's pig came back washed out — 平均 ΔE00 1.39 with 差块 0
+    while the black eyes and brown brows were gone).  A per-colour penalty cannot
+    be bought that cheaply: the line keeps its own ΔE00 whatever else is in the
+    block.
 
     Returns ``[]`` when nothing has to be dropped, so the caller keeps the
     untouched result — which is also why the untouched rolls are checked against
@@ -1320,6 +1334,19 @@ def _budget_fits(
             dtype=np.float64,
         )
 
+    #: The colour the picture actually has behind each colour of ``kept``.  This
+    #: is what a plan is judged against; ``labs`` is what a plan may print.  A
+    #: caller that cannot say (the legacy ``_fit_spool_budget``) gets each colour
+    #: standing for itself, which is the same rule read one level down.
+    if region_rgb is not None and len(region_rgb) == len(pool):
+        picture_labs = list(
+            _color.lab_from_rgb(
+                np.rint(np.asarray(region_rgb, dtype=np.float64)).astype(np.uint8)
+            )
+        )
+    else:
+        picture_labs = [np.asarray(entry.lab, dtype=np.float64) for entry in pool]
+
     untouched = frozenset().union(*needs)
     if len(untouched) <= budget and require <= untouched and not (avoid & untouched):
         return []  # the picture already fits; there is nothing to decide
@@ -1336,14 +1363,20 @@ def _budget_fits(
 
     matrix: np.ndarray | None = None
 
-    def _table() -> np.ndarray:
+    def _pairs() -> np.ndarray:
+        """ΔE00 from every picture colour of ``pool`` to every colour of ``pool``.
+
+        Row ``i`` is the picture colour behind kept position ``i`` measured
+        against each colour the plan could print; column ``i`` is the colour
+        ``kept`` itself offers for that region.
+        """
         nonlocal matrix
         if matrix is None:
             matrix = np.empty((len(pool), len(pool)), dtype=np.float64)
             for position in range(len(pool)):
-                matrix[position] = [
-                    _color.delta_e_2000(labs[position], other) for other in labs
-                ]
+                matrix[position] = _color.delta_e_2000(
+                    picture_labs[position], np.asarray(labs, dtype=np.float64)
+                )
         return matrix
 
     def _score(choice: Sequence[str]) -> tuple[tuple[float, ...], list[int]]:
@@ -1352,44 +1385,14 @@ def _budget_fits(
         printable = [position for position, need in enumerate(needs) if need <= subset]
         if not printable:
             return (float("inf"),), []
-        if region_rgb is None:
-            # No picture colour per colour of ``kept`` (the legacy caller): score
-            # every refused colour against the substitute that will print it.
-            worst = np.zeros(len(pool), dtype=np.float64)
-            surplus = np.ones(len(pool), dtype=bool)
-            surplus[printable] = False
-            columns = _table()[:, printable]
-            worst[surplus] = columns[surplus].min(axis=1)
-            return objective(worst, weights), printable
-        ranks = {position: rank for rank, position in enumerate(printable)}
-        nearest = _table()[:, printable].argmin(axis=1)
-        pixels = np.zeros(len(printable), dtype=np.float64)
-        blend = np.zeros((len(printable), 3), dtype=np.float64)
-        for position in range(len(pool)):
-            rank = ranks.get(position)
-            if rank is None:
-                rank = int(nearest[position])
-            pixels[rank] += weights[position]
-            blend[rank] += weights[position] * region_rgb[position]
-        # The block a plan ends up with is the average of everything folded into
-        # it, printed in the surviving colour — exactly what
-        # :func:`match_fidelity_report` measures, so the ranking and the numbers
-        # on screen cannot disagree.  「按当前色块重新匹配」 is the exception: there the
-        # block that survived keeps its own picture colour and the region is
-        # judged on that, which is the rule 合并 follows.
-        if blend_regions:
-            means = np.rint(blend / np.maximum(pixels, 1.0)[:, None]).astype(np.uint8)
-        else:
-            means = np.asarray(
-                [region_rgb[position] for position in printable], dtype=np.uint8
-            )
-        values = np.atleast_1d(
-            _color.delta_e_2000(
-                _color.lab_from_rgb(means),
-                np.asarray([labs[position] for position in printable], dtype=np.float64),
-            )
-        ).astype(np.float64)
-        return objective(values, pixels / pixels.sum()), printable
+        pairs = _pairs()
+        values = np.diagonal(pairs).copy()
+        surplus = np.ones(len(pool), dtype=bool)
+        surplus[printable] = False
+        if surplus.any():
+            values[surplus] = pairs[np.ix_(np.flatnonzero(surplus), printable)].min(axis=1)
+        total = float(weights.sum()) or 1.0
+        return objective(values, weights / total), printable
 
     def _walk(
         available: Sequence[str], width: int
@@ -1476,7 +1479,9 @@ def _budget_fits(
                 continue
             remap[position] = min(
                 range(len(printable)),
-                key=lambda rank: _color.delta_e_2000(labs[position], labs[printable[rank]]),
+                key=lambda rank: _color.delta_e_2000(
+                    picture_labs[position], labs[printable[rank]]
+                ),
             )
         folded = np.where(indices >= 0, remap[np.clip(indices, 0, None)], -1).astype(_INDEX_DTYPE)
         entries, region_counts, final, sources = _renumber_sources(
@@ -1504,6 +1509,9 @@ def _budget_fits(
             pool.append(fallback)
             origin.append(0)
             labs.append(np.asarray(fallback.lab, dtype=np.float64))
+            # It stands in for the largest region, so it is judged against that
+            # region's picture colour.
+            picture_labs.append(np.asarray(picture_labs[0], dtype=np.float64))
             printable = [len(pool) - 1]
         fit = _build(printable)
         if require - fit.spools or (avoid & fit.spools):
@@ -1674,11 +1682,11 @@ def _pool_region_means(prepared: _Prepared) -> np.ndarray | None:
     """The picture colour behind each colour of ``kept``, before the cap is spent.
 
     :func:`_region_means` averages the pixels of every block a *plan* ends up
-    with; scoring a plan before it is built needs the same average one level
-    down, for the colours the cap starts from.  These are kept as floats rather
-    than rounded to bytes, because a plan's block is the weighted blend of the
-    colours folded into it and the result has to equal the average of everything
-    in that block.
+    with; scoring a plan before it is built needs the same thing one level down,
+    for the colours the cap starts from — each kept colour keeps its own picture
+    colour, because that is what the plan is judged against.  These are kept as
+    floats rather than rounded to bytes so that the rounding happens once, when
+    the ΔE00 is measured.
     """
     if prepared.pictures is not None:
         return np.asarray(prepared.pictures, dtype=np.float64)
@@ -1690,6 +1698,41 @@ def _pool_region_means(prepared: _Prepared) -> np.ndarray | None:
     valid = flat >= 0
     np.add.at(totals, flat[valid], pixels[valid])
     return totals / np.maximum(prepared.counts, 1)[:, None]
+
+
+def _source_report(
+    prepared: _Prepared, fit: _Fit, picture_labs: np.ndarray | None
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """（每个图片颜色的 ΔE00，它背后的像素数）for the colours a plan prints.
+
+    One entry per colour the picture was reduced to: how far the colour this plan
+    prints for that region is from what the region actually looks like.  The page
+    shows these three numbers — weighted average, worst, how many are past
+    :data:`_BAD_BLOCK_DELTA_E` — and :func:`_budget_fits` ranks candidates with the
+    same quantity, so a row can never promise something its own picture does not
+    deliver.  A thin wrong line is one entry here, which is the point: averaging
+    it into a big block is what hid it before.
+    """
+    if picture_labs is None or not len(fit.entries) or not len(prepared.kept):
+        return None
+    # Which surviving block each colour of ``kept`` was folded into.  Read off the
+    # pixels: ``prepared.indices`` says which kept colour a pixel wanted and
+    # ``fit.indices`` which printed block it got.
+    rank_of_position = np.full(len(prepared.kept), -1, dtype=_INDEX_DTYPE)
+    wanted = prepared.indices.reshape(-1)
+    printed = fit.indices.reshape(-1)
+    valid = (wanted >= 0) & (printed >= 0)
+    if valid.any():
+        rank_of_position[wanted[valid]] = printed[valid]
+    values = np.zeros(len(prepared.kept), dtype=np.float64)
+    entry_labs = [np.asarray(entry.lab, dtype=np.float64) for entry in fit.entries]
+    for position in range(len(prepared.kept)):
+        rank = int(rank_of_position[position])
+        if 0 <= rank < len(entry_labs):
+            values[position] = _color.delta_e_2000(
+                picture_labs[position], entry_labs[rank]
+            )
+    return values, np.asarray(prepared.counts, dtype=np.float64)
 
 
 def _identity_fit(prepared: _Prepared) -> _Fit:
@@ -1724,6 +1767,7 @@ def _plans(
     of demanded / forbidden rolls cannot be met.
     """
     _report(progress, "按「耗材上限」合并颜色", 0.90)
+    region_rgb = _pool_region_means(prepared)
     fits = _budget_fits(
         prepared.kept,
         prepared.indices,
@@ -1731,8 +1775,7 @@ def _plans(
         prepared.palette,
         prepared.counts,
         objective,
-        region_rgb=_pool_region_means(prepared),
-        blend_regions=prepared.pictures is None,
+        region_rgb=region_rgb,
         limit=limit,
         require=require,
         avoid=avoid,
@@ -1748,8 +1791,14 @@ def _plans(
         if capped and require <= spools and not (avoid & spools):
             fits = [_identity_fit(prepared)]
     results: list[MatchResult] = []
+    picture_labs = None
+    if region_rgb is not None and len(region_rgb) == len(prepared.kept):
+        picture_labs = _color.lab_from_rgb(
+            np.rint(np.asarray(region_rgb, dtype=np.float64)).astype(np.uint8)
+        )
     for fit in fits:
         _report(progress, "统计每种颜色的像素", 0.96)
+        report = _source_report(prepared, fit, picture_labs)
         results.append(
             MatchResult(
                 width=int(fit.indices.shape[1]),
@@ -1760,6 +1809,8 @@ def _plans(
                 settings=prepared.config,
                 source=prepared.name,
                 means=_region_means(prepared, fit),
+                source_values=None if report is None else report[0],
+                source_counts=None if report is None else report[1],
             )
         )
     return results
@@ -1808,17 +1859,22 @@ def match_fidelity(result: MatchResult) -> tuple[float, float]:
     return average, worst
 
 
-def match_fidelity_report(result: MatchResult) -> tuple[float, float, int]:
-    """（平均 ΔE00，最差 ΔE00，差块个数）of a plan.
+def _fidelity_values(result: MatchResult) -> tuple[np.ndarray, np.ndarray] | None:
+    """（每种颜色的色差 ΔE00, 每种颜色的像素权重）that :func:`match_fidelity_report` reads.
 
-    The third number counts the colours off by more than
-    :data:`_BAD_BLOCK_DELTA_E`, which is the 「混不出来」 the eye actually
-    notices: on the user's pig every four-roll 方案 keeps the average near 1.5,
-    and they differ in whether the nose is one of the two or three blocks that
-    are visibly off.  An average alone hides that choice.
+    One entry per **colour of the picture** when the result carries the measurement
+    (``source_values``, written by :func:`_plans`), otherwise one entry per printed
+    block, read off its mean picture colour.  Both callers — the row's numbers and
+    the ranking that puts the rows in order — go through here, so a row can never
+    be ranked by one measurement and printed with another (the 1.6.14 complaint).
     """
+    values = result.source_values
+    counts = result.source_counts
+    if values is not None and counts is not None and len(values) and len(values) == len(counts):
+        total = float(np.sum(counts)) or 1.0
+        return np.asarray(values, dtype=np.float64), np.asarray(counts, dtype=np.float64) / total
     if result.means is None or not len(result.palette):
-        return 0.0, 0.0, 0
+        return None
     values = np.asarray(
         [
             _color.delta_e_2000(
@@ -1829,7 +1885,29 @@ def match_fidelity_report(result: MatchResult) -> tuple[float, float, int]:
         dtype=np.float64,
     )
     total = float(np.sum(result.counts)) or 1.0
-    weights = np.asarray(result.counts, dtype=np.float64) / total
+    return values, np.asarray(result.counts, dtype=np.float64) / total
+
+
+def match_fidelity_report(result: MatchResult) -> tuple[float, float, int]:
+    """（平均 ΔE00，最差 ΔE00，差块个数）of a plan.
+
+    Measured per **colour of the picture**: the third number counts the colours
+    off by more than :data:`_BAD_BLOCK_DELTA_E`, which is the 「混不出来」 the eye
+    actually notices — the nose, the eyebrows, a whole small shape.  An average
+    alone hides that choice, and an average *per printed block* hides it twice
+    over: folding a thin dark line into a large pale block barely moves the
+    block's mean, so a plan that erases the line used to look perfect (1.6.14).
+    Counting colours keeps it honest whatever the block sizes are.
+
+    Results built by :func:`_plans` carry the measurement (:attr:`MatchResult.
+    source_values`); one built by hand falls back to comparing each block's mean
+    picture colour with the colour that prints it, which is the same quantity
+    read at block resolution.
+    """
+    measured = _fidelity_values(result)
+    if measured is None:
+        return 0.0, 0.0, 0
+    values, weights = measured
     return (
         float(weights @ values),
         float(values.max()),
@@ -1989,30 +2067,30 @@ def _without_banned(
 #: ... and how many rows each one offers.  「耗材方案太少了，多推荐几组」 is answered
 #: with more *different roll sets* inside the same rules: the same subsets the
 #: search already scores are ranked, so the second row is the runner-up rather
-#: than a worse objective.  Three are shown for the default reading of the
-#: picture, two for each of the narrower ones — enough to choose between without
-#: burying the panel in near-duplicates.
+#: than a worse objective.  1.6.15（m00830 第 4 条「耗材方案多给些选项」）把每一档都
+#: 加宽：默认那一档五组，另两档各四组。印出来是同一套卷的行仍然只留一行，所以
+#: 卷库小、不少组合打平的图上会少于十三行。
 _PLAN_SPECS: tuple[tuple[str, str, str, BudgetObjective, int], ...] = (
     (
         "closest",
         "总体最接近",
         "整张图算下来最像；个别小色块可能差一点。",
         _objective_closest,
-        3,
+        5,
     ),
     (
         "worst",
         "最不像的色块优先",
         "先把差得最明显的那一块拉回来，平均会稍差。",
         _objective_worst,
-        2,
+        4,
     ),
     (
         "distinct",
         "小色块优先",
         "眼睛、鼻子这类小色块更准；超过 ΔE00 5 的色块最少。",
         _objective_distinct,
-        2,
+        4,
     ),
 )
 
@@ -2061,8 +2139,9 @@ def plan_help() -> str:
         "「耗材方案」这几行：",
         "· 同一个「耗材上限」里有好几种搭法，每一行是一种。行里写着这一套的平均色差、最差色差、"
         "差块个数和用几卷，后面那几个小方块就是这一套要装哪几卷料。",
-        f"· 「差块」是色差 ΔE00 超过 {_BAD_BLOCK_DELTA_E:g} 的颜色个数。平均色差看不出是哪一块画坏了，"
-        "差块个数看得出——越少，越不容易一眼看出偏差。",
+        f"· 「差块」是色差 ΔE00 超过 {_BAD_BLOCK_DELTA_E:g} 的颜色个数，按图片自己的颜色数："
+        "图片被归并成多少种颜色，就按多少种算。平均色差看不出是哪一块画坏了，差块个数看得出——"
+        "越少，越不容易一眼看出偏差。卷少、颜色多的时候这个数天生就大：几卷料印不出几十种颜色。",
     ]
     lines.extend(
         f"· {title}：{note}" for _key, title, note, _objective, _count in _PLAN_SPECS
@@ -2074,6 +2153,31 @@ def plan_help() -> str:
     return "\n".join(lines)
 
 
+def _ranked_plans(
+    pool: Sequence[MatchResult], objective: BudgetObjective
+) -> list[MatchResult]:
+    """``pool`` sorted by ``objective``, using the numbers the rows print.
+
+    The sort key is :func:`_fidelity_values` — the same measurement
+    :func:`match_fidelity_report` turns into 「平均 / 最差 / 差块」 — so the row on
+    top really is the best one under the name it carries.
+    """
+    indexed: list[tuple[tuple[float, ...], int, MatchResult]] = []
+    for index, result in enumerate(pool):
+        measured = _fidelity_values(result)
+        if measured is None:
+            continue
+        values, weights = measured
+        indexed.append((objective(values, weights), index, result))
+    indexed.sort(key=lambda item: (item[0], item[1]))
+    return [result for _score, _index, result in indexed]
+
+
+def _option_rolls(result: MatchResult) -> frozenset[str]:
+    """Every spool a plan spends, whichever colour it spends it on."""
+    return frozenset(spool for entry in result.palette for spool in _spool_ids(entry))
+
+
 def _offer_options(
     prepared: _Prepared,
     *,
@@ -2083,33 +2187,64 @@ def _offer_options(
 ) -> list[BudgetOption]:
     """Turn the plans every spec asks for into the rows the page shows.
 
-    Two candidates that end up printing the same rolls are the same 方案 and only
-    the first is kept, so a picture that fits inside 「耗材上限」 with room to spare
-    is offered fewer rows rather than duplicates.  A candidate that cannot obey
-    the 筛选 never reaches the list: the cap and the demanded / forbidden rolls are
-    instructions about this machine, not preferences to trade against picture
-    quality.
+    Each objective searches for itself, and then the **union** of what all three
+    found is re-ranked per objective.  Searching separately is a heuristic (the
+    budget walk is a beam, not an exhaustive enumeration), so one objective's top
+    answer can also be sitting in another objective's list — on the pig the 小色块
+    优先 rows came out at 差块 13 while a 总体最接近 row was 12, not because the
+    ranking was wrong but because that search never walked to those rolls.  With
+    the union, every objective's first row is the best of everything found.
+
+    The rows are then handed out **round by round** — the best of each objective,
+    then the second best of each, and so on — so no objective can eat the whole
+    pool and leave another one only leftovers.  Because the best answer under one
+    objective is often also the best under another (both 总体最接近 and 最不像的
+    色块优先 want the plan with the smallest worst block here), a roll set another
+    row already prints is skipped: the row under the second name is that
+    objective's best *remaining* answer, which ties the one above rather than
+    beating it, and no two rows print the same rolls.
+
+    A candidate that cannot obey the 筛选 never reaches the list: the cap and the
+    demanded / forbidden rolls are instructions about this machine, not
+    preferences to trade against picture quality.
     """
     cap = prepared.config.max_spools
     total = max(1, sum(spec[4] for spec in _PLAN_SPECS))
-    options: list[BudgetOption] = []
-    seen: set[frozenset[str]] = set()
+    pool: list[MatchResult] = []
     done = 0
     for key, title, note, objective, count in _PLAN_SPECS:
         _report(progress, f"试着搭配耗材（{title}）", 0.88 + 0.1 * done / total)
-        results = _plans(
-            prepared, cap, objective, limit=count, require=require, avoid=avoid
-        )
-        for rank, result in enumerate(results):
-            done += 1
-            rolls = frozenset(
-                spool for entry in result.palette for spool in _spool_ids(entry)
-            )
+        found = _plans(prepared, cap, objective, limit=count, require=require, avoid=avoid)
+        done += len(found)
+        for result in found:
+            rolls = _option_rolls(result)
             if require - rolls or (avoid & rolls):
                 continue  # a plan that breaks the 筛选 is not a plan
-            if rolls in seen:
-                continue  # the same rolls under two objectives: list them once
-            seen.add(rolls)
+            pool.append(result)
+    ranked = {
+        key: _ranked_plans(pool, objective)
+        for key, _title, _note, objective, _count in _PLAN_SPECS
+    }
+    cursors = {key: 0 for key, _title, _note, _objective, _count in _PLAN_SPECS}
+    picks: dict[str, list[MatchResult]] = {key: [] for key in cursors}
+    seen: set[frozenset[str]] = set()
+    for round_index in range(max(spec[4] for spec in _PLAN_SPECS)):
+        for key, title, note, _objective, count in _PLAN_SPECS:
+            if round_index >= count:
+                continue
+            rows = ranked[key]
+            while cursors[key] < len(rows):
+                candidate = rows[cursors[key]]
+                cursors[key] += 1
+                rolls = _option_rolls(candidate)
+                if rolls in seen:
+                    continue  # the same rolls under two objectives: list them once
+                picks[key].append(candidate)
+                seen.add(rolls)
+                break
+    options: list[BudgetOption] = []
+    for key, title, note, _objective, _count in _PLAN_SPECS:
+        for rank, result in enumerate(picks[key]):
             option_key, option_title = _option_title(key, title, rank)
             options.append(
                 BudgetOption(

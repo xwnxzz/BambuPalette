@@ -826,6 +826,22 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         _click_plan(0)
         check(page._plan_key == page._plans[0].key, "点回第一行就回到第一套")
 
+        # m00830 item 2: 换方案等于换一张图，上一份结果里的高亮块/描边不能留下来。
+        page._select(0)
+        app.processEvents()
+        check(page._view._selected == 0, "点一个颜色，预览才画那一块的高亮")
+        _click_plan(1)
+        check(
+            page._view._selected == -1
+            and page._list.current() == -1
+            and not page._list.selected_indices()
+            and page._view._dim_pixmap() is None,
+            "换一套方案之后，预览不再留着上一张图的高亮块和描边 "
+            f"(view={page._view._selected}, row={page._list.current()})",
+        )
+        _click_plan(0)
+        check(page._plan_key == page._plans[0].key, "再点回第一套")
+
     # 「用到的耗材」 and 「选中的颜色」 are not panels any more (1.6.13 #1/#2): the rolls
     # belong to the 方案 that spends them, and one colour's recipe is asked for by
     # double-clicking its row instead of taking a third of the column.  The lower

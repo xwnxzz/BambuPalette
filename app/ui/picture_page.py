@@ -1708,8 +1708,9 @@ class PicturePage(QWidget):
         self._refresh_plans()
         # m01885 item 7: 新的一次匹配从「什么都没选」开始。上一次的高亮指的是上一份
         # 结果里的色块，留着它等于替用户选了一种颜色；编辑（删除 / 合并 / 更换颜色 /
-        # 撤销）才继续跟着用户点过的那一块走。
-        self._list.clear_selection()
+        # 撤销）才继续跟着用户点过的那一块走。`_show_colour(-1)` 把预览的压暗和描边、
+        # 列表的选中行、右侧详情一次清干净（m00830 item 2）。
+        self._show_colour(-1)
         self._apply_edits()
         self._set_controls_enabled(True)
         self._announce_edits()
@@ -1752,7 +1753,8 @@ class PicturePage(QWidget):
             )
             numbers.setProperty("role", "hint")
             numbers.setToolTip(
-                "「差块」= 色差 ΔE00 超过 5 的颜色个数，越少越不容易一眼看出偏差。"
+                "「差块」= 图片里有几种颜色打出来偏差超过 ΔE00 5（按图片自己的颜色数算），"
+                "越少越不容易一眼看出偏差。"
             )
             line.addWidget(button)
             line.addWidget(numbers)
@@ -1900,6 +1902,10 @@ class PicturePage(QWidget):
         self._dirty = True
         self._plate = None
         self._list.setLibrary(self._library)
+        # m00830 item 2: a different 方案 is a different picture.  Keeping the old
+        # selection drew the dim wash and the outline of a colour in a picture the
+        # user had just replaced; a switch now starts from 「什么都没选」.
+        self._show_colour(-1)
         self._apply_edits()
         self._set_controls_enabled(True)
         self._announce_edits()
@@ -2277,7 +2283,9 @@ class PicturePage(QWidget):
                 "匹配完成后，这里列出这一版用到了哪几卷耗材，以及各卷占的色料比例。"
             )
             return
-        rows = []
+        # 一排（m00830 第 3 条）：以前是「共 3 卷」加一行一卷，三卷就吃掉三行；现在
+        # 卷名和占比横着排，宽了才换行，而且每一项自己不断行（nowrap）。
+        parts = []
         for use in uses:
             chip = (
                 f'<span style="background-color:{use.color_hex};">&nbsp;&nbsp;&nbsp;</span> '
@@ -2285,8 +2293,11 @@ class PicturePage(QWidget):
                 else ""
             )
             missing = "" if use.filament is not None else "（耗材库里已经没有这一卷）"
-            rows.append(f"{chip}{use.display_name}{missing} <b>{use.share:.1%}</b>")
-        self._usage.setText(f"共 {len(uses)} 卷<br>" + "<br>".join(rows))
+            parts.append(
+                f'<span style="white-space:nowrap;">{chip}{use.display_name}'
+                f"{missing} <b>{use.share:.1%}</b></span>"
+            )
+        self._usage.setText(f"共 {len(uses)} 卷：" + " · ".join(parts))
 
     def _on_delete_colours(self) -> None:
         picked = self._list.selected_indices()
