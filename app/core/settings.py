@@ -1,10 +1,10 @@
 """Persisted user preferences.
 
-Currently one thing is remembered: which mixing engine the user picked.  The
-Bambu 2.8 pigment engine is the shipped default because it reproduces what the
-user's installed Bambu Studio paints; the legacy sRGB engine and the
-Kubelka-Munk spectral engine are first-class choices, so the selection is
-remembered instead of resetting on every launch.
+Two things are remembered: which mixing engine the user picked, and how a click
+in 「预览」 chooses a colour.  The Bambu 2.8 pigment engine is the shipped default
+because it reproduces what the user's installed Bambu Studio paints; the legacy
+sRGB engine and the Kubelka-Munk spectral engine are first-class choices, so the
+selection is remembered instead of resetting on every launch.
 
 ``version`` exists because the meaning of the default moved once already: before
 build 02.08 the id ``"bambu"`` named the sRGB average and was also the shipped
@@ -27,16 +27,39 @@ __all__ = [
     "save_settings",
     "DEFAULT_SETTINGS",
     "SETTINGS_VERSION",
+    "PICK_COLOUR",
+    "PICK_EDGE",
+    "PICK_MODES",
+    "DEFAULT_PICK_MODE",
+    "resolve_pick_mode",
 ]
 
 #: Bumped whenever a stored value needs reinterpreting.
 SETTINGS_VERSION = 2
 
-DEFAULT_SETTINGS: dict = {"engine": DEFAULT_ENGINE, "version": SETTINGS_VERSION}
+#: 「点图片时」 how a click in 预览 chooses a colour: the block the pixel belongs
+#: to (「按颜色选择」), or the block whose edge is nearest to the cursor
+#: (「按色块边缘选择」, which is how a one-pixel brow can be hit at all).  The user
+#: picks between them and gets whichever they used last (m01411 item 4).
+PICK_COLOUR = "colour"
+PICK_EDGE = "edge"
+PICK_MODES = (PICK_COLOUR, PICK_EDGE)
+DEFAULT_PICK_MODE = PICK_COLOUR
+
+DEFAULT_SETTINGS: dict = {
+    "engine": DEFAULT_ENGINE,
+    "pick_mode": DEFAULT_PICK_MODE,
+    "version": SETTINGS_VERSION,
+}
 
 #: Engine ids that used to be the shipped default.  A pre-version file holding
 #: one of these is migrated to the current default rather than kept.
 _PRE_VERSION_DEFAULT_IDS = frozenset({"bambu"})
+
+
+def resolve_pick_mode(value: object) -> str:
+    """A stored pick mode, or the default when it is missing or unknown."""
+    return value if value in PICK_MODES else DEFAULT_PICK_MODE
 
 
 def settings_path() -> Path:
@@ -66,6 +89,7 @@ def load_settings() -> dict:
     if not isinstance(raw, dict):
         return values
     values["engine"] = _migrate_engine(raw.get("engine"), raw.get("version"))
+    values["pick_mode"] = resolve_pick_mode(raw.get("pick_mode"))
     return values
 
 

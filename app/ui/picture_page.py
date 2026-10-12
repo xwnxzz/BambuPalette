@@ -65,6 +65,15 @@ from ..core.image_matching import (
 )
 from ..core.library import FilamentLibrary
 from ..core.mixes import DEFAULT_ENGINE, MixCatalog
+from ..core.settings import (
+    DEFAULT_PICK_MODE,
+    PICK_COLOUR,
+    PICK_EDGE,
+    PICK_MODES,
+    load_settings,
+    resolve_pick_mode,
+    save_settings,
+)
 from ..core.project import (
     PROJECT_FILTER,
     PROJECT_SUFFIX,
@@ -119,6 +128,9 @@ PROGRESS_STEPS = 1000
 
 #: 图片页面原来那行常驻说明。1.6.14 把它整段搬进「帮助」窗口（m01885 第 6 条）：
 #: 页面上只留随图片变化的东西，要读的使用说明去帮助里读，不再压着图片。
+#: 「点图片时」两种方式的说法（取值见 ``app.core.settings``）。
+PICK_MODE_LABELS = {PICK_COLOUR: "按颜色选择", PICK_EDGE: "按色块边缘选择"}
+
 PAGE_HELP = (
     "图像转换这一步：\n"
     f"· {ZOOM_HINT}\n"
@@ -129,8 +141,39 @@ PAGE_HELP = (
     "工程里装着原图、这张预览、用到的颜色和耗材，下次「打开工程」就回到现在这一步。\n"
     "· 双击颜色列表里的一行，看这个颜色的详情（图片里的颜色、匹配到的颜色和它的配方）。\n"
     "· 「筛选耗材」先说好哪几卷必须用、哪几卷不要用，之后每套搭配都照这个来。\n"
-    "· 「按当前色块重新匹配」拿现在这些色块重新挑卷，删除、合并和手改过的颜色都留着。"
+    "· 「按当前色块重新匹配」拿现在这些色块重新挑卷，删除、合并和手改过的颜色都留着。\n"
+    f"· 点图片时默认「{PICK_MODE_LABELS[PICK_COLOUR]}」：点在哪一块就选哪一块。描边这类细线"
+    f"一条只有一两个像素宽，不好点，换成「{PICK_MODE_LABELS[PICK_EDGE]}」后会选离你点的位置"
+    "最近的那一块，点歪一点也能选中。"
 )
+
+
+#: 「按色块边缘选择」在光标周围找多远的像素。10 像素够得着描边，又不会在空白处
+#: 一点就选中半张图外的一块。
+EDGE_PICK_RADIUS = 10
+
+
+def _nearest_edge(result: MatchResult, x: int, y: int, *, fallback: int) -> int:
+    """The block with a pixel nearest to ``(x, y)``, within :data:`EDGE_PICK_RADIUS`.
+
+    ``result.indices[y, x]`` is the honest answer and stays the default; this is for
+    the strokes it cannot reach.  Inside a block the nearest pixel is the cursor's
+    own, so the answer is that block; next to a one-pixel brow the answer is the
+    brow.  ``fallback`` is used when the neighbourhood holds no block at all.
+    """
+    left = max(0, x - EDGE_PICK_RADIUS)
+    right = min(result.width, x + EDGE_PICK_RADIUS + 1)
+    top = max(0, y - EDGE_PICK_RADIUS)
+    bottom = min(result.height, y + EDGE_PICK_RADIUS + 1)
+    window = np.asarray(result.indices[top:bottom, left:right])
+    ys, xs = np.nonzero(window >= 0)
+    if not len(ys):
+        return fallback
+    # Squared pixel distance: the nearest boundary wins, ties going to the pixel
+    # first in raster order so the same click always picks the same block.
+    distances = (xs + left - x) ** 2 + (ys + top - y) ** 2
+    closest = int(np.argmin(distances))
+    return int(window[ys[closest], xs[closest]])
 
 
 def _to_qimage(image: Image.Image) -> QImage:
@@ -177,6 +220,8 @@ class PictureView(QWidget):
         self._press_pos: QPointF | None = None
         self._last_pos: QPointF | None = None
         self._dragged = False
+        #: 「按颜色选择」 or 「按色块边缘选择」 — owned by the page, saved in settings.
+        self._pick_mode = DEFAULT_PICK_MODE
 
     # -- contents ---------------------------------------------------------
     def setResult(self, result: MatchResult | None, source: QImage | None) -> None:
@@ -482,11 +527,26 @@ class PictureView(QWidget):
         y = int((position.y() - rect.y()) / self._scale)
         if not (0 <= x < result.width and 0 <= y < result.height):
             return
-        index = int(result.indices[y, x])
+        index = self._pick_index(result, x, y)
         if index < 0:
             return
         self.setSelected(index)
         self.regionClicked.emit(index)
+
+    def pickMode(self) -> str:
+        """How a click chooses a colour: the block it is on, or the nearest edge."""
+        return self._pick_mode
+
+    def setPickMode(self, mode: str) -> None:
+        """Switch between 「按颜色选择」 and 「按色块边缘选择」 (m01411 item 4)."""
+        self._pick_mode = resolve_pick_mode(mode)
+
+    def _pick_index(self, result: MatchResult, x: int, y: int) -> int:
+        """The block a click at ``(x, y)`` means in the current 「点图片时」 mode."""
+        exact = int(result.indices[y, x])
+        if self._pick_mode != PICK_EDGE:
+            return exact
+        return _nearest_edge(result, x, y, fallback=exact)
 
 
 class ColourList(QWidget):
@@ -638,7 +698,10 @@ class ColourList(QWidget):
         if row < 0:
             return
         multi = self._list.selectionMode() == QAbstractItemView.SelectionMode.MultiSelection
-        keep = self.selected_indices() if multi else []
+        # The pinned row belongs to the selection even while 「多选」 is on: revealing it
+        # used to write the old set back on top of it, which left the list claiming
+        # nothing was selected while 预览 drew that colour's block (m01411 item 3).
+        keep = set(self.selected_indices()) | {self._pinned} if multi else set()
         self._suppress = True
         self._list.setCurrentRow(row)
         self._list.scrollToItem(self._list.item(row), QAbstractItemView.ScrollHint.EnsureVisible)
@@ -660,6 +723,10 @@ class ColourList(QWidget):
             return
         item = self._list.item(row)
         item.setSelected(not item.isSelected())
+        if not item.isSelected() and self._pinned == index:
+            # 在预览里再点一次就是把这一块拿掉。它已经不在多选里了，高亮也不能
+            # 还赖在它身上（m01411 item 3：列表说没选中的东西，预览不能还画着）。
+            self._pinned = -1
         self._reveal()
 
     def select(self, indices) -> None:
@@ -935,6 +1002,14 @@ class PicturePage(QWidget):
         # question and only asks which rolls print them.  Two buttons rather than
         # one with a mode, because the user knows which question they are asking.
         self._rematch_blocks_button = QPushButton("按当前色块重新匹配")
+
+        # 「点图片时」：how a click in 预览 chooses a colour (m01411 item 4).  No
+        # tooltip — a black pop-up over the picture is the one thing this page does
+        # not do; the 帮助 window explains both modes.
+        self._pick_combo = QComboBox()
+        for mode in PICK_MODES:
+            self._pick_combo.addItem(PICK_MODE_LABELS[mode], mode)
+        self._pick_combo.currentIndexChanged.connect(self._on_pick_mode_changed)
         self._rematch_blocks_button.clicked.connect(self._on_rematch_blocks)
 
         # 打开 / 保存工程 sit next to 导入图片: all three are file actions on the
@@ -977,6 +1052,8 @@ class PicturePage(QWidget):
         top.addWidget(self._dither)
         top.addWidget(self._rematch_button)
         top.addWidget(self._rematch_blocks_button)
+        top.addWidget(QLabel("点图片时:"))
+        top.addWidget(self._pick_combo)
         top.addStretch(1)
 
         self._width_spin = QDoubleSpinBox()
@@ -1022,6 +1099,8 @@ class PicturePage(QWidget):
 
         self._view = PictureView()
         self._view.regionClicked.connect(self._on_region_clicked)
+        # Whichever mode the user used last, from the previous session.
+        self._set_pick_mode(load_settings().get("pick_mode", DEFAULT_PICK_MODE), save=False)
 
         # 原图 and 预览 sit side by side so the user can compare what they
         # imported with what the printer will actually lay down.  The original
@@ -1341,6 +1420,16 @@ class PicturePage(QWidget):
         # so Ctrl+S has to ask where this one goes.
         self._project_path = None
         self._dirty = False
+        # Nor is it the picture the match and the edits behind Ctrl+Z belonged to:
+        # undoing past an import would paint the old match over this one.
+        self._base = None
+        self._plans = []
+        self._plan_key = None
+        self._deleted = set()
+        self._merged = {}
+        self._replaced = {}
+        self._undo_stack = []
+        self._redo_stack = []
         self._on_rematch()
 
     def _on_import(self) -> None:
@@ -1688,18 +1777,23 @@ class PicturePage(QWidget):
         """Make ``options[0]`` the match on screen, with the rest listed under it.
 
         Every edit so far was made against the previous 方案 and the rolls it spent,
-        so the edit history starts over.  A hand-picked colour is not lost — it is
-        carried in as one of the blocks (「按当前色块重新匹配」 pins it) — but
-        undoing across that boundary would undo a colour that is still on screen.
+        so the edit history starts over — but the state it had is pushed onto the
+        undo stack first.  「按当前色块重新匹配」 is the one button that throws a whole
+        match away, and the reporter pressed it, disliked the answer and could not
+        get back (m01411 item 1): one Ctrl+Z now restores the match, its plans and
+        the edits that were made on it.  The hand-picked colours are still carried
+        into the new match as blocks (「按当前色块重新匹配」 pins them).
         """
+        # The very first match of a picture has nothing behind it; pushing there
+        # would arm Ctrl+Z against a page that had no match at all.
+        if self._base is not None:
+            self._push()
         self._plans = options
         self._plan_key = options[0].key
         self._base = options[0].result
         self._deleted = set()
         self._merged = {}
         self._replaced = {}
-        self._undo_stack = []
-        self._redo_stack = []
         # A new match is a new picture: whatever the project file holds is now
         # one step behind.
         self._dirty = True
@@ -1889,14 +1983,18 @@ class PicturePage(QWidget):
         self._apply_plan(option)
 
     def _apply_plan(self, option: BudgetOption) -> None:
-        """Make ``option`` the picture, dropping the edits made for the old one."""
+        """Make ``option`` the picture, dropping the edits made for the old one.
+
+        The edits are dropped — the dialog said so — but the *state* that had them
+        is pushed onto the undo stack first, so 「换错了」 costs one Ctrl+Z instead of
+        the whole session's work.
+        """
+        self._push()
         self._plan_key = option.key
         self._base = option.result
         self._deleted = set()
         self._merged = {}
         self._replaced = {}
-        self._undo_stack = []
-        self._redo_stack = []
         # A different 方案 is a different picture: the project file needs saving
         # again, and the mesh has to be rebuilt from the new colours.
         self._dirty = True
@@ -1954,15 +2052,21 @@ class PicturePage(QWidget):
             self._preview_history.append(self._shown)
         self._show_colour(index)
 
-    def _show_colour(self, index: int) -> None:
-        """Put ``index`` on screen without touching the preview history."""
+    def _show_colour(self, index: int, *, keep_picked: bool = False) -> None:
+        """Put ``index`` on screen without touching the preview history.
+
+        ``keep_picked`` is for taking the highlight off one block while a
+        multi-selection stays put: 「多选」 is a set of colours the user is about to
+        删除 or 合并, so clearing the preview must not empty that set (m01411 item 3).
+        """
         index = int(index)
         self._shown = index
         self._view.setSelected(index)
         self._original_view.setSelected(index)
         if index < 0:
             # 「取消选中」: no colour, so no block, no detail and no row highlight.
-            self._list.clear_selection()
+            if not keep_picked:
+                self._list.clear_selection()
             self._detail.clear()
             return
         self._list.pin(index)
@@ -2005,10 +2109,15 @@ class PicturePage(QWidget):
 
         With 「多选」 on it toggles the region in and out of the selection, so the
         user can pick colours by pointing at the picture instead of hunting for
-        the row in the list.
+        the row in the list.  Clicking a block that is already in the selection
+        takes it back out — and then the block must not stay highlighted (m01411
+        item 3: 列表说没选中的东西，预览不能还画着它).
         """
         if self._multi_button.isChecked():
             self._list.toggle(index)
+            if index not in self._list.selected_indices():
+                self._show_colour(-1, keep_picked=True)
+                return
         self._select(index)
 
     def _on_colour_activated(self, index: int) -> None:
@@ -2069,13 +2178,31 @@ class PicturePage(QWidget):
         return index
 
     def _snapshot(self) -> tuple:
-        return (set(self._deleted), dict(self._merged), dict(self._replaced))
+        """Everything one step of history has to put back.
+
+        The edit bookkeeping alone used to be enough, because 删除 / 合并 /
+        更换颜色 are the only acts that touch it.  「按当前色块重新匹配」 and a 方案
+        switch replace the match itself — a new ``_base``, a new list of plans, a
+        newly checked row — so those travel with the snapshot too, and Ctrl+Z after
+        a re-match lands exactly where the user was (m01411 item 1).
+        """
+        return (
+            set(self._deleted),
+            dict(self._merged),
+            dict(self._replaced),
+            self._base,
+            list(self._plans),
+            self._plan_key,
+        )
 
     def _restore(self, snapshot: tuple) -> None:
-        deleted, merged, replaced = snapshot
+        deleted, merged, replaced, base, plans, plan_key = snapshot
         self._deleted = set(deleted)
         self._merged = dict(merged)
         self._replaced = dict(replaced)
+        self._base = base
+        self._plans = list(plans)
+        self._plan_key = plan_key
 
     def _push(self) -> None:
         """Remember the state before an edit, and drop the redo history."""
@@ -2168,20 +2295,22 @@ class PicturePage(QWidget):
     def _apply_edits(self, keep: int | None = None) -> None:
         """Recompose the live result and show it everywhere.
 
-        ``keep`` is an ORIGINAL palette index to keep selected across the
-        rebuild; without it the colour that is currently selected is followed
-        through the edit, so 「更换颜色」 and 撤销 both leave the user where they
-        were instead of jumping back to the top of the list.
+        ``keep`` is the palette index the edit was about (the colour the user merged
+        into, the one they swapped); the highlight follows it so the detail panel still
+        shows what the edit produced.  If that colour is gone — the user deleted the very
+        colour they had picked — nothing is selected instead.
+
+        What must never happen is 预览 drawing a block while the list claims nothing is
+        selected: that dim wash and outline over an unclaimed colour is 「没有选择颜色的时候
+        不要显示色块」 (m00830 item 2, m01411 item 3).  ``_reveal`` keeps the list's selection
+        and the highlight in step; the callers that replace the whole match (a 方案
+        switch, 重新匹配) clear both with ``_show_colour(-1)`` before calling this.
         """
-        anchor = keep
-        if anchor is None:
-            index = self._list.current()
-            if 0 <= index < len(self._live_map):
-                anchor = self._live_map[index]
         self._result = self._compose()
         self._plate = None
         # The rows were rebuilt, so the colours the preview history pointed at no
         # longer mean what they meant; 「取消选中」 starts over from here.
+        anchor = keep if keep is not None else self._list.current()
         self._shown = -1
         self._preview_history.clear()
         result = self._result
@@ -2199,15 +2328,34 @@ class PicturePage(QWidget):
         self._list.setResult(result)
         self._refresh_base_combo()
         target = self._live_map.index(anchor) if anchor in self._live_map else -1
-        # m01885 item 7: a fresh match selects nothing.  The old code fell back to
-        # row 0 here, which drew a highlight on a colour the user never picked and
-        # made 「取消选中」 impossible to reach from a clean match.
         if 0 <= target < len(result.palette):
             self._select(target)
         else:
             self._show_colour(-1)
         self._update_actions()
         self._announce_edits()
+
+    def _on_pick_mode_changed(self, index: int) -> None:
+        mode = self._pick_combo.itemData(index)
+        self._set_pick_mode(mode if isinstance(mode, str) else DEFAULT_PICK_MODE)
+
+    def _set_pick_mode(self, mode: str, *, save: bool = True) -> None:
+        """Point the view and the combo at ``mode``, and remember the choice.
+
+        m01411 item 4: 「按颜色选择」 is what this page always did — 点在哪一块就是
+        哪一块; 「按色块边缘选择」 picks the block whose edge is nearest instead, so the
+        one-pixel brows and outlines of a picture like the reporter's pig can be hit
+        at all.  Whichever they used last is what they get next time.
+        """
+        mode = resolve_pick_mode(mode)
+        self._view.setPickMode(mode)
+        row = self._pick_combo.findData(mode)
+        if row >= 0 and row != self._pick_combo.currentIndex():
+            self._pick_combo.blockSignals(True)
+            self._pick_combo.setCurrentIndex(row)
+            self._pick_combo.blockSignals(False)
+        if save:
+            save_settings({"pick_mode": mode})
 
     def _on_multi_toggled(self, on: bool) -> None:
         """「多选」：click to add a colour, click again to drop it — no Ctrl."""
@@ -2344,6 +2492,9 @@ class PicturePage(QWidget):
         self._restore(self._undo_stack.pop())
         self._dirty = True
         self._apply_edits()
+        # The step may have been a re-match or a 方案 switch, so the rows on the
+        # right are re-drawn from the plans that came back with it.
+        self._refresh_plans()
         self._status.setText("已撤销上一步。Ctrl+Y 可以再做回来。")
 
     def _redo(self) -> None:
@@ -2353,6 +2504,7 @@ class PicturePage(QWidget):
         self._restore(self._redo_stack.pop())
         self._dirty = True
         self._apply_edits()
+        self._refresh_plans()
         self._status.setText("已恢复刚才撤销的那一步。")
 
     def _on_replace(self) -> None:

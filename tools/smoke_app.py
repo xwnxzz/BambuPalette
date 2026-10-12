@@ -2009,6 +2009,15 @@ def main() -> int:
                     page._result.printed_pixels == printed_before,
                     "merging prints every pixel the two colours covered",
                 )
+                # m01411 item 3: list and preview have to point at the same colour —
+                # the list must never say 「没选中」 while 预览 draws a block.
+                check(
+                    page._list.current() >= 0
+                    and page._view._selected == page._list.current()
+                    and page._view._dim_pixmap() is not None,
+                    "after a merge the list and the preview point at the same colour "
+                    f"(row={page._list.current()}, view={page._view._selected})",
+                )
                 page._undo()
                 app.processEvents()
                 check(
@@ -2171,9 +2180,77 @@ def main() -> int:
             page._on_delete_colours()
             app.processEvents()
             check(page._usage.text() != usage_saved, "an edit refreshes the spool list")
+            # m01411 item 3: the deleted colour was the selected one, so nothing is
+            # selected now — and the preview must not keep drawing its block.
+            check(
+                page._view._selected == -1 and page._view._dim_pixmap() is None,
+                "deleting the picked colour clears the preview highlight too "
+                f"(view={page._view._selected})",
+            )
             page._undo()
             app.processEvents()
             check(page._usage.text() == usage_saved, "undo puts the spool list back")
+
+            # --- 点图片时：按颜色选择 / 按色块边缘选择 (m01411 item 4) --------------
+            from app.core.settings import load_settings as _load_settings  # noqa: PLC0415
+
+            labels = [page._pick_combo.itemText(i) for i in range(page._pick_combo.count())]
+            check(
+                labels
+                == [
+                    _picture_page.PICK_MODE_LABELS[_picture_page.PICK_COLOUR],
+                    _picture_page.PICK_MODE_LABELS[_picture_page.PICK_EDGE],
+                ],
+                f"the toolbar offers both ways to pick a colour, got {labels}",
+            )
+            page._set_pick_mode(_picture_page.PICK_COLOUR, save=False)
+            check(page._view.pickMode() == _picture_page.PICK_COLOUR, "按颜色选择 is what it did before")
+            page._pick_combo.setCurrentIndex(1)
+            app.processEvents()
+            check(
+                page._view.pickMode() == _picture_page.PICK_EDGE,
+                f"choosing the other one reaches the preview, got {page._view.pickMode()!r}",
+            )
+            check(
+                _load_settings().get("pick_mode") == _picture_page.PICK_EDGE,
+                "the way the user picks is remembered for next time",
+            )
+            # A synthetic 5x5 match: one painted pixel at (2, 2), the rest unpainted.
+            # The sample picture has no blank area for the model to draw, so the two
+            # modes are compared where the difference is unambiguous: the cursor is on
+            # a blank pixel whose nearest painted pixel is the one to its left.
+            from dataclasses import replace as _dataclass_replace  # noqa: PLC0415
+
+            import numpy as _np  # noqa: PLC0415
+
+            lonely = _dataclass_replace(
+                page._result,
+                width=5,
+                height=5,
+                palette=[page._result.palette[0]],
+                counts=_np.asarray([1], dtype=np.int64),
+                indices=_np.full((5, 5), -1, dtype=np.int32),
+            )
+            lonely.indices[2, 2] = 0
+            page._set_pick_mode(_picture_page.PICK_COLOUR, save=False)
+            check(
+                page._view._pick_index(lonely, 2, 2) == 0,
+                "按颜色选择 reads the pixel under the cursor, and it is the block",
+            )
+            check(
+                page._view._pick_index(lonely, 3, 2) == -1,
+                "按颜色选择 answers with the pixel under the cursor, blank is blank",
+            )
+            page._set_pick_mode(_picture_page.PICK_EDGE, save=False)
+            check(
+                page._view._pick_index(lonely, 2, 2) == 0,
+                "按色块边缘选择 reads the pixel under the cursor too",
+            )
+            check(
+                page._view._pick_index(lonely, 3, 2) == 0,
+                "按色块边缘选择 still finds the block next door",
+            )
+            page._set_pick_mode(_picture_page.PICK_COLOUR, save=False)
 
             # --- the plans the cap allows (1.6.12: 「耗材方案」) -----------------
             from PySide6.QtTest import QTest as _QTest  # noqa: PLC0415
@@ -2378,6 +2455,10 @@ def main() -> int:
             page._on_delete_colours()
             app.processEvents()
             unpainted = page._result.total_pixels - page._result.printed_pixels
+            before_plans = [option.key for option in page._plans]
+            before_base = page._base
+            before_key = page._plan_key
+            before_undo = len(page._undo_stack)
             page._on_rematch_blocks()
             app.processEvents()
             check(
@@ -2386,10 +2467,34 @@ def main() -> int:
                 and page._base.total_pixels - page._base.printed_pixels == unpainted,
                 "「按当前色块重新匹配」不再自己加回删掉的色块",
             )
+            # m01411 item 2: every block still on screen has to survive the re-match —
+            # 1.6.15 answered each block with its own nearest colour, and when those
+            # colours needed more rolls than the cap allowed the surplus blocks were
+            # folded away instead (the reporter's 3 blocks came back as 1).
+            check(
+                len(page._base.palette) == keep - 1,
+                "it keeps every block that is left, none folded away "
+                f"({len(page._base.palette)} of {keep - 1})",
+            )
+            # m01411 item 1: it replaces the whole match, so it has to be one Ctrl+Z.
+            check(
+                len(page._undo_stack) == before_undo + 1,
+                f"and it is one step of history, not a dead end ({len(page._undo_stack)})",
+            )
             check(
                 all(demanded in option.spools for option in page._plans),
                 "… 也没忘了「必须有」那一卷",
             )
+            page._undo()
+            app.processEvents()
+            check(
+                page._base is before_base
+                and [option.key for option in page._plans] == before_plans
+                and page._plan_key == before_key,
+                "Ctrl+Z puts the replaced match, its plans and its ticked row back",
+            )
+            page._redo()
+            app.processEvents()
             page._require = frozenset()
             page._avoid = frozenset()
             page._update_filter_hint()

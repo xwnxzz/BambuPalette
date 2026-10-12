@@ -497,6 +497,7 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     from PySide6.QtGui import QMouseEvent as _QMouse
 
     from .core.image_matching import plan_help as _plan_help
+    from .core.settings import load_settings as _load_settings
     from .ui import picture_page as _pp
 
     def _mouse(kind, pos, *, buttons=_Qt.MouseButtons.NoButton):
@@ -1060,8 +1061,9 @@ def run_selftest(*, report_path: Path | None = None) -> int:
             and not page._replaced
             and not page._merged
             and not page._deleted
-            and not page._undo_stack
             and not page._redo_stack,
+            # 1.6.16 (m01411 item 1) makes 重新匹配/换方案 undoable, so one step stays
+            # on the undo stack on purpose — it holds the match this one replaced.
             "a fresh match keeps the automatic palette and no edits",
         )
         check(MatchSettings().merge_delta_e == 2.0, "near-identical matches merge by default")
@@ -1261,6 +1263,12 @@ def run_selftest(*, report_path: Path | None = None) -> int:
             page._list.current() == -1 and not page._list.selected_indices(),
             f"删完之后列表不自动跳到第一行（m01885 第 7 条），got {page._list.current()}",
         )
+        # m01411 item 3: 预览画着高亮，列表里就必须有一行是选中的——「多选」开着时
+        # 露出高亮那一行的老写法会把选中又抹掉，于是列表空着、预览还罩着一层。
+        check(
+            page._view._selected == -1 and page._view._dim_pixmap() is None,
+            f"删掉选中的那一块之后不再有高亮（选中 {page._view._selected}）",
+        )
         check(page._undo_button.isEnabled(), "删除 can be undone")
         page._undo()
         app.processEvents()
@@ -1279,6 +1287,63 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         page._undo()
         app.processEvents()
 
+        # m01411 item 4: 点图片时怎么算选中了哪一块。原来是「点在哪一块就是哪一块」，
+        # 现在还能选「按色块边缘选择」——取离点最近的那条边，细到一像素的眉毛才点得中。
+        check(
+            [page._pick_combo.itemText(i) for i in range(page._pick_combo.count())]
+            == [_pp.PICK_MODE_LABELS[_pp.PICK_COLOUR], _pp.PICK_MODE_LABELS[_pp.PICK_EDGE]],
+            "工具栏上能选「按颜色选择」和「按色块边缘选择」",
+        )
+        page._set_pick_mode(_pp.PICK_COLOUR, save=False)
+        check(
+            page._view.pickMode() == _pp.PICK_COLOUR,
+            "默认还是老做法：按颜色选择",
+        )
+        page._pick_combo.setCurrentIndex(1)
+        app.processEvents()
+        check(
+            page._view.pickMode() == _pp.PICK_EDGE,
+            "在下拉里换一种，预览立刻跟着换",
+        )
+        check(
+            _load_settings().get("pick_mode") == _pp.PICK_EDGE,
+            "选过的那一种会记下来，下次开程序还是它",
+        )
+        # A synthetic 5x5 match: one painted pixel at (2, 2), the rest unpainted.
+        # A real picture has no 「空白」 for the model to draw, so the two modes are
+        # compared on a shape where the difference is unambiguous: the cursor sits
+        # on a blank pixel whose nearest painted pixel is the one to the left of it.
+        from dataclasses import replace as _dataclass_replace  # noqa: PLC0415
+
+        lonely = _dataclass_replace(
+            page.result,
+            width=5,
+            height=5,
+            palette=[page.result.palette[0]],
+            counts=np.asarray([1], dtype=np.int64),
+            indices=np.full((5, 5), -1, dtype=np.int32),
+        )
+        lonely.indices[2, 2] = 0
+        page._set_pick_mode(_pp.PICK_COLOUR, save=False)
+        check(
+            page._view._pick_index(lonely, 2, 2) == 0,
+            "点在色块本身上，按颜色选择选中它",
+        )
+        check(
+            page._view._pick_index(lonely, 3, 2) == -1,
+            "按颜色选择：点在旁边的空白上什么都不选",
+        )
+        page._set_pick_mode(_pp.PICK_EDGE, save=False)
+        check(
+            page._view._pick_index(lonely, 2, 2) == 0,
+            "点在色块本身上，按色块边缘选择也选中它",
+        )
+        check(
+            page._view._pick_index(lonely, 3, 2) == 0,
+            "按色块边缘选择：点在旁边的空白上选中最近的那一块",
+        )
+        page._set_pick_mode(_pp.PICK_COLOUR, save=False)
+
         # 合并: only reachable through the dialog, so drive the non-UI half.
         if len(page.result.palette) >= 2:
             keep = page.result.palette[1].key
@@ -1296,6 +1361,15 @@ def run_selftest(*, report_path: Path | None = None) -> int:
                 page.result.printed_pixels == before_pixels,
                 "merging prints every pixel the two colours covered",
             )
+            # m01411 item 3: 合并之后活下来的那一块会被选中，而预览的高亮必须跟列表一
+            # 致——列表说选中的是它，预览画的也是它。
+            check(
+                page._list.current() >= 0
+                and page._view._selected == page._list.current()
+                and page._view._dim_pixmap() is not None,
+                "合并后列表和预览指的是同一块"
+                f"（列表 {page._list.current()}，预览 {page._view._selected}）",
+            )
             page._undo()
             app.processEvents()
             check(
@@ -1311,8 +1385,18 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         app.processEvents()
         check(bool(page._deleted), "先真的删掉一种颜色")
         unpainted = page.result.total_pixels - page.result.printed_pixels
+        # m01411 item 1: 这一次把整张匹配都换掉（新的 _base、新的方案表），所以它必须
+        # 进历史——用户按了它、不喜欢结果，Ctrl+Z 得能回到按之前。
+        before_plans = [option.key for option in page._plans]
+        before_base = page._base
+        before_key = page._plan_key
+        before_undo = len(page._undo_stack)
         page._on_rematch_blocks()
         app.processEvents()
+        check(
+            len(page._undo_stack) == before_undo + 1,
+            f"按当前色块重新匹配会记一步历史（{len(page._undo_stack)} 步）",
+        )
         check(
             bool(page._plans) and page._base is page._plans[0].result,
             f"按当前色块重新匹配给出 {len(page._plans)} 套搭配，并显示第一套",
@@ -1334,6 +1418,20 @@ def run_selftest(*, report_path: Path | None = None) -> int:
             all(option.key != "extra" for option in page._plans),
             "搭配里没有越界的「多用 1 卷」",
         )
+        page._undo()
+        app.processEvents()
+        check(
+            page._base is before_base
+            and [option.key for option in page._plans] == before_plans
+            and page._plan_key == before_key,
+            "撤销把被换掉的那张匹配、方案表和勾选的那一套一起放回去",
+        )
+        check(
+            bool(page._deleted) and len(page._undo_stack) == before_undo,
+            "撤销之后之前那一步（删掉的色块）还在，历史长度也退回去了",
+        )
+        page._redo()
+        app.processEvents()
         page._on_rematch()
         app.processEvents()
         check(
