@@ -2151,6 +2151,43 @@ def main() -> int:
             check(page._progress.isHidden(), "the bar is gone when the match ends")
             check(app.overrideCursor() is None, "no wait cursor is left over after a match")
 
+            # 按当前色块重新匹配 is the button that froze the window (m00940 第 2 条):
+            # it used to spend seconds grouping the whole three-filament pool
+            # without saying anything, so the status line sat on the search.
+            block_reports: list[tuple[str, float]] = []
+
+            def _record_block(message: str, fraction: float) -> None:
+                block_reports.append((message, fraction))
+                remember_report(message, fraction)
+
+            page._report_match = _record_block  # type: ignore[method-assign]
+            try:
+                page._on_rematch_blocks()
+                app.processEvents()
+            finally:
+                page._report_match = remember_report  # type: ignore[method-assign]
+            check(
+                len(block_reports) >= 9,
+                f"按当前色块重新匹配 reports every stage too, got {len(block_reports)}",
+            )
+            check(
+                all(
+                    later[1] >= earlier[1]
+                    for earlier, later in zip(block_reports, block_reports[1:])
+                ),
+                f"… and its progress never goes backwards: "
+                f"{[round(f, 3) for _m, f in block_reports]}",
+            )
+            check(
+                block_reports[-1][1] == 1.0,
+                f"… and it ends at 1.0, got {block_reports[-1][1]}",
+            )
+            check(
+                any(message == "给每个色块找可替换的颜色" for message, _f in block_reports),
+                "the stretch that used to be silent reports itself",
+            )
+            check(page._progress.isHidden(), "the bar is gone when the block re-match ends")
+
             # --- which rolls the picture spends (m08102 item 3) -----------------
             from PySide6.QtWidgets import QLabel as _QLabel  # noqa: PLC0415
 

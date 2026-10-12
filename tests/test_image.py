@@ -1258,5 +1258,104 @@ class RematchTests(unittest.TestCase):
             self.assertNotIn(red, option.spools)
 
 
+class _CountedTriples:
+    """A three-filament catalogue that counts the colours built out of it.
+
+    :class:`TriplePalette` keeps its tail lazy, so one of the four million
+    colours becomes a :class:`PaletteEntry` only when something asks for that
+    exact index — counting ``recipes_at`` is how the tests below watch that
+    happen without holding the pool in memory.
+    """
+
+    def __init__(self, catalog: TripleCatalog) -> None:
+        self._catalog = catalog
+        self.built = 0
+
+    @property
+    def packed(self):
+        return self._catalog.packed
+
+    def lab_table(self) -> np.ndarray:
+        return self._catalog.lab_table()
+
+    def recipes_at(self, index: int):
+        self.built += 1
+        return self._catalog.recipes_at(index)
+
+    def color_hex_at(self, index: int) -> str:
+        return self._catalog.color_hex_at(index)
+
+    def rgb_at(self, index: int) -> tuple[int, int, int]:
+        return self._catalog.rgb_at(index)
+
+
+class RematchProgressTests(unittest.TestCase):
+    """报告进度的地方 besides 完成 (m00940 第 2 条).
+
+    The reporter's 41-spool library holds four million three-filament colours.
+    「按当前色块重新匹配」 froze the window for seconds and the status line sat on
+    the search message the whole time: every colour of the pool was turned into a
+    :class:`PaletteEntry` to be grouped by the rolls it spends, although a roll
+    set here is a spool or a two-filament mix and can never name three — and
+    nothing reported while that happened.  Both halves are asserted below: the
+    tail is asked for the handful of colours the search keeps, and the stretch
+    that used to be silent reports.
+    """
+
+    def setUp(self):
+        self.library = _library()
+        self.catalog = MixCatalog(self.library.filaments, engine=ENGINE_BAMBU).build()
+        self.triples = _CountedTriples(
+            TripleCatalog(self.library.filaments, engine=ENGINE_MIXER).build()
+        )
+        self.head = build_palette(self.library, self.catalog)
+        self.palette = TriplePalette(self.head, self.triples, self.library)
+
+    def _reports(self, call) -> list[tuple[str, float]]:
+        seen: list[tuple[str, float]] = []
+        call(lambda message, fraction: seen.append((message, fraction)))
+        return seen
+
+    def test_a_rematch_does_not_group_the_three_filament_tail(self):
+        result = match_image(_quadrant_image(), self.palette, MatchSettings(max_colours=4))
+        self.assertGreater(len(self.palette), len(self.head))
+        self.triples.built = 0
+
+        options = rematch_options(result, self.palette, result.settings)
+
+        self.assertTrue(options)
+        # 「给每个色块找可替换的颜色」 keeps six candidates per block; the tail itself
+        # is never the answer to a roll set, so it must not be walked.
+        self.assertLessEqual(self.triples.built, 6 * len(result.palette))
+
+    def test_the_stretch_that_used_to_be_silent_reports(self):
+        result = match_image(_quadrant_image(), self.head, MatchSettings(max_colours=4))
+        seen = self._reports(
+            lambda report: rematch_options(result, self.head, result.settings, progress=report)
+        )
+        fractions = [fraction for _message, fraction in seen]
+
+        self.assertGreaterEqual(len(seen), 9)
+        self.assertEqual(fractions, sorted(fractions))
+        self.assertEqual(fractions[-1], 1.0)
+        self.assertTrue(any(message == "给每个色块找可替换的颜色" for message, _f in seen))
+        self.assertTrue([fraction for fraction in fractions if 0.62 <= fraction <= 0.86])
+
+    def test_a_match_reports_the_scan_and_the_exact_pass(self):
+        seen = self._reports(
+            lambda report: match_image(
+                _quadrant_image(), self.head, MatchSettings(max_colours=4), progress=report
+            )
+        )
+        fractions = [fraction for _message, fraction in seen]
+
+        self.assertEqual(fractions, sorted(fractions))
+        self.assertEqual(fractions[-1], 1.0)
+        # 0.35–0.60 walks the palette in blocks, 0.60–0.75 picks the winner with
+        # CIEDE2000: on a four-million-row pool both are seconds of work.
+        self.assertTrue([fraction for fraction in fractions if 0.35 <= fraction <= 0.60])
+        self.assertTrue([fraction for fraction in fractions if 0.60 < fraction <= 0.75])
+
+
 if __name__ == "__main__":
     unittest.main()

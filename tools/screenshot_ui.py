@@ -102,6 +102,13 @@ def main() -> int:
     _make_sample(sample)
     page = window._picture_page
     window._tabs.setCurrentIndex(1)
+    # 1.6.18: the 耗材方案 panel shows BOTH hint lines before a picture is
+    # loaded — the plan-table sentence and the usage sentence belong together,
+    # and the stretches below them keep them from being spread apart.
+    app.processEvents()
+    window.grab().save(str(OUT / "picture-fresh.png"))
+    print("wrote", OUT / "picture-fresh.png")
+
     page.loadImage(sample)
     app.processEvents()
     result = page.result

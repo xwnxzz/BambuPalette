@@ -132,6 +132,13 @@ PROGRESS_STEPS = 1000
 #: 「点图片时」两种方式的说法（取值见 ``app.core.settings``）。
 PICK_MODE_LABELS = {PICK_COLOUR: "按颜色选择", PICK_EDGE: "按色块边缘选择"}
 
+#: 耗材方案面板空着时的两句话（m00940 第 1 条）。它们是一对——上一句说方案表会有
+#: 什么，下一句说它下面的用量行会说什么——所以两句都在建面板时就写上，刚打开软件就
+#: 一起看得见；以前第二句要等第一次匹配走完 `_update_usage` 才出现，用户只会看到
+#: 上半句悬在面板中间。
+PLAN_HINT_TEXT = "匹配一张图片后，这里会列出几套耗材搭配，自己挑一套。"
+USAGE_HINT_TEXT = "匹配完成后，这里列出这一版用到了哪几卷耗材，以及各卷占的色料比例。"
+
 PAGE_HELP = (
     "图像转换这一步：\n"
     f"· {ZOOM_HINT}\n"
@@ -143,6 +150,8 @@ PAGE_HELP = (
     "· 双击颜色列表里的一行，看这个颜色的详情（图片里的颜色、匹配到的颜色和它的配方）。\n"
     "· 「筛选耗材」先说好哪几卷必须用、哪几卷不要用，之后每套搭配都照这个来。\n"
     "· 「按当前色块重新匹配」拿现在这些色块重新挑卷，删除、合并和手改过的颜色都留着。\n"
+    "· 匹配时状态栏右边有一条进度条，跟着「正在匹配：…」一路走到 100%。它要等匹配超过"
+    f" {BUSY_DELAY_MS} 毫秒才出现，几毫秒就完成的匹配不会闪一下。\n"
     f"· 点图片时默认「{PICK_MODE_LABELS[PICK_COLOUR]}」：点在哪一块就选哪一块。描边这类细线"
     f"一条只有一两个像素宽，不好点，换成「{PICK_MODE_LABELS[PICK_EDGE]}」后会选离你点的位置"
     "最近的那一块，点歪一点也能选中。\n"
@@ -1463,7 +1472,7 @@ class PicturePage(QWidget):
         self._plan_rows_layout.setSpacing(2)
         self._plan_layout.addWidget(self._plan_rows)
 
-        self._plan_hint = QLabel("")
+        self._plan_hint = QLabel(PLAN_HINT_TEXT)
         self._plan_hint.setProperty("role", "hint")
         self._plan_hint.setWordWrap(True)
         self._plan_layout.addWidget(self._plan_hint)
@@ -1472,12 +1481,18 @@ class PicturePage(QWidget):
         # question the 方案 rows disagree about — 用哪几卷 — so it sits under them,
         # for the 方案 that is picked.  It no longer scrolls on its own: the whole
         # 耗材方案 panel does (see below), because seven 方案 plus their rolls do
-        # not fit in the panel anyway.
-        self._usage = QLabel("")
+        # not fit in the panel anyway.  Its sentence is written here rather than
+        # left to the first match, so the two hints appear together (m00940 第 1 条).
+        self._usage = QLabel(USAGE_HINT_TEXT)
         self._usage.setProperty("role", "hint")
         self._usage.setTextFormat(Qt.TextFormat.RichText)
         self._usage.setWordWrap(True)
         self._plan_layout.addWidget(self._usage)
+
+        # 两句话、方案行和用量行都按内容高，多余的高度落到这块空白上（m00940 第 1
+        # 条）：没有 stretch 时 480 高的面板把多出来的高度平均分给三个子部件，每句话
+        # 在自己的槽里垂直居中，看上去像分散在三个盒子里，而不是面板开头挨着的两行。
+        self._plan_layout.addStretch(1)
         self._refresh_plans()
 
         # m01885 item 3: 「打印图片需要的颜色的窗口要能自由向上拖拽上滑」.  A panel
@@ -1530,14 +1545,16 @@ class PicturePage(QWidget):
         self._status.setProperty("role", "hint")
         self._status.setWordWrap(True)
 
-        # The progress bar lives beside the status line it is described by.  It
-        # is hidden until a match has been running for BUSY_DELAY_MS, and the
-        # step message goes into the status label rather than into the bar, so
-        # there is one text surface and nothing jumps when the bar appears.
+        # The progress bar sits at the end of the status line it belongs to
+        # (m00940 第 2 条: 「在文本『正在匹配：…』的地方添加匹配进度条」).  It is
+        # hidden until a match has been running for BUSY_DELAY_MS — a 50 ms match
+        # should not flash it — and the step message goes into the status label
+        # rather than into the bar, so there is one text surface and nothing
+        # jumps when the bar appears.
         self._progress = QProgressBar()
         self._progress.setRange(0, PROGRESS_STEPS)
         self._progress.setTextVisible(False)
-        self._progress.setFixedHeight(10)
+        self._progress.setFixedSize(260, 12)
         self._progress.setVisible(False)
         self._busy_timer = QTimer(self)
         self._busy_timer.setSingleShot(True)
@@ -1548,13 +1565,18 @@ class PicturePage(QWidget):
         # 从这里读一份给帮助窗口和自动检查用。
         self._help = PAGE_HELP
 
+        status_row = QHBoxLayout()
+        status_row.setContentsMargins(0, 0, 0, 0)
+        status_row.setSpacing(10)
+        status_row.addWidget(self._status, 1)
+        status_row.addWidget(self._progress)
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
         layout.addLayout(top)
         layout.addWidget(splitter, 1)
-        layout.addWidget(self._progress)
-        layout.addWidget(self._status)
+        layout.addLayout(status_row)
         layout.addLayout(bottom)
 
     def help_text(self) -> str:
@@ -2082,9 +2104,7 @@ class PicturePage(QWidget):
         for button in self._plan_group.buttons():
             self._plan_group.removeButton(button)
         if not self._plans:
-            self._plan_hint.setText(
-                placeholder or "匹配一张图片后，这里会列出几套耗材搭配，自己挑一套。"
-            )
+            self._plan_hint.setText(placeholder or PLAN_HINT_TEXT)
             self._plan_hint.setVisible(True)
             return
         for index, option in enumerate(self._plans):
@@ -2886,9 +2906,7 @@ class PicturePage(QWidget):
         bar = self._plan_scroll.verticalScrollBar()
         bar.setValue(bar.minimum())
         if not uses:
-            self._usage.setText(
-                "匹配完成后，这里列出这一版用到了哪几卷耗材，以及各卷占的色料比例。"
-            )
+            self._usage.setText(USAGE_HINT_TEXT)
             return
         # 一排（m00830 第 3 条）：以前是「共 3 卷」加一行一卷，三卷就吃掉三行；现在
         # 卷名和占比横着排，宽了才换行，而且每一项自己不断行（nowrap）。

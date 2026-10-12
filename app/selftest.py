@@ -453,6 +453,38 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         "both pages are present",
     )
 
+    # m00940 #1: 刚打开软件时，耗材方案面板里那两句解释文本要同时出现、而且是面板开头
+    # 挨着的两行。1.6.17 里第二句要等第一次匹配/编辑才写上去，两个 QLabel 又各自被面板
+    # 的多余高度摊到 116 px 高的槽里（文字在自己槽里垂直居中），看上去像分散在不同盒子
+    # 里、只出现了一句。
+    from .ui.picture_page import PLAN_HINT_TEXT as _PLAN_HINT_TEXT  # noqa: PLC0415
+    from .ui.picture_page import USAGE_HINT_TEXT as _USAGE_HINT_TEXT  # noqa: PLC0415
+
+    window._tabs.setCurrentIndex(1)
+    app.processEvents()
+    panel = window._picture_page._plan_box
+    fresh = window._picture_page
+    check(
+        fresh._plan_hint.text() == _PLAN_HINT_TEXT and fresh._plan_hint.isVisibleTo(panel),
+        f"刚打开时面板就写着「匹配一张图片后…」，got {fresh._plan_hint.text()!r}",
+    )
+    check(
+        fresh._usage.text() == _USAGE_HINT_TEXT and fresh._usage.isVisibleTo(panel),
+        f"… 而「匹配完成后…」同时就在旁边，got {fresh._usage.text()!r}",
+    )
+    check(
+        fresh._plan_hint.height() <= 40 and fresh._usage.height() <= 40,
+        f"两句各占自己那一行，没有被面板的多余高度摊开"
+        f"（{fresh._plan_hint.height()} px / {fresh._usage.height()} px）",
+    )
+    check(
+        0 <= fresh._usage.geometry().top() - fresh._plan_hint.geometry().bottom() <= 24,
+        f"两句是挨着的上下两行"
+        f"（{fresh._plan_hint.geometry().bottom()} → {fresh._usage.geometry().top()}）",
+    )
+    window._tabs.setCurrentIndex(0)
+    app.processEvents()
+
     # A picture with four flat fields and a gradient.
     from PIL import Image, ImageDraw
 

@@ -55,6 +55,11 @@ _INDEX_DTYPE = np.int32
 #: instead of standing still for a second and a half.
 _PROGRESS_ROWS = 4
 
+#: Same idea for 「按当前色块重新匹配」: a block may have up to
+#: :data:`_BUDGET_ROLL_LIMIT` rolls to spend, which is 253 roll sets to score it
+#: against, and the alternatives step has to say something inside that walk too.
+_PROGRESS_ROLL_SETS = 16
+
 
 def _report(progress: ProgressFn | None, message: str, fraction: float) -> None:
     if progress is not None:
@@ -428,13 +433,21 @@ def _palette_table(palette: Sequence[PaletteEntry]) -> np.ndarray:
 
 
 def _shortlist_indices(
-    table: np.ndarray, targets: np.ndarray, shortlist: int
+    table: np.ndarray,
+    targets: np.ndarray,
+    shortlist: int,
+    on_block: Callable[[int, int], None] | None = None,
 ) -> np.ndarray:
     """The ``shortlist`` rows of ``table`` closest to each row of ``targets``.
 
     Distances are Euclidean in Lab and computed in blocks: the three-filament
     pool is millions of rows, so the full ``(targets × rows)`` matrix would be
     gigabytes.
+
+    ``on_block`` is called with ``(rows_done, rows_total)`` after every block.
+    It is what keeps the bar moving across a four-million-row pool: the scan is
+    one vectorised call per block, so without this nothing is reported between
+    the start of the search and its answer (m00940 第 2 条).
     """
     count = int(table.shape[0])
     take = min(shortlist, count)
@@ -450,6 +463,8 @@ def _shortlist_indices(
         best_scores = np.concatenate(
             [best_scores, np.take_along_axis(square, picked, axis=1)], axis=1
         )
+        if on_block is not None:
+            on_block(min(start + _SEARCH_BLOCK, count), count)
     width = best_scores.shape[1]
     keep = np.argpartition(best_scores, min(shortlist, width) - 1, axis=1)[:, :shortlist]
     return np.take_along_axis(best_indices, keep, axis=1)
@@ -460,14 +475,18 @@ def _nearest_entries(
     entries: Sequence[PaletteEntry],
     table: np.ndarray | None = None,
     on_row: Callable[[int, int], None] | None = None,
+    on_scan: Callable[[int, int], None] | None = None,
 ) -> np.ndarray:
     """Index of the palette entry closest to each row of ``labs``.
 
     A Euclidean pass in Lab narrows the field, then CIEDE2000 picks the winner so
     the answer agrees with the ΔE the UI reports.
 
-    ``on_row`` is called with ``(rows_done, rows_total)`` as the exact pass
-    walks the colours — it is the only step long enough to need saying so.
+    ``on_scan`` is called with ``(rows_done, rows_total)`` as the Euclidean pass
+    walks the palette, and ``on_row`` with the same shape as the exact pass walks
+    the colours.  Two callbacks rather than one because they are two very
+    different stretches of time: the scan is one vectorised call per 65,536
+    palette rows, the exact pass one CIEDE2000 per candidate colour.
     """
     if not entries:
         return np.zeros(len(labs), dtype=np.int64)
@@ -478,7 +497,7 @@ def _nearest_entries(
         return np.zeros(len(labs), dtype=np.int64)
 
     targets = np.asarray(labs, dtype=np.float32)
-    best_indices = _shortlist_indices(table, targets, _SHORTLIST)
+    best_indices = _shortlist_indices(table, targets, _SHORTLIST, on_scan)
 
     # A three-filament pool is a superset of the two-filament one, but a wider
     # table can push a two-filament colour out of the Euclidean shortlist — and
@@ -1719,15 +1738,26 @@ def _prepare(
     _report(progress, "在耗材与混色库里寻找最接近的颜色", 0.35)
     labs = _color.lab_from_rgb(colours)
 
+    def _scan_rows(rows_done: int, rows_total: int) -> None:
+        # The Euclidean pass over a four-million-row pool: silent for seconds
+        # unless every block says something (m00940 第 2 条).
+        _report(
+            progress,
+            "在耗材与混色库里寻找最接近的颜色",
+            0.35 + 0.25 * rows_done / max(1, rows_total),
+        )
+
     def _search_rows(rows_done: int, rows_total: int) -> None:
         # The exact pass is the long one: keep the bar moving through it.
         _report(
             progress,
             "在耗材与混色库里寻找最接近的颜色",
-            0.35 + 0.35 * rows_done / max(1, rows_total),
+            0.60 + 0.15 * rows_done / max(1, rows_total),
         )
 
-    chosen = _nearest_entries(labs, palette, _palette_table(palette), _search_rows)
+    chosen = _nearest_entries(
+        labs, palette, _palette_table(palette), _search_rows, _scan_rows
+    )
 
     _report(progress, "按像素分配颜色", 0.75)
     indices = np.where(mask, chosen[classes], -1).astype(_INDEX_DTYPE)
@@ -2416,6 +2446,7 @@ def _with_alternatives(
     palette: Sequence[PaletteEntry],
     *,
     locked: frozenset[int] = frozenset(),
+    progress: ProgressFn | None = None,
 ) -> _Prepared:
     """Give every block of a re-match the other colours it could be printed with.
 
@@ -2452,32 +2483,52 @@ def _with_alternatives(
         labs = np.asarray([entry.lab for entry in prepared.kept], dtype=np.float64)
 
     #: The palette by the rolls each colour spends, so a roll set can be asked for
-    #: its best colour without walking four million triples.
+    #: its best colour without walking four million triples.  Only a spool or a
+    #: two-filament mix can answer a roll set here — every ``roll_sets`` key is one
+    #: or two rolls — so a three-filament pool is asked for its head and never for
+    #: its tail: grouping the tail was 4.3 M :class:`PaletteEntry` objects built to
+    #: look up keys nothing asks for, and it is what froze the window on a
+    #: 41-spool library (m00940 第 2 条).  ``head`` keeps the palette's own
+    #: indices, so the group values are still palette positions.
+    head = getattr(palette, "head", None)
+    rows: Sequence[PaletteEntry] = head if head is not None else palette
     table = _palette_table(palette)
     groups: dict[tuple[str, ...], list[int]] = {}
-    for index, entry in enumerate(palette):
+    for index, entry in enumerate(rows):
         groups.setdefault(tuple(sorted(_spool_ids(entry))), []).append(index)
 
     roll_sets: list[tuple[str, ...]] = [(spool,) for spool in wish]
     roll_sets += [tuple(sorted(pair)) for pair in combinations(wish, 2)]
 
+    total = max(1, len(prepared.kept))
     alternatives: list[list[PaletteEntry]] = []
     for position, entry in enumerate(prepared.kept):
         if position in locked:
             alternatives.append([entry])
+            _report(progress, "给每个色块找可替换的颜色", 0.62 + 0.24 * (position + 1) / total)
             continue
         scored: list[tuple[float, int]] = []
-        for key in roll_sets:
+        for step, key in enumerate(roll_sets):
             indices = groups.get(key)
             if not indices:
                 continue
             values = np.atleast_1d(_color.delta_e_2000(labs[position], table[indices]))
             best = int(np.argmin(values))
             scored.append((float(values[best]), int(indices[best])))
+            # A block with 22 rolls to spend has 253 roll sets to try, and a node
+            # that only spoke at the end of it would leave the bar sitting still
+            # for the whole stretch.
+            if step % _PROGRESS_ROLL_SETS == _PROGRESS_ROLL_SETS - 1:
+                _report(
+                    progress,
+                    "给每个色块找可替换的颜色",
+                    0.62 + 0.24 * (position + (step + 1) / len(roll_sets)) / total,
+                )
         scored.sort(key=lambda item: item[0])
         near = [palette[index] for _value, index in scored[:_REMATCH_SHORTLIST]]
         rest = [candidate for candidate in near if candidate.key != entry.key]
         alternatives.append([entry, *rest])
+        _report(progress, "给每个色块找可替换的颜色", 0.62 + 0.24 * (position + 1) / total)
     return replace(prepared, alternatives=alternatives)
 
 
@@ -2516,17 +2567,26 @@ def rematch_options(
         [result.region_colour(index) for index in range(len(result.palette))],
         dtype=np.uint8,
     )
-    _report(progress, "读取当前色块", 0.10)
+    _report(progress, "读取当前色块", 0.08)
     labs = _color.lab_from_rgb(targets)
+
+    def _scan_rows(rows_done: int, rows_total: int) -> None:
+        _report(
+            progress,
+            "在耗材与混色库里寻找最接近的颜色",
+            0.10 + 0.30 * rows_done / max(1, rows_total),
+        )
 
     def _search_rows(rows_done: int, rows_total: int) -> None:
         _report(
             progress,
             "在耗材与混色库里寻找最接近的颜色",
-            0.20 + 0.60 * rows_done / max(1, rows_total),
+            0.40 + 0.15 * rows_done / max(1, rows_total),
         )
 
-    chosen = _nearest_entries(labs, palette, _palette_table(palette), _search_rows)
+    chosen = _nearest_entries(
+        labs, palette, _palette_table(palette), _search_rows, _scan_rows
+    )
     entries = [
         choices.get(index, palette[int(chosen[index])])
         for index in range(len(result.palette))
@@ -2549,10 +2609,10 @@ def rematch_options(
         if entry.key in pinned_keys
     )
     if wanted:
-        _report(progress, "换成「必须包含」的耗材", 0.86)
+        _report(progress, "换成「必须包含」的耗材", 0.58)
         prepared = _with_required(prepared, wanted, palette, pinned=held)
     if banned:
-        _report(progress, "换掉「不要用」的耗材", 0.87)
+        _report(progress, "换掉「不要用」的耗材", 0.60)
         prepared = _without_banned(prepared, banned, palette, pinned=held)
-    prepared = _with_alternatives(prepared, palette, locked=held)
+    prepared = _with_alternatives(prepared, palette, locked=held, progress=progress)
     return _offer_options(prepared, require=wanted, avoid=banned, progress=progress)
