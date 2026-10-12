@@ -108,7 +108,12 @@ EXCLUDES = [
     "PySide6.QtSpatialAudio",
     "PySide6.QtSql",
     "PySide6.QtStateMachine",
-    "PySide6.QtTest",
+    # QtTest is *not* excluded: 自检 (``--selftest``) clicks real widgets with
+    # ``QTest.mouseClick`` to prove a click reaches the code it is meant to.
+    # It used to sit in this list, and the 1.6.12 bundle's selftest died with
+    # "No module named 'PySide6.QtTest'" — the app itself never imports it, so
+    # only ``tools/verify_release_exe.py`` (which runs the packaged exe) caught
+    # it. Keep that gate in the release checklist.
     "PySide6.QtTextToSpeech",
     "PySide6.QtWebChannel",
     "PySide6.QtWebEngineCore",

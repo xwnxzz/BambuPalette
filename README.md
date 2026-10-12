@@ -252,7 +252,12 @@ uv pip install --python .venv\Scripts\python.exe -r requirements.txt
 ```powershell
 uv pip install --python .venv\Scripts\python.exe pyinstaller
 .\.venv\Scripts\python.exe -m PyInstaller --noconfirm --clean build\BambuPalette.spec
+.\.venv\Scripts\python.exe tools\package_release.py      # 打成 dist\BambuPalette-<版本>-win64.zip
+.\.venv\Scripts\python.exe tools\verify_release_exe.py   # 解包并跑那个 exe 的 --selftest
 ```
+
+发版前最后一步跑的是**要发出去的那个 exe**，不是源码：源码里全绿不代表打包版能跑（1.6.12 就遇到过
+一次——spec 的 `EXCLUDES` 里排掉了自检要用的 `PySide6.QtTest`，只有冻结版才会发现）。
 
 ---
 
