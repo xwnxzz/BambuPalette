@@ -79,6 +79,26 @@ class _StubChooser:
         return (str(self._target), "")
 
 
+class _StubDialog:
+    """Stands in for the block dialogs (``MergeDialog`` / ``ColourPickerDialog``).
+
+    Both are *called* to build a dialog and then ``exec()``-ed, so the picture page
+    asks for the chosen row (``int``) or the chosen entry (``PaletteEntry``).
+    """
+
+    def __init__(self, choice: int, chosen=None) -> None:
+        self._choice = choice
+        self._chosen = chosen
+
+    def exec(self):  # noqa: D102
+        from PySide6.QtWidgets import QDialog  # noqa: PLC0415
+
+        return QDialog.DialogCode.Accepted
+
+    def chosen(self):  # noqa: D102
+        return self._chosen if self._chosen is not None else self._choice
+
+
 class _StubButton:
     """A stand-in for a QMessageBox button: identity is what the code compares."""
 
@@ -1942,7 +1962,7 @@ def main() -> int:
                 if isinstance(edit_row.itemAt(position).widget(), _QPushButton)
             ]
             check(
-                labels == ["多选", "删除", "合并", "更换颜色", "撤销", "恢复"],
+                labels == ["多选", "删除 (Del)", "合并", "更换颜色", "撤销", "恢复"],
                 f"the edit row reads 多选 删除 合并 更换颜色 撤销 恢复, got {labels}",
             )
 
@@ -2294,8 +2314,143 @@ def main() -> int:
             )
             page._set_pick_mode(_picture_page.PICK_COLOUR, save=False)
 
-            # --- the plans the cap allows (1.6.12: 「耗材方案」) -----------------
+            # --- 1.6.19 (m01566): Del is the 删除 button, and 删除/合并 edit 原图 ----
+            from PySide6.QtCore import QEvent as _QEvent  # noqa: PLC0415
+            from PySide6.QtGui import QKeyEvent as _QKeyEvent  # noqa: PLC0415
             from PySide6.QtTest import QTest as _QTest  # noqa: PLC0415
+
+            check(
+                "Del" in page._delete_button.text(),
+                f"the 删除 button names the shortcut, got {page._delete_button.text()!r}",
+            )
+            page._set_pick_mode(_picture_page.PICK_EDGE, save=False)
+            app.processEvents()
+            blocks = page._blocks
+            if blocks is not None and blocks.count:
+                whole = blocks.mask(blocks.order()[0])
+                page._list.clear_selection()
+                page._on_region_clicked(blocks.order()[0])
+                app.processEvents()
+                before_del = page._result.printed_pixels
+                page._list.setFocus()
+                app.processEvents()
+                check(not page._typing_in_field(), "with the list focused Del belongs to 删除")
+                # The focus itself is checked in the selftest (this offscreen window is
+                # never active, so ``focusWidget()`` here is not the spin box); what
+                # matters is that a Del typed into a number box never deletes a block,
+                # so hand the page the same guard the field would raise.
+                typing = page._typing_in_field
+                page._typing_in_field = lambda: True
+                try:
+                    app.sendEvent(
+                        page,
+                        _QKeyEvent(
+                            _QEvent.Type.KeyPress,
+                            Qt.Key.Key_Delete,
+                            Qt.KeyboardModifier.NoModifier,
+                        ),
+                    )
+                    app.processEvents()
+                finally:
+                    page._typing_in_field = typing
+                check(
+                    page._result.printed_pixels == before_del,
+                    "typing Del in a number box does not delete a block",
+                )
+                page._list.setFocus()
+                app.processEvents()
+                _QTest.keyClick(page._list._list, Qt.Key.Key_Delete)
+                app.processEvents()
+                check(
+                    page._result.printed_pixels == before_del - int(whole.sum()),
+                    f"Del deletes what the button deletes, got "
+                    f"{before_del - page._result.printed_pixels} of {int(whole.sum())} pixels",
+                )
+                check(page._original_edited, "a delete edits 原图 itself")
+                check(
+                    page._original_badge is not None and page._original_badge.isVisible(),
+                    "原图 wears the 原图已修改 badge",
+                )
+                grid = _picture_page._to_image_grid(
+                    _np.asarray(whole, dtype=bool), page._image.size
+                )
+                check(
+                    int(_np.asarray(page._image.convert("RGBA"))[..., 3][grid].max()) == 0,
+                    "the deleted pixels are transparent in 原图",
+                )
+                check(
+                    page._original_means(page._result) is not None,
+                    "the edited 原图 can still measure every block's own colour",
+                )
+                page._undo()
+                app.processEvents()
+                check(
+                    not page._original_edited and not page._original_badge.isVisible(),
+                    "Ctrl+Z puts 原图 back too, badge and all",
+                )
+                # The list is not the only door: a Del the page itself receives means
+                # 删除 as well (the list can lose the focus to the picture).
+                page._list.clear_selection()
+                page._on_region_clicked(blocks.order()[0])
+                app.processEvents()
+                again = page._result.printed_pixels
+                app.sendEvent(
+                    page,
+                    _QKeyEvent(
+                        _QEvent.Type.KeyPress,
+                        Qt.Key.Key_Delete,
+                        Qt.KeyboardModifier.NoModifier,
+                    ),
+                )
+                app.processEvents()
+                check(
+                    page._result.printed_pixels < again and page._original_edited,
+                    "a Del delivered to the page itself still means 删除",
+                )
+                page._undo()
+                app.processEvents()
+            page._set_pick_mode(_picture_page.PICK_COLOUR, save=False)
+            app.processEvents()
+            # m02039: 原图 only follows 色块, never 颜色 — a colour-level delete leaves
+            # the picture itself untouched.
+            page._list.select([0])
+            colour_image = page._image.tobytes()
+            page._on_delete_colours()
+            app.processEvents()
+            check(
+                page._image.tobytes() == colour_image
+                and not page._original_edited
+                and not page._original_badge.isVisible(),
+                "deleting a colour leaves 原图 alone",
+            )
+            page._undo()
+            app.processEvents()
+            page._list.select([0])
+            wanted = next(
+                (
+                    entry
+                    for entry in page._candidate_palette()
+                    if entry.key != page._result.palette[0].key
+                ),
+                None,
+            )
+            if wanted is not None:
+                picture_before = page._image.tobytes()
+                real_picker = _picture_page.ColourPickerDialog
+                _picture_page.ColourPickerDialog = lambda *args, **kwargs: _StubDialog(0, wanted)
+                try:
+                    page._on_replace()
+                    app.processEvents()
+                finally:
+                    _picture_page.ColourPickerDialog = real_picker
+                check(
+                    page._image.tobytes() == picture_before,
+                    "「更换颜色」 leaves 原图 alone",
+                )
+                page._undo()
+                app.processEvents()
+
+            # --- the plans the cap allows (1.6.12: 「耗材方案」) -----------------
 
             # This picture is flat enough to print exactly with four rolls, and
             # then every recipe agrees, so only one plan is worth offering.
@@ -2542,6 +2697,8 @@ def main() -> int:
             page._update_filter_hint()
             page._on_rematch()
             app.processEvents()
+            # m02039: 按颜色删除 leaves 原图 alone, so a plain 重新匹配 starts from the
+            # untouched picture and the deleted colour is back.
             check(
                 len(page._result.palette) == keep and not page._deleted,
                 "「重新匹配」从图片重来，删掉的颜色回来了",

@@ -83,6 +83,9 @@ class ProjectState:
     image: Image.Image
     image_name: str
     base: MatchResult
+    #: 「原图」被删除/合并改过了（1.6.19, m01566 item 2）。 存的是改过之后的那张图，
+    #: 这个标记只负责让页面照旧显示「原图已修改」。 旧工程没有这一项，默认 False。
+    original_edited: bool = False
     deleted: set[int] = field(default_factory=set)
     merged: dict[int, int] = field(default_factory=dict)
     replaced: dict[int, PaletteEntry] = field(default_factory=dict)
@@ -339,6 +342,7 @@ def save_project(
     preview: Image.Image | None = None,
     plan: str = "",
     block_paints=(),
+    original_edited: bool = False,
 ) -> Path:
     """Write one ``.bpproj`` file.  Returns the path actually written."""
     target = Path(path)
@@ -360,6 +364,8 @@ def save_project(
             "file": _SOURCE,
             "width": int(image.width),
             "height": int(image.height),
+            # 存进去的 ``_SOURCE`` 就是删除/合并改过的那张原图（1.6.19）。
+            "original_edited": bool(original_edited),
         },
         "preview": {"file": _PREVIEW},
         "settings": {key: getattr(base.settings, key) for key in _SETTING_KEYS},
@@ -508,6 +514,7 @@ def load_project(
     return ProjectState(
         image=image,
         image_name=str((document.get("image") or {}).get("name") or "混色底板"),
+        original_edited=bool((document.get("image") or {}).get("original_edited", False)),
         base=base,
         deleted={int(value) for value in (edits.get("deleted") or ())},
         merged={int(key): int(value) for key, value in dict(edits.get("merged") or {}).items()},

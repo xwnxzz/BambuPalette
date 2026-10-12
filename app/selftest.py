@@ -1508,6 +1508,136 @@ def run_selftest(*, report_path: Path | None = None) -> int:
             "回到颜色模式：列表又是一行一种颜色",
         )
 
+        # 1.6.19 (m01566 item 1)：Del 就是点「删除」。事件直接派给页面／列表，焦点在
+        # 输入框里时两边都必须放手——那个 Del 是在删字符。
+        import numpy as _np  # noqa: PLC0415
+        from PySide6.QtCore import QEvent as _QEvent2  # noqa: PLC0415
+        from PySide6.QtGui import QKeyEvent as _QKeyEvent  # noqa: PLC0415
+
+        def _del() -> None:
+            app.sendEvent(
+                page._list._list,
+                _QKeyEvent(
+                    _QEvent2.Type.KeyPress,
+                    _Qt.Key.Key_Delete,
+                    _Qt.KeyboardModifier.NoModifier,
+                ),
+            )
+            app.processEvents()
+
+        page._set_pick_mode(_pp.PICK_EDGE, save=False)
+        app.processEvents()
+        blocks = page._blocks
+        if blocks is not None and blocks.count:
+            whole = blocks.mask(blocks.order()[0])
+            grid = _pp._to_image_grid(_np.asarray(whole, dtype=bool), page._image.size)
+            page._list.clear_selection()
+            page._on_region_clicked(blocks.order()[0])
+            app.processEvents()
+            before_del = page.result.printed_pixels
+            page._list.setFocus()
+            app.processEvents()
+            check(not page._typing_in_field(), "焦点不在输入框里：Del 归「删除」")
+            # 焦点在数字框里时，Del 属于那个框，页面不能抢。
+            page._colour_count.setFocus()
+            app.processEvents()
+            check(page._typing_in_field(), "焦点在数字框里：Del 归输入框")
+            app.sendEvent(
+                page,
+                _QKeyEvent(
+                    _QEvent2.Type.KeyPress,
+                    _Qt.Key.Key_Delete,
+                    _Qt.KeyboardModifier.NoModifier,
+                ),
+            )
+            app.processEvents()
+            check(
+                page.result.printed_pixels == before_del and not page._block_edits,
+                "在输入框里按 Del 不会删掉色块",
+            )
+            page._list.setFocus()
+            app.processEvents()
+            _del()
+            check(
+                page.result.printed_pixels == before_del - int(whole.sum()),
+                f"按 Del 和点「删除」一样（少了 {int(whole.sum())} 像素）",
+            )
+            # 1.6.19 (m01566 item 2)：删除同时改「原图」本身，并挂出「原图已修改」。
+            check(page._original_edited, "删除把原图一起改了")
+            check(
+                page._original_badge is not None and page._original_badge.isVisible(),
+                "原图标题边上出现「原图已修改」",
+            )
+            del_alpha = _np.asarray(page._image.convert("RGBA"))[..., 3][grid]
+            check(
+                int(del_alpha.max()) == 0,
+                f"删掉的那些像素在原图里真的透明了（最大不透明度 {int(del_alpha.max())}）",
+            )
+            check(
+                page._original_means(page.result) is not None,
+                "改过的原图能量出每个色块自己的颜色",
+            )
+            page._undo()
+            app.processEvents()
+            check(
+                not page._original_edited
+                and not page._original_badge.isVisible()
+                and int(
+                    _np.asarray(page._image.convert("RGBA"))[..., 3][grid].min()
+                )
+                == 255,
+                "Ctrl+Z 把原图也退回去：像素重新不透明、标记消失",
+            )
+        page._set_pick_mode(_pp.PICK_COLOUR, save=False)
+        app.processEvents()
+
+        # m02039：原图只因为「色块」变，不因为「颜色」变 —— 按颜色删除／合并只决定
+        # 这些颜色打不打印，图还是原来那张。
+        if len(page.result.palette) >= 1:
+            page._list.select([0])
+            before_colour_image = page._image.tobytes()
+            page._on_delete_colours()
+            app.processEvents()
+            check(
+                page._image.tobytes() == before_colour_image
+                and not page._original_edited
+                and not page._original_badge.isVisible(),
+                "按颜色删除不改原图，也不挂「原图已修改」",
+            )
+            check(
+                page._original_means(page.result) is not None,
+                "没改过的原图照样能量出每块自己的颜色",
+            )
+            page._undo()
+            app.processEvents()
+
+        # 1.6.19：「更换颜色」只决定这块地方打印成什么颜色，原图一个像素都不动。
+        if len(page.result.palette) >= 1:
+            page._list.select([0])
+            wanted = next(
+                (
+                    entry
+                    for entry in page._candidate_palette()
+                    if entry.key != page.result.palette[0].key
+                ),
+                None,
+            )
+            if wanted is not None:
+                before_image = page._image.tobytes()
+                real_picker = _pp.ColourPickerDialog
+                _pp.ColourPickerDialog = lambda *args, **kwargs: _StubDialog(0, wanted)
+                try:
+                    page._on_replace()
+                    app.processEvents()
+                finally:
+                    _pp.ColourPickerDialog = real_picker
+                check(
+                    page._image.tobytes() == before_image,
+                    "「更换颜色」一个像素都不改原图",
+                )
+                page._undo()
+                app.processEvents()
+
         # 合并: only reachable through the dialog, so drive the non-UI half.
         if len(page.result.palette) >= 2:
             keep = page.result.palette[1].key
@@ -1598,6 +1728,7 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         app.processEvents()
         page._on_rematch()
         app.processEvents()
+        # m02039：按颜色删除不改原图，所以「重新匹配」从图片重来一遍，颜色当然回来。
         check(
             len(page.result.palette) == keep_count and not page._deleted,
             "「重新匹配」从图片重来一遍，删掉的颜色回来了",

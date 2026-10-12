@@ -187,6 +187,48 @@ class ProjectRoundTripTests(unittest.TestCase):
                 target.writestr(name, payload)
         self.assertEqual(load_project(older, library=library).plan, "")
 
+    def test_the_edited_picture_and_its_badge_survive_the_round_trip(self):
+        # 1.6.19 (m01566 的答复): 删除/合并 改的是原图本身，文件里存的就是改过的那张；
+        # original_edited 只回答「标题旁边要不要写『原图已修改』」。
+        library = _library()
+        picture = _picture()
+        picture.putpixel((3, 3), (10, 20, 30, 255))
+        written = save_project(
+            self._dir / "edited",
+            image=picture,
+            image_name="改过的图",
+            base=_base_match(library),
+            library=library,
+            original_edited=True,
+        )
+        state = load_project(written, library=library)
+        self.assertTrue(state.original_edited)
+        self.assertEqual(state.image.getpixel((3, 3))[:3], (10, 20, 30))
+        self.assertEqual(state.image.getpixel((0, 0))[3], 0)
+
+        plain = save_project(
+            self._dir / "plain",
+            image=_picture(),
+            image_name="没改过",
+            base=_base_match(library),
+            library=library,
+        )
+        self.assertFalse(load_project(plain, library=library).original_edited)
+
+        # 1.6.18 及更早的工程没有这个键：读成「没改过」，而不是拒绝整个文件。
+        older = self._dir / "older-picture.bpproj"
+        with zipfile.ZipFile(written) as source, zipfile.ZipFile(
+            older, "w", zipfile.ZIP_DEFLATED
+        ) as target:
+            for name in source.namelist():
+                payload = source.read(name)
+                if name == "工程.json":
+                    document = json.loads(payload.decode("utf-8"))
+                    document["image"].pop("original_edited")
+                    payload = json.dumps(document, ensure_ascii=False).encode("utf-8")
+                target.writestr(name, payload)
+        self.assertFalse(load_project(older, library=library).original_edited)
+
     def test_mixed_recipes_come_back_with_their_percentages(self):
         library = _library()
         base = _base_match(library)

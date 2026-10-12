@@ -24,6 +24,7 @@ from PySide6.QtCore import QEvent, QEventLoop, QPointF, QRectF, Qt, QTimer, Sign
 from PySide6.QtGui import QColor, QImage, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QAbstractSpinBox,
     QApplication,
     QButtonGroup,
     QCheckBox,
@@ -35,9 +36,11 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMessageBox,
+    QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QRadioButton,
@@ -45,6 +48,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QSplitter,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -150,6 +154,12 @@ PAGE_HELP = (
     "· 双击颜色列表里的一行，看这个颜色的详情（图片里的颜色、匹配到的颜色和它的配方）。\n"
     "· 「筛选耗材」先说好哪几卷必须用、哪几卷不要用，之后每套搭配都照这个来。\n"
     "· 「按当前色块重新匹配」拿现在这些色块重新挑卷，删除、合并和手改过的颜色都留着。\n"
+    "· 「删除」也可以按键盘上的 Del：选中一种颜色或者一块之后按 Del，和点按钮一样。\n"
+    "· 在「按色块边缘选择」下删除或合并，会同时改「原图」本身——删掉的那块在原图里变透明、"
+    "并掉的那几块在原图里刷成选中的颜色，所以「重新匹配」和「按当前色块重新匹配」都从改过的"
+    "原图出发，删掉的地方不会又被匹配回来。原图被改过之后，它上方的标题旁边会出现「原图已修"
+    "改」。按颜色删除或合并只决定「这些颜色不打印／都用同一种颜色打印」，原图不动；「更换颜"
+    "色」也从来不动原图。Ctrl+Z 会把原图一起退回去。\n"
     "· 匹配时状态栏右边有一条进度条，跟着「正在匹配：…」一路走到 100%。它要等匹配超过"
     f" {BUSY_DELAY_MS} 毫秒才出现，几毫秒就完成的匹配不会闪一下。\n"
     f"· 点图片时默认「{PICK_MODE_LABELS[PICK_COLOUR]}」：点在哪一块就选哪一块。描边这类细线"
@@ -232,6 +242,55 @@ def _live_means(
     weights = np.bincount(slots, minlength=count).astype(np.float64)
     weights[weights == 0] = 1.0
     return (sums.reshape(count, 3) / weights[:, None]).astype(base_means.dtype)
+
+
+def _to_image_grid(array: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+    """最近的邻放大：把匹配网格上的图放回原图尺寸（``size`` 是 ``(宽, 高)``）。
+
+    匹配先把原图缩到最长边 ``max_dimension`` 再分色块，所以 ``_base.indices`` 和每个
+    ``BlockPaint.mask`` 都长在那张小网格上（1875×1188 的样例配 512 的网格会长成
+    324×512），而原图本身一直是原始分辨率。要改原图的像素，得先把蒙版／标签放回去。
+    """
+    width, height = int(size[0]), int(size[1])
+    source_height, source_width = array.shape
+    if (source_width, source_height) == (width, height):
+        return array
+    rows = np.minimum(
+        (np.arange(height) * source_height) // height, source_height - 1
+    )
+    cols = np.minimum(
+        (np.arange(width) * source_width) // width, source_width - 1
+    )
+    return array[rows][:, cols]
+
+
+def _pixel_means(pixels: np.ndarray, indices: np.ndarray, count: int) -> np.ndarray:
+    """每种 live 颜色在 ``pixels`` 上的平均色，按 ``indices`` 分组，洞（``-1``）不算。
+
+    匹配时量下的 ``MatchResult.means`` 是「那张图」的本色。1.6.19 起 删除/合并 会改
+    原图本身（m01566 的答复），所以「这一块本来是什么颜色」得从当前原图重新量，
+    否则「按当前色块重新匹配」会把用户刚删掉的颜色又匹配回来。
+    """
+    flat = np.asarray(indices).ravel()
+    values = np.asarray(pixels).reshape(-1, 3).astype(np.int64)
+    means = np.zeros((count, 3), dtype=np.uint8)
+    if flat.shape[0] != values.shape[0]:
+        return means
+    keep = flat >= 0
+    if not keep.any():
+        return means
+    slots = flat[keep].astype(np.int64)
+    weights = np.bincount(slots, minlength=count)[:count].astype(np.float64)
+    sums = np.stack(
+        [
+            np.bincount(slots, weights=values[keep, channel], minlength=count)[:count]
+            for channel in range(3)
+        ],
+        axis=1,
+    )
+    live = weights > 0
+    means[live] = np.rint(sums[live] / weights[live, None]).astype(np.uint8)
+    return means
 
 
 @dataclass(frozen=True)
@@ -706,6 +765,10 @@ class ColourList(QWidget):
     colourDeselected = Signal(int)
     #: The SET of selected rows changed — the page re-reads ``selected_indices``.
     selectionChanged = Signal()
+    #: Del was pressed on the list: the page does exactly what 「删除」 does
+    #: (m01566 item 1).  The key is NOT bound as a window-wide shortcut, because
+    #: that would swallow Del inside the hex and number fields.
+    deletePressed = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -743,6 +806,10 @@ class ColourList(QWidget):
         # longer recognisable.  The event filter notes what was on screen BEFORE
         # Qt touches anything.
         self._list.viewport().installEventFilter(self)
+        # Del has to work while the list owns the focus, and ``QListWidget``
+        # swallows keys the viewport filter never sees — so the list itself is
+        # watched too (m01566 item 1).
+        self._list.installEventFilter(self)
         self._list.itemClicked.connect(self._on_row_clicked)
 
         self._summary = QLabel("")
@@ -1080,6 +1147,12 @@ class ColourList(QWidget):
         emits ``pressed``/``clicked`` afterwards; a filter on the viewport runs
         before both, which is the only place the previous state is still intact.
         """
+        if watched is self._list and event.type() == QEvent.Type.KeyPress:
+            # Del on the list means 「删除」 (m01566 item 1).  A list is not a text
+            # field, so nothing here is taken away from the user's typing.
+            if event.key() == Qt.Key.Key_Delete:
+                self.deletePressed.emit()
+                return True
         if watched is self._list.viewport() and event.type() == QEvent.Type.MouseButtonPress:
             position = event.position().toPoint()
             row = self._list.row(self._list.itemAt(position))
@@ -1175,6 +1248,13 @@ class PicturePage(QWidget):
         self._image: Image.Image | None = None
         self._image_name: str = "混色底板"
         self._source_qimage: QImage | None = None
+        #: True once 删除/合并 have changed the picture itself (1.6.19, m01566 item 2:
+        #: 「预览的色块删除合并之后，原图也一并修改…原图修改后，标注原图已修改」).
+        #: 「更换颜色」 never sets it — the user was explicit that a colour swap is a
+        #: print decision and must leave the original alone.
+        self._original_edited: bool = False
+        #: The 「原图已修改」 badge in the 原图 panel header (built by ``_wrap``).
+        self._original_badge: QLabel | None = None
         #: The ``.bpproj`` this picture came from, or the one it was last saved
         #: to.  Ctrl+S overwrites it without asking; ``None`` means the next save
         #: has to ask where to put the file.
@@ -1362,6 +1442,8 @@ class PicturePage(QWidget):
         self._list.selectionChanged.connect(self._update_actions)
         # 块模式下「多选」是一组色块，预览要画的是这一组的并集，不只是光标那一行。
         self._list.selectionChanged.connect(self._sync_block_highlight)
+        # Del 等于点「删除」(m01566 item 1)。
+        self._list.deletePressed.connect(self._on_delete_colours)
 
         # 「删除 / 合并 / 更换颜色 / 撤销 / 恢复」 sit in ONE row right under the
         # colour list, in that order: the first three all act on the selection
@@ -1371,7 +1453,10 @@ class PicturePage(QWidget):
         # raised covered the very picture the user was working on.  What each
         # button does is said in the bottom line the moment it matters (a delete
         # announces that those pixels are left blank, and so on).
-        self._delete_button = QPushButton("删除")
+        # The key is written on the button because it is the only place that can
+        # say it: a tooltip would cover the picture (see above), and a keyboard
+        # shortcut nobody can see is a shortcut nobody uses (m01566 item 1).
+        self._delete_button = QPushButton("删除 (Del)")
         self._delete_button.clicked.connect(self._on_delete_colours)
 
         self._merge_button = QPushButton("合并")
@@ -1527,7 +1612,7 @@ class PicturePage(QWidget):
         # (which covered the picture the user was looking at).
         original_area = _scrollable(self._original_view)
         preview_area = _scrollable(self._view)
-        pictures.addWidget(self._wrap(original_area, "原图"))
+        pictures.addWidget(self._wrap(original_area, "原图", badge="原图已修改"))
         pictures.addWidget(self._wrap(preview_area, "预览"))
         # 预览 is the one the user works in, so it gets the extra room.
         pictures.setStretchFactor(0, 1)
@@ -1583,15 +1668,27 @@ class PicturePage(QWidget):
         """这一页怎么用，「帮助」窗口里的头一节（m01885 第 6 条）。"""
         return self._help
 
-    def _wrap(self, widget: QWidget, title: str) -> QWidget:
+    def _wrap(self, widget: QWidget, title: str, badge: str | None = None) -> QWidget:
         frame = QFrame()
         frame.setObjectName("panel")
         header = QLabel(title)
         header.setProperty("role", "sectionTitle")
+        head = QHBoxLayout()
+        head.setContentsMargins(0, 0, 0, 0)
+        head.setSpacing(8)
+        head.addWidget(header)
+        if badge is not None:
+            # 「原图已修改」 sits next to the 原图 title and only shows once the picture
+            # itself has been changed by 删除/合并 (1.6.19, m01566 item 2).
+            self._original_badge = QLabel(badge)
+            self._original_badge.setProperty("role", "hint")
+            self._original_badge.setVisible(False)
+            head.addWidget(self._original_badge)
+        head.addStretch(1)
         box = QVBoxLayout(frame)
         box.setContentsMargins(10, 8, 10, 10)
         box.setSpacing(8)
-        box.addWidget(header)
+        box.addLayout(head)
         box.addWidget(widget, 1)
         return frame
 
@@ -1675,7 +1772,9 @@ class PicturePage(QWidget):
         else:
             image = source
         self._image = image.convert("RGBA")
-        self._source_qimage = _to_qimage(self._image)
+        # A freshly imported picture has not been edited yet (1.6.19).
+        self._original_edited = False
+        self._refresh_source()
         # A freshly imported picture is not the project that was open before it,
         # so Ctrl+S has to ask where this one goes.
         self._project_path = None
@@ -1692,6 +1791,46 @@ class PicturePage(QWidget):
         self._undo_stack = []
         self._redo_stack = []
         self._on_rematch()
+
+    def _refresh_source(self) -> None:
+        """Re-draw 原图/预览's backdrop from ``self._image`` and show the badge.
+
+        Called whenever the picture itself changes (删除/合并, undo, 打开工程): the
+        two views are handed ``self._source_qimage`` by ``_apply_edits``, so it has
+        to be the current picture, holes and merged colours included.
+        """
+        self._source_qimage = _to_qimage(self._image) if self._image is not None else None
+        if self._original_badge is not None:
+            self._original_badge.setVisible(self._original_edited)
+
+    def _paint_original(self, mask: np.ndarray, entry: PaletteEntry | None) -> None:
+        """Write a 色块级 edit into the picture itself (1.6.19, m01566 item 2).
+
+        ``entry is None`` means 删除: those pixels become transparent, so they are
+        blank in 原图 as well and the next match leaves them unprinted.
+        Otherwise 合并: the pixels take that colour, so 原图 really shows one block
+        of one colour and matching the modified picture finds that colour again.
+
+        This is deliberately separate from ``_block_edits``: that overlay is what
+        预览 shows right now, this is what 匹配 starts from later.
+        """
+        if self._image is None or not mask.any():
+            return
+        # The mask lives on the match grid; the picture is full size (see
+        # ``_to_image_grid``).  Painting the grid's pixels as-is would hit the
+        # wrong part of a picture that was downscaled for matching.
+        mask = _to_image_grid(np.asarray(mask, dtype=bool), self._image.size)
+        if mask.shape != (self._image.height, self._image.width):
+            return
+        pixels = np.asarray(self._image.convert("RGBA")).copy()
+        if entry is None:
+            pixels[..., 3][mask] = 0
+        else:
+            red, green, blue = (int(value) for value in entry.rgb)
+            pixels[mask] = (red, green, blue, 255)
+        self._image = Image.fromarray(pixels)
+        self._original_edited = True
+        self._refresh_source()
 
     def _on_import(self) -> None:
         start = str(paths.projects_dir())
@@ -1732,7 +1871,10 @@ class PicturePage(QWidget):
         """Make ``state`` the page's picture, match and edit state."""
         self._image = state.image.convert("RGBA")
         self._image_name = state.image_name or "混色底板"
-        self._source_qimage = _to_qimage(self._image)
+        # The file's picture IS the one the user left, edits and all (1.6.19): the
+        # flag only says whether it had been changed when it was saved.
+        self._original_edited = bool(state.original_edited)
+        self._refresh_source()
         self._base = state.base
         self._deleted = set(state.deleted)
         self._merged = dict(state.merged)
@@ -1844,6 +1986,8 @@ class PicturePage(QWidget):
                 # 色块级的删除 / 合并 / 更换颜色 (m02366 item 3)：整块一起改，改的是像素
                 # 而不是「哪一种颜色」，所以文件里存的是掩码，见 save_project.
                 block_paints=[(edit.mask, edit.entry) for edit in self._block_edits],
+                # 这张原图已经被删除/合并改过（1.6.19），重开时照旧显示「原图已修改」。
+                original_edited=self._original_edited,
             )
         except Exception as error:
             QApplication.restoreOverrideCursor()
@@ -2003,6 +2147,21 @@ class PicturePage(QWidget):
         # told about.
         self._adopt_options(options)
 
+    def _original_means(self, result: MatchResult) -> np.ndarray | None:
+        """每种 live 颜色在当前「原图」上的平均色（``None`` = 量不了，仍用旧的）。
+
+        只在原图被 删除/合并 改过之后才需要：那时 ``result.means`` 描述的是一张
+        已经不存在的图。
+        """
+        if self._image is None:
+            return None
+        pixels = np.asarray(self._image.convert("RGB"))
+        # ``result.indices`` is the match grid, the picture is full size.
+        labels = _to_image_grid(np.asarray(result.indices), self._image.size)
+        if pixels.shape[:2] != labels.shape:
+            return None
+        return _pixel_means(pixels, labels, len(result.palette))
+
     def _on_rematch_blocks(self) -> None:
         """「按当前色块重新匹配」: keep the colours on screen, re-choose the rolls.
 
@@ -2025,10 +2184,19 @@ class PicturePage(QWidget):
             for index, source in enumerate(self._live_map)
             if source in self._replaced
         }
+        # 删除/合并 改的是原图本身（m01566 的答复），所以「这一块本来是什么颜色」要
+        # 从改过的原图上重新量；沿用匹配时的旧 means 会把用户刚删掉的颜色找回来。
+        source = self._result
+        if self._original_edited:
+            means = self._original_means(source)
+            if means is not None:
+                source = replace(
+                    source, means=means, source_values=None, source_counts=None
+                )
         self._begin_match()
         try:
             options = rematch_options(
-                self._result,
+                source,
                 palette,
                 self._settings(),
                 pinned=pinned,
@@ -2496,6 +2664,11 @@ class PicturePage(QWidget):
         撤销/恢复 on them too) and「点图片时」 itself, because switching between
         「按颜色选择」 and 「按色块边缘选择」 changes what the list shows and therefore
         has to be one step the user can take back (m02439 的答复).
+
+        1.6.19 adds the picture: 删除/合并 write into 原图 itself (m01566 的答复), so
+        Ctrl+Z has to bring the old picture back as well.  The reference is enough —
+        every path that changes ``_image`` (``_paint_original``, ``loadImage``,
+        ``_adopt_project``) REPLACES the object and nothing ever edits one in place.
         """
         return (
             set(self._deleted),
@@ -2506,6 +2679,8 @@ class PicturePage(QWidget):
             self._plan_key,
             list(self._block_edits),
             self._mode,
+            self._image,
+            self._original_edited,
         )
 
     def _restore(self, snapshot: tuple) -> None:
@@ -2518,6 +2693,8 @@ class PicturePage(QWidget):
             plan_key,
             block_edits,
             mode,
+            image,
+            original_edited,
         ) = snapshot
         self._deleted = set(deleted)
         self._merged = dict(merged)
@@ -2527,6 +2704,10 @@ class PicturePage(QWidget):
         self._plan_key = plan_key
         self._block_edits = list(block_edits)
         self._mode = mode
+        self._image = image
+        self._original_edited = bool(original_edited)
+        # 原图 has to catch up before ``_apply_edits`` hands the views a backdrop.
+        self._refresh_source()
 
     def _push(self) -> None:
         """Remember the state before an edit, and drop the redo history."""
@@ -2958,12 +3139,41 @@ class PicturePage(QWidget):
         for one in masks[1:]:
             mask = mask | one
         self._push()
+        # 原图 也跟着改：这些像素变透明，之后无论「重新匹配」还是「按当前色块重新
+        # 匹配」都从改过的原图出发，删掉的地方就真的不会再被匹配回来 (m01566 答复).
+        self._paint_original(mask, None)
         self._block_edits.append(BlockPaint(mask=mask, entry=None, labels=tuple(sorted(labels))))
         self._apply_edits(reselect=mask)
         self._status.setText(
-            f"已删除 {len(masks)} 块：这些地方留空、变成透明，不打印也没有底板。"
-            "Ctrl+Z 可以撤销。"
+            f"已删除 {len(masks)} 块：这些地方留空、变成透明，不打印也没有底板；"
+            "「原图」同样改掉了，所以重新匹配也不会再填回来。Ctrl+Z 可以撤销。"
         )
+
+    # -- keyboard: Del means 「删除」 (m01566 item 1) ---------------------------
+
+    #: Widgets that own the keyboard for typing.  Del inside one of these belongs
+    #: to the field (「删掉一个字符」), never to 「删除」.
+    _TEXT_WIDGETS = (QLineEdit, QAbstractSpinBox, QTextEdit, QPlainTextEdit)
+
+    def _typing_in_field(self) -> bool:
+        """True when the keyboard focus sits in a text field or a number box."""
+        return isinstance(QApplication.focusWidget(), self._TEXT_WIDGETS)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt spelling
+        """Del on the picture page does exactly what the 「删除」 button does.
+
+        Qt hands the key to the focused child first, so a Del typed into a hex or
+        number field is already consumed there; this only ever sees the key when
+        no text widget wanted it (the list and the picture both ignore it), and
+        ``_typing_in_field`` is a second lock on the same door.  There is no
+        window-wide ``QShortcut`` on purpose: a shortcut outranks the focus
+        widget and would break Del inside 颜色配方's search and hex fields.
+        """
+        if event.key() == Qt.Key.Key_Delete and not self._typing_in_field():
+            self._on_delete_colours()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def _on_delete_colours(self) -> None:
         picked = self._list.selected_indices()
@@ -2976,11 +3186,13 @@ class PicturePage(QWidget):
         if not originals:
             return
         self._push()
+        # 原图 不动：删掉一种颜色只是「这种颜色不打印」，图还是原来那张
+        # (m02039：原图只改色块，不改颜色) —— 所以重新匹配它还会回来。
         self._deleted.update(originals)
         self._apply_edits()
         self._status.setText(
             f"已删除 {len(originals)} 种颜色：这些地方留空、变成透明，"
-            "不打印也没有底板。Ctrl+Z 可以撤销。"
+            "不打印也没有底板； Ctrl+Z 可以撤销。"
         )
 
     def _merge_blocks(self, labels: list[int]) -> None:
@@ -3022,6 +3234,9 @@ class PicturePage(QWidget):
         for one in masks[1:]:
             mask = mask | one
         self._push()
+        # 原图 一起改（m01566 答复）：选中的这几块在源图里直接刷成选中的颜色，所以
+        # 重新匹配之后它们还是同一种颜色、还连在一起。
+        self._paint_original(mask, target)
         for label in labels:
             if 0 <= label < blocks.count:
                 self._block_edits.append(
@@ -3030,7 +3245,7 @@ class PicturePage(QWidget):
         self._apply_edits(reselect=mask)
         self._status.setText(
             f"已把选中的 {len(masks)} 块都换成 {target.color_hex}，"
-            "这些地方整块都用它打印。Ctrl+Z 可以撤销。"
+            "这些地方整块都用它打印；「原图」也一起改成了这个颜色。Ctrl+Z 可以撤销。"
         )
 
     def _on_merge_colours(self) -> None:
@@ -3050,13 +3265,15 @@ class PicturePage(QWidget):
         target = self._live_map[picked[choice]]
         originals = [self._live_map[index] for index in picked]
         self._push()
+        # 原图 不动：合并两种颜色只是「这两块地方都按同一种颜色打印」，源图还是原来
+        # 那张 (m02039：原图只改色块，不改颜色)。
         for original in originals:
             if original != target:
                 self._merged[original] = target
         self._apply_edits(keep=target)
         self._status.setText(
             f"已把 {len(originals)} 种颜色合并成 {entries[choice].color_hex}，"
-            "整块区域都用它打印。Ctrl+Z 可以撤销。"
+            "整块区域都用它打印；「原图」里那些地方也刷成了这个颜色。Ctrl+Z 可以撤销。"
         )
 
     def _undo(self) -> None:
