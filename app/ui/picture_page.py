@@ -20,11 +20,12 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
-from PySide6.QtCore import QEventLoop, QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QEventLoop, QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QImage, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -39,6 +40,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QRadioButton,
     QScrollArea,
     QSpinBox,
     QSplitter,
@@ -49,12 +51,14 @@ from PySide6.QtWidgets import (
 from .. import __version__
 from ..core import paths
 from ..core.image_matching import (
+    BudgetOption,
     MatchResult,
     MatchSettings,
     PaletteEntry,
     TriplePalette,
     build_palette,
-    match_image,
+    match_options,
+    plan_caption,
     spool_usage,
 )
 from ..core.library import FilamentLibrary
@@ -118,7 +122,7 @@ PAGE_HINT = (
     f"{ZOOM_HINT}\n"
     f"颜色数量最多 {MAX_PAINTED_FILAMENTS} 是 Bambu Studio 自己的限制：一个工程里只认 "
     f"{MAX_PAINTED_FILAMENTS} 个耗材位，第 {MAX_PAINTED_FILAMENTS + 1} 种颜色在切片时会被"
-    "丢掉（我们已经就这条限制向拓竹提了工单）。耗材上限 0 表示不限制；带透明区域的图片不能用抖动。\n"
+    "丢掉（我们已经就这条限制向拓竹提了工单）。耗材上限 0 表示不限制。\n"
     "改到一半可以存成工程接着改：Ctrl+S 保存（第一次会问存哪儿），Ctrl+Shift+S 换一个文件名；"
     "工程里装着原图、这张预览、用到的颜色和耗材，下次「打开工程」就回到现在这一步。"
 )
@@ -320,13 +324,28 @@ class PictureView(QWidget):
         return self._matched
 
     def _dim_pixmap(self) -> QPixmap | None:
-        """The picture with everything but the selected colour faded out."""
+        """The picture with everything but the selected colour faded out.
+
+        Built once per selection and cached: it walks the whole class map, and a
+        repaint happens for every wheel notch, every resize and every time the
+        window is activated again — including when the user clicks another
+        program.  The cache therefore has to be *handed back*, not merely
+        remembered.  It used to return ``None`` whenever it was already built,
+        so the block showed for exactly one frame and disappeared at the next
+        repaint: zooming in and out or clicking another window wiped it.
+        """
         result = self._result
-        if self._plain or result is None or self._selected < 0 or self._highlight is not None:
+        if self._plain or result is None or self._selected < 0:
             return None
+        if self._highlight is None:
+            self._highlight = self._build_highlight(result, self._selected)
+        return self._highlight
+
+    def _build_highlight(self, result: MatchResult, selected: int) -> QPixmap:
+        """Fade everything but ``selected`` and outline the region that keeps it."""
         height, width = result.indices.shape
         canvas = np.zeros((height, width, 4), dtype=np.uint8)
-        keep = result.indices == self._selected
+        keep = result.indices == selected
         printed = result.indices >= 0
         # A wash rather than a solid fill: the rest of the picture stays legible
         # as context, so a small highlighted region is not floating in a void.
@@ -342,7 +361,6 @@ class PictureView(QWidget):
             painter = QPainter(pixmap)
             painter.drawImage(0, 0, outline)
             painter.end()
-        self._highlight = pixmap
         return pixmap
 
     def _outline(self, result: MatchResult, keep: np.ndarray) -> QImage | None:
@@ -476,6 +494,9 @@ class ColourList(QWidget):
 
     colourSelected = Signal(int)
     colourActivated = Signal(int)
+    #: The user clicked the row of the colour that is already on screen — put it
+    #: away again (「再点一下取消选中」).
+    colourDeselected = Signal(int)
     #: The SET of selected rows changed — the page re-reads ``selected_indices``.
     selectionChanged = Signal()
 
@@ -490,6 +511,9 @@ class ColourList(QWidget):
         #: the widget because ``_refresh`` clears the list on every pin, and the
         #: selection has to survive that.
         self._picked: set[int] = set()
+        #: What the last press landed on, and which colour was on screen then.
+        self._press_index = -1
+        self._press_shown = -1
 
         self._list = QListWidget()
         self._list.setIconSize(compare_pixmap("#FFFFFF", "#000000").size())
@@ -504,6 +528,13 @@ class ColourList(QWidget):
         self._list.currentRowChanged.connect(self._on_row_changed)
         self._list.itemSelectionChanged.connect(self._on_selection_changed)
         self._list.itemDoubleClicked.connect(self._on_row_double_clicked)
+        # 「再点一下同一个颜色就取消选中」: Qt moves the current row during the
+        # press and only then emits itemPressed, so by the time the click signal
+        # arrives the row has already changed and 「the same colour again」 is no
+        # longer recognisable.  The event filter notes what was on screen BEFORE
+        # Qt touches anything.
+        self._list.viewport().installEventFilter(self)
+        self._list.itemClicked.connect(self._on_row_clicked)
 
         self._summary = QLabel("")
         self._summary.setProperty("role", "hint")
@@ -733,6 +764,43 @@ class ColourList(QWidget):
     def _on_row_double_clicked(self, item: QListWidgetItem) -> None:
         self.colourActivated.emit(int(item.data(Qt.ItemDataRole.UserRole)))
 
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802 - Qt spelling
+        """Remember the row and the shown colour from before the press landed.
+
+        ``QAbstractItemView.mousePressEvent`` sets the current index first and
+        emits ``pressed``/``clicked`` afterwards; a filter on the viewport runs
+        before both, which is the only place the previous state is still intact.
+        """
+        if watched is self._list.viewport() and event.type() == QEvent.Type.MouseButtonPress:
+            position = event.position().toPoint()
+            row = self._list.row(self._list.itemAt(position))
+            item = self._list.item(row) if row >= 0 else None
+            self._press_index = (
+                int(item.data(Qt.ItemDataRole.UserRole)) if item is not None else -1
+            )
+            self._press_shown = self._pinned
+        return super().eventFilter(watched, event)
+
+    def _on_row_clicked(self, item: QListWidgetItem) -> None:
+        """A click on the colour that was ALREADY on screen means 「取消选中」.
+
+        「多选」 is left out: there a second click toggles the row off by itself,
+        which already drops it out of the selection the buttons work on.
+        """
+        if self._suppress:
+            return
+        if self._list.selectionMode() == QAbstractItemView.SelectionMode.MultiSelection:
+            return
+        index = int(item.data(Qt.ItemDataRole.UserRole))
+        if index == self._press_index == self._press_shown:
+            self.colourDeselected.emit(index)
+
+    def clear_selection(self) -> None:
+        """Drop the highlight from every row, without touching ``_pinned``'s order."""
+        self._pinned = -1
+        self._list.clearSelection()
+        self._list.setCurrentRow(-1)
+
 
 class MergeDialog(QDialog):
     """Ask which of the selected colours the merged region should become.
@@ -825,6 +893,11 @@ class PicturePage(QWidget):
         self._redo_stack: list[tuple] = []
         #: Live palette index -> original index, rebuilt by ``_compose``.
         self._live_map: list[int] = []
+        #: The colour on screen right now (-1 = none), and the ones it replaced.
+        #: Clicking the same row again steps back through this list, so
+        #: 「取消选中」 returns to the preview the user came from.
+        self._shown = -1
+        self._preview_history: list[int] = []
         # Set when the library changed while this page was off screen; the
         # re-match is then done in showEvent instead of in setLibrary.
         self._stale = False
@@ -946,6 +1019,7 @@ class PicturePage(QWidget):
 
         self._list = ColourList()
         self._list.colourSelected.connect(self._on_colour_selected)
+        self._list.colourDeselected.connect(self._on_colour_deselected)
         self._list.colourActivated.connect(self._on_colour_activated)
         self._list.selectionChanged.connect(self._update_actions)
 
@@ -1047,19 +1121,46 @@ class PicturePage(QWidget):
         usage_scroll.setWidget(self._usage)
         self._usage_scroll = usage_scroll
 
+        # 「耗材方案」: a match is not one answer, it is a few, and the user is the
+        # one who knows whether a fifth roll is worth loading for this print.  Each
+        # row carries its own numbers — 平均 / 最差 ΔE00 and how many rolls — so the
+        # comparison happens on screen instead of inside the program's head, which
+        # is exactly what the old single-answer 「重新匹配」 hid.
+        self._plans: list[BudgetOption] = []
+        self._plan_key = ""
+        self._plan_group = QButtonGroup(self)
+        self._plan_group.setExclusive(True)
+        self._plan_group.idClicked.connect(self._on_plan_clicked)
+        self._plan_box = QWidget()
+        self._plan_layout = QVBoxLayout(self._plan_box)
+        self._plan_layout.setContentsMargins(0, 0, 0, 0)
+        self._plan_layout.setSpacing(2)
+        self._plan_hint = QLabel("")
+        self._plan_hint.setProperty("role", "hint")
+        self._plan_hint.setWordWrap(True)
+        # The rows are rebuilt in place; the hint label is reused, so it is the one
+        # widget the rebuild must not delete.
+        self._plan_layout.addWidget(self._plan_hint)
+        self._refresh_plans()
+
         right = QSplitter(Qt.Orientation.Vertical)
+        # 耗材方案 comes first: it decides what every panel under it says.
+        right.addWidget(self._wrap(self._plan_box, "耗材方案"))
         right.addWidget(self._wrap(list_box, "这个模型需要的颜色"))
         right.addWidget(self._wrap(detail_scroll, "选中的颜色"))
         # 「用到的耗材」 goes last: it answers the printer's question (which rolls
         # to load) rather than the picture's, and it is the one line here that
         # stays readable at a glance while the user edits.
         right.addWidget(self._wrap(usage_scroll, "用到的耗材"))
-        right.setStretchFactor(0, 3)
-        right.setStretchFactor(1, 2)
-        right.setStretchFactor(2, 1)
+        right.setStretchFactor(0, 0)
+        right.setStretchFactor(1, 3)
+        right.setStretchFactor(2, 2)
+        right.setStretchFactor(3, 1)
+        right.setCollapsible(0, False)
         right.setCollapsible(1, False)
         right.setCollapsible(2, False)
-        right.setSizes([360, 290, 180])
+        right.setCollapsible(3, False)
+        right.setSizes([190, 330, 250, 170])
 
         pictures = QSplitter(Qt.Orientation.Horizontal)
         # 原图 and 预览 both zoom and pan with the same gesture; the hint is a
@@ -1210,24 +1311,7 @@ class PicturePage(QWidget):
         # so Ctrl+S has to ask where this one goes.
         self._project_path = None
         self._dirty = False
-        self._sync_dither_state()
         self._on_rematch()
-
-    def _sync_dither_state(self) -> None:
-        """灰掉「抖动」——如果这张图根本用不上它。
-
-        抖动是误差扩散：它要靠「左右邻居」把量化误差摊出去。而带透明区域的图会先被
-        拆成「有颜色的像素」和「透明像素」两部分，有颜色的那部分被挤成一整行交给量化器，
-        那一行上没有任何有意义的邻居关系，扩散出去只会是噪点。所以
-        ``reduce_colours()`` 在 ``keep is not None`` 时直接忽略这个开关；与其让用户勾了
-        没反应，不如直接灰掉，并且把原因写在上面的常显提示行里。
-        """
-        threshold = self._settings().alpha_threshold
-        blocked = False
-        if self._image is not None:
-            alpha = np.asarray(self._image.getchannel("A"), dtype=np.uint8)
-            blocked = bool((alpha <= threshold).any())
-        self._dither.setEnabled(not blocked)
 
     def _on_import(self) -> None:
         start = str(paths.projects_dir())
@@ -1285,10 +1369,24 @@ class PicturePage(QWidget):
         self._max_dimension.setValue(int(settings.max_dimension))
         self._dither.setChecked(bool(settings.dither))
         self._spool_cap.setValue(int(settings.max_spools))
-        self._sync_dither_state()
         self._width_spin.setValue(float(state.plate.target_width_mm))
         self._base_spin.setValue(float(state.plate.base_thickness_mm))
         self._colour_spin.setValue(float(state.plate.colour_thickness_mm))
+        # The 方案 list belongs to a match, and 「打开工程」 deliberately does not run
+        # one: the colour table in the file is what the user saved, edits and all,
+        # and re-matching could answer something slightly different.  So the panel
+        # shows the single row this file came with — named for the 方案 it was
+        # saved under — and 「重新匹配」 is what fills in the other choices.
+        self._plans = [
+            BudgetOption(
+                key=state.plan,
+                title=plan_caption(state.plan)[0],
+                note=plan_caption(state.plan)[1],
+                result=state.base,
+            )
+        ]
+        self._plan_key = state.plan
+        self._refresh_plans()
         self._stale = False
         self._apply_edits()
         if 0 <= int(state.plate.base_index) < self._base_combo.count():
@@ -1354,6 +1452,7 @@ class PicturePage(QWidget):
                 library=self._library,
                 version=__version__,
                 preview=render_preview(self._result),
+                plan=self._plan_key,
             )
         except Exception as error:
             QApplication.restoreOverrideCursor()
@@ -1471,9 +1570,14 @@ class PicturePage(QWidget):
         if not palette:
             self._status.setText("调色板是空的，请先添加耗材。")
             return
+        # The rows on screen describe the match that is about to be replaced:
+        # clearing them first is what keeps 「耗材方案」 from showing a choice that
+        # is no longer the one being made.
+        self._plans = []
+        self._refresh_plans("正在重新匹配，马上列出几套耗材搭配。")
         self._begin_match()
         try:
-            result = match_image(
+            options = match_options(
                 self._image, palette, self._settings(), progress=self._report_match
             )
         except Exception as error:  # pragma: no cover - defensive
@@ -1484,7 +1588,17 @@ class PicturePage(QWidget):
             return
         finally:
             self._end_match()
-        self._base = result
+        if not options:
+            QMessageBox.warning(self, "匹配失败", "这一版没有找到能用的耗材搭配。")
+            self._set_controls_enabled(self._result is not None)
+            return
+        # The first 方案 is 「总体最接近」, the answer a single-answer matcher would
+        # have given, so 「重新匹配」 still lands where it always did and the other
+        # rows are the alternatives the user can now see instead of never being
+        # told about.
+        self._plans = options
+        self._plan_key = options[0].key
+        self._base = options[0].result
         self._deleted = set()
         self._merged = {}
         self._replaced = {}
@@ -1495,9 +1609,131 @@ class PicturePage(QWidget):
         self._dirty = True
         self._plate = None
         self._list.setLibrary(self._library)
+        self._refresh_plans()
         self._apply_edits()
         self._set_controls_enabled(True)
         self._announce_edits()
+
+    # -- 耗材方案：同一张图，几套搭配，用户自己挑 ---------------------------
+    def _refresh_plans(self, placeholder: str = "") -> None:
+        """Draw one radio row per 方案 and the line that explains the picked one.
+
+        Rebuilt rather than updated: there are a handful of rows at most and every
+        number on them changes with the match, so clearing and refilling is
+        shorter than any diff.  ``placeholder`` replaces the rows with one sentence
+        (used while a match is running, when the old rows are already wrong).
+        """
+        while self._plan_layout.count():
+            item = self._plan_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None and widget is not self._plan_hint:
+                widget.deleteLater()
+        for button in self._plan_group.buttons():
+            self._plan_group.removeButton(button)
+        if not self._plans:
+            self._plan_hint.setText(
+                placeholder or "匹配一张图片后，这里会列出几套耗材搭配，自己挑一套。"
+            )
+            self._plan_layout.addWidget(self._plan_hint)
+            return
+        for index, option in enumerate(self._plans):
+            average, worst = option.fidelity
+            row = QWidget()
+            line = QHBoxLayout(row)
+            line.setContentsMargins(0, 0, 0, 0)
+            line.setSpacing(6)
+            button = QRadioButton(option.title)
+            button.setChecked(option.key == self._plan_key)
+            button.setToolTip(option.note)
+            self._plan_group.addButton(button, index)
+            numbers = QLabel(
+                f"平均 ΔE00 {average:.2f} · 最差 {worst:.2f} · 差块 {option.defects} · "
+                f"用 {len(option.spools)} 卷"
+            )
+            numbers.setProperty("role", "hint")
+            numbers.setToolTip(
+                "「差块」= 色差 ΔE00 超过 5 的颜色个数，越少越不容易一眼看出偏差。"
+            )
+            line.addWidget(button)
+            line.addWidget(numbers)
+            line.addStretch(1)
+            self._plan_layout.addWidget(row)
+        self._plan_layout.addWidget(self._plan_hint)
+        self._update_plan_hint()
+
+    def _update_plan_hint(self) -> None:
+        option = self._selected_plan()
+        if option is None:
+            self._plan_hint.setText("")
+            return
+        rolls = "、".join(
+            use.display_name for use in spool_usage(option.result, self._library)
+        )
+        self._plan_hint.setText(
+            f"{option.note}\n用到的耗材（{len(option.spools)} 卷）：{rolls}"
+        )
+
+    def _selected_plan(self) -> BudgetOption | None:
+        for option in self._plans:
+            if option.key == self._plan_key:
+                return option
+        return None
+
+    def _check_plan(self, key: str) -> None:
+        """Put the radios back in step with ``self._plan_key``.  No rebuild."""
+        for index, option in enumerate(self._plans):
+            button = self._plan_group.button(index)
+            if button is not None:
+                button.setChecked(option.key == key)
+
+    def _on_plan_clicked(self, index: int) -> None:
+        if not 0 <= index < len(self._plans):
+            return
+        option = self._plans[index]
+        if option.key == self._plan_key:
+            return
+        if not self._confirm_plan_switch(option):
+            self._check_plan(self._plan_key)
+            return
+        self._apply_plan(option)
+
+    def _apply_plan(self, option: BudgetOption) -> None:
+        """Make ``option`` the picture, dropping the edits made for the old one."""
+        self._plan_key = option.key
+        self._base = option.result
+        self._deleted = set()
+        self._merged = {}
+        self._replaced = {}
+        self._undo_stack = []
+        self._redo_stack = []
+        # A different 方案 is a different picture: the project file needs saving
+        # again, and the mesh has to be rebuilt from the new colours.
+        self._dirty = True
+        self._plate = None
+        self._list.setLibrary(self._library)
+        self._apply_edits()
+        self._set_controls_enabled(True)
+        self._update_plan_hint()
+        self._announce_edits()
+
+    def _confirm_plan_switch(self, option: BudgetOption) -> bool:
+        """Ask before switching, because a 方案 switch repaints the picture.
+
+        The per-colour edits are indices into the *old* palette, so there is no
+        honest way to carry them across; saying so is the whole job here.
+        """
+        if not (self._deleted or self._merged or self._replaced):
+            return True
+        box = QMessageBox(self)
+        box.setWindowTitle("换一套耗材要重新分配颜色")
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setText(f"换成「{option.title}」会重画这张图，现在这些改动会丢。")
+        box.setInformativeText("删除 / 合并 / 更换过的颜色只对当前这一套搭配有效。")
+        switch = box.addButton("换一套", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(switch)
+        box.exec()
+        return box.clickedButton() is switch
 
     def _refresh_base_combo(self) -> None:
         result = self._result
@@ -1514,9 +1750,27 @@ class PicturePage(QWidget):
 
     # -- two-way selection ------------------------------------------------
     def _select(self, index: int) -> None:
-        """Show one colour everywhere it appears: picture, list and detail."""
+        """Show one colour everywhere it appears: picture, list and detail.
+
+        The colour that was on screen goes on ``_preview_history`` first, which
+        is what 「再点一下取消选中」 steps back through.
+        """
+        index = int(index)
+        if index != self._shown and self._shown >= 0:
+            self._preview_history.append(self._shown)
+        self._show_colour(index)
+
+    def _show_colour(self, index: int) -> None:
+        """Put ``index`` on screen without touching the preview history."""
+        index = int(index)
+        self._shown = index
         self._view.setSelected(index)
         self._original_view.setSelected(index)
+        if index < 0:
+            # 「取消选中」: no colour, so no block, no detail and no row highlight.
+            self._list.clear_selection()
+            self._detail.clear()
+            return
         self._list.pin(index)
         if self._result is None:
             return
@@ -1539,6 +1793,18 @@ class PicturePage(QWidget):
 
     def _on_colour_selected(self, index: int) -> None:
         self._select(index)
+
+    def _on_colour_deselected(self, index: int) -> None:
+        """Clicking the colour that is already on screen puts it away.
+
+        The preview steps back to whatever it showed before that colour, which
+        is the whole point of keeping the history: the user got here to compare,
+        and losing the comparison would be worse than losing the colour.
+        """
+        if self._shown < 0 or int(index) != self._shown:
+            return
+        previous = self._preview_history.pop() if self._preview_history else -1
+        self._show_colour(previous)
 
     def _on_region_clicked(self, index: int) -> None:
         """A click in 「预览」 means the same thing as a click on that row.
@@ -1675,6 +1941,10 @@ class PicturePage(QWidget):
                 anchor = self._live_map[index]
         self._result = self._compose()
         self._plate = None
+        # The rows were rebuilt, so the colours the preview history pointed at no
+        # longer mean what they meant; 「取消选中」 starts over from here.
+        self._shown = -1
+        self._preview_history.clear()
         result = self._result
         if result is None:
             self._view.setResult(None, self._source_qimage)
@@ -1731,11 +2001,19 @@ class PicturePage(QWidget):
         if self._replaced:
             parts.append(f"手动更换 {len(self._replaced)} 种颜色")
         if not parts:
+            # When the match found more than one way to spend the rolls, say so:
+            # the panel is on the right, and a user who does not scroll that far
+            # would never learn the choice exists.
+            choices = (
+                f"给出 {len(self._plans)} 套耗材搭配，右边「耗材方案」里自己挑一套；"
+                if len(self._plans) > 1
+                else ""
+            )
             self._status.setText(
-                "匹配完成：{0}×{1} 像素，{2} 种颜色。点击右侧颜色看图片高光，"
+                "匹配完成：{0}×{1} 像素，{2} 种颜色。{3}点击右侧颜色看图片高光，"
                 "点击图片看它属于哪种颜色；点「更换颜色」可以手动换掉不合适的颜色，"
                 "多选颜色后可以「删除」（留空不打印）或「合并」。".format(
-                    result.width, result.height, len(result.palette)
+                    result.width, result.height, len(result.palette), choices
                 )
             )
             return

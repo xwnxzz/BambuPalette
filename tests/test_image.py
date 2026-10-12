@@ -25,6 +25,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from app.core.engines import ENGINE_BAMBU, ENGINE_MIXER  # noqa: E402
 from app.core.image_matching import (  # noqa: E402
+    _PLAN_SPECS,
     MatchSettings,
     TriplePalette,
     _fit_spool_budget,
@@ -32,7 +33,10 @@ from app.core.image_matching import (  # noqa: E402
     _merge_indistinguishable,
     _merge_similar_colours,
     build_palette,
+    match_fidelity,
+    match_fidelity_report,
     match_image,
+    match_options,
     reduce_colours,
     sort_palette,
 )
@@ -104,6 +108,49 @@ class ColourReductionTests(unittest.TestCase):
         self.assertGreater(len(colours), 2)
         self.assertEqual(classes.shape, (64, 64))
         self.assertLess(int(classes.max()), len(colours))
+
+    def test_dithering_a_transparent_picture_stays_inside_the_mask(self):
+        # 抖动 used to be refused whenever the picture had transparency.  It now
+        # runs on the two-dimensional picture with the palette the masked
+        # reduction already earned, so the mask still wins.
+        cols, rows = 40, 20
+        ramp = np.zeros((rows, cols, 3), dtype=np.uint8)
+        ramp[..., 0] = np.linspace(60, 250, cols, dtype=np.uint8).reshape(1, cols)
+        ramp[..., 1] = np.linspace(30, 200, rows, dtype=np.uint8).reshape(rows, 1)
+        ramp[..., 2] = 120
+        image = Image.fromarray(ramp, "RGB").convert("RGBA")
+        mask = np.ones((rows, cols), dtype=bool)
+        mask[:, :6] = False  # a transparent strip on the left
+
+        plain, _ = reduce_colours(image, MatchSettings(max_colours=4, dither=False), mask)
+        colours, classes = reduce_colours(image, MatchSettings(max_colours=4, dither=True), mask)
+        self.assertLessEqual(len(colours), 4)
+        self.assertTrue((classes[:, :6] == -1).all(), "the transparent strip stays unprinted")
+        self.assertTrue((classes[:, 6:] >= 0).all(), "the artwork is printed in full")
+        self.assertLess(int(classes.max()), len(colours))
+
+    def test_a_masked_dither_really_changes_the_class_map(self):
+        # A no-op would satisfy every invariant above, so compare against the
+        # undithered reduction: error diffusion has to move pixels.
+        cols, rows = 48, 24
+        ramp = np.zeros((rows, cols, 3), dtype=np.uint8)
+        ramp[..., 0] = np.linspace(40, 240, cols, dtype=np.uint8).reshape(1, cols)
+        ramp[..., 1] = 90
+        ramp[..., 2] = np.linspace(200, 60, rows, dtype=np.uint8).reshape(rows, 1)
+        image = Image.fromarray(ramp, "RGB").convert("RGBA")
+        mask = np.ones((rows, cols), dtype=bool)
+        mask[0, :] = False  # transparency along the top edge only
+        settings = MatchSettings(max_colours=3, smooth_radius=0)
+        _, plain = reduce_colours(image, settings, mask)
+        colours, dithered = reduce_colours(
+            image, replace(settings, dither=True), mask
+        )
+        self.assertTrue((dithered[:, :] >= 0).all() or (dithered[mask] >= 0).all())
+        self.assertTrue((dithered[~mask] == -1).all())
+        self.assertGreater(int(np.count_nonzero(dithered != plain)), 0)
+        # A dithered picture spreads over the palette instead of using one flat
+        # class per band, which is the whole point of the switch.
+        self.assertGreater(len(np.unique(dithered[mask])), 1)
 
 
 class PaletteTests(unittest.TestCase):
@@ -859,6 +906,144 @@ class SpoolBudgetTests(unittest.TestCase):
         self.assertEqual(
             MatchSettings(max_spools=10_000).clamped().max_spools, MAX_PAINTED_FILAMENTS
         )
+
+
+class BudgetOptionTests(unittest.TestCase):
+    """「多给用户选项，让用户自己选择用那一组耗材」.
+
+    The program must not pretend one 方案 is right: it offers a few, each with
+    its promise, and the user picks.  What is tested here is the promise of the
+    list itself — the first entry is what 「重新匹配」 would have used, no entry
+    ever spends more than 「耗材上限」 rolls (that cap is the user's instruction,
+    not a suggestion the program may overshoot), and no two entries are the same
+    方案 twice.
+    """
+
+    def setUp(self):
+        self.library = _library()
+        self.catalog = MixCatalog(self.library.filaments, engine=ENGINE_BAMBU).build()
+        self.palette = build_palette(self.library, self.catalog)
+
+    def test_the_first_option_is_what_the_plain_match_gives(self):
+        settings = MatchSettings(max_colours=4, max_spools=2)
+        plain = match_image(_quadrant_image(), self.palette, settings)
+        options = match_options(_quadrant_image(), self.palette, settings)
+
+        self.assertEqual(options[0].key, "closest")
+        self.assertEqual(
+            [entry.key for entry in options[0].result.palette],
+            [entry.key for entry in plain.palette],
+        )
+        self.assertEqual(
+            [int(value) for value in options[0].result.counts],
+            [int(value) for value in plain.counts],
+        )
+
+    def test_a_picture_that_fits_the_cap_is_offered_once(self):
+        # Four spools and a cap of four: nothing has to be refused, so every
+        # 方案 prints the same rolls and the extra roll buys nothing.
+        options = match_options(
+            _quadrant_image(), self.palette, MatchSettings(max_colours=4, max_spools=4)
+        )
+        self.assertEqual(len(options), 1)
+        self.assertEqual(len(options[0].spools), 4)
+
+    def test_an_unlimited_cap_is_offered_once_and_never_asks_for_an_extra_roll(self):
+        result = match_image(
+            _quadrant_image(), self.palette, MatchSettings(max_colours=4, max_spools=0)
+        )
+        options = match_options(
+            _quadrant_image(), self.palette, MatchSettings(max_colours=4, max_spools=0)
+        )
+        self.assertEqual([option.key for option in options], ["closest"])
+        wanted = {parent for entry in result.palette for parent in entry.filament_ids}
+        self.assertEqual(set(options[0].spools), wanted)
+
+    def test_no_option_ever_spends_more_than_the_cap(self):
+        # 「耗材方案只能比等于小于耗材上限，不能大于耗材上限」: the cap is the user's
+        # instruction about this machine, so it is a hard ceiling for every 方案.
+        for cap in (1, 2, 3, 4):
+            options = match_options(
+                _quadrant_image(), self.palette, MatchSettings(max_colours=4, max_spools=cap)
+            )
+            self.assertTrue(options, cap)
+            for option in options:
+                self.assertLessEqual(len(option.spools), cap, (cap, option.key))
+                self.assertNotEqual(option.key, "extra")
+
+    def test_every_option_obeys_the_cap_of_the_settings_it_was_given(self):
+        settings = MatchSettings(max_colours=4, max_spools=2)
+        options = match_options(_quadrant_image(), self.palette, settings)
+        for option in options:
+            self.assertLessEqual(len(option.spools), settings.max_spools, option.key)
+
+    def test_two_options_never_print_the_same_rolls(self):
+        options = match_options(
+            _quadrant_image(), self.palette, MatchSettings(max_colours=4, max_spools=3)
+        )
+        rolls = [set(option.spools) for option in options]
+        self.assertEqual(len(rolls), len({frozenset(entry) for entry in rolls}))
+
+    def test_every_option_carries_a_title_a_note_and_its_rolls(self):
+        options = match_options(
+            _quadrant_image(), self.palette, MatchSettings(max_colours=4, max_spools=2)
+        )
+        known = {key for key, _title, _note, _objective in _PLAN_SPECS}
+        self.assertEqual([option.key for option in options][0], "closest")
+        for option in options:
+            self.assertIn(option.key, known)
+            self.assertTrue(option.title.strip())
+            self.assertTrue(option.note.strip())
+            self.assertNotIn("…", option.title + option.note)
+            self.assertTrue(set(option.spools) <= {filament.id for filament in self.library.filaments})
+
+    def test_the_defect_count_is_the_third_fidelity_number(self):
+        options = match_options(
+            _quadrant_image(), self.palette, MatchSettings(max_colours=4, max_spools=2)
+        )
+        average, worst, bad = match_fidelity_report(options[0].result)
+        self.assertEqual(match_fidelity(options[0].result), (average, worst))
+        self.assertEqual(options[0].defects, bad)
+        self.assertGreaterEqual(bad, 0)
+
+    def test_a_perfect_match_scores_zero(self):
+        result = match_image(
+            _quadrant_image(), self.palette, MatchSettings(max_colours=4, max_spools=0)
+        )
+        average, worst = match_fidelity(result)
+        self.assertLess(average, 0.01)
+        self.assertLess(worst, 0.01)
+        self.assertEqual(match_fidelity(result), (average, worst))
+        self.assertEqual(match_fidelity_report(result)[:2], (average, worst))
+        self.assertEqual(match_fidelity_report(result)[2], 0)
+
+    def test_the_average_is_weighted_by_pixels_and_bounded_by_the_worst(self):
+        # A 40x40 black field with a small odd patch: the average must land much
+        # closer to the exact region than to the patch, and never outside the
+        # range of the per-region errors.
+        image = Image.new("RGBA", (40, 40), (23, 24, 28, 255))
+        image.paste(Image.new("RGBA", (10, 10), (120, 190, 60, 255)), (0, 0))
+        result = match_image(image, self.palette, MatchSettings(max_colours=4, max_spools=0))
+        average, worst = match_fidelity(result)
+        errors = [
+            _color.delta_e_2000(
+                _color.lab_from_rgb(tuple(result.means[index])), entry.lab
+            )
+            for index, entry in enumerate(result.palette)
+        ]
+        self.assertAlmostEqual(worst, max(errors), places=9)
+        self.assertGreaterEqual(average, min(errors) - 1e-9)
+        self.assertLessEqual(average, max(errors) + 1e-9)
+        self.assertLess(average, min(worst, 2.0))
+
+    def test_an_empty_result_has_no_fidelity_to_report(self):
+        # Nothing kept: the page greys the panel out rather than printing a
+        # meaningless 0.00.
+        result = match_image(
+            _quadrant_image(), self.palette, MatchSettings(max_colours=4, max_spools=0)
+        )
+        empty = replace(result, palette=[], counts=np.array([], dtype=np.int64), means=None)
+        self.assertEqual(match_fidelity(empty), (0.0, 0.0))
 
 
 if __name__ == "__main__":

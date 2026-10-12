@@ -575,21 +575,97 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     )
     probe.deleteLater()
 
-    # 抖动对有透明区域的图没有意义（有颜色的像素会被挤成一行再量化，那一行上没有
-    # 邻居关系），所以那种图上直接灰掉，原因写在上面的常显提示行里 —— 悬停弹窗已经
-    # 按用户要求删掉了，所以原因不能再只活在弹窗上。
+    # 抖动以前在带透明区域的图上被灰掉：有颜色的像素会被挤成一行再量化，那一行上没有
+    # 邻居关系。1.6.12 改成「先按老办法定出调色板，再用这块调色板在二维原图上做误差
+    # 扩散」（见 image_matching._dither_masked），所以那种图上它也该能勾、勾了要有区别。
     check(page._dither.isEnabled(), "an opaque picture keeps 抖动 selectable")
     transparent = scratch / "selftest-alpha.png"
-    alpha_image = Image.new("RGBA", (32, 32), "#F2F0EB")
-    ImageDraw.Draw(alpha_image).rectangle((0, 0, 7, 31), fill=(242, 240, 235, 0))
-    alpha_image.save(transparent)
+    alpha_picture = Image.new("RGBA", (48, 32))
+    for x in range(48):
+        for y in range(32):
+            alpha_picture.putpixel(
+                (x, y), (180 + x * 3, 90 + y * 4, 200 - x * 2, 0 if x < 8 else 255)
+            )
+    alpha_picture.save(transparent)
+    page._dither.setChecked(False)
     page.loadImage(transparent)
     app.processEvents()
-    check(not page._dither.isEnabled(), "no meaningful dithering on a transparent picture")
-    check("透明" in page._page_hint.text(), "and the always-visible hint says why it went grey")
+    check(page._dither.isEnabled(), "a transparent picture keeps 抖动 selectable too")
+    check(
+        "不能用抖动" not in page._page_hint.text(),
+        "and the always-visible hint no longer claims it cannot",
+    )
+    plain_indices = np.array(page.result.indices, dtype=np.int64, copy=True)
+    page._dither.setChecked(True)
+    page._on_rematch()
+    app.processEvents()
+    check(page.result is not None, "a transparent picture still matches with 抖动 on")
+    indices = page.result.indices
+    check(bool((indices[:, :8] < 0).all()), "the transparent strip stays unprinted with 抖动 on")
+    check(bool((indices[:, 8:] >= 0).all()), "and the artwork is printed in full")
+    changed = int((indices != plain_indices).sum())
+    check(changed > 0, f"turning 抖动 on really changes the match ({changed} 像素)")
+    page._dither.setChecked(False)
     page.loadImage(picture)
     app.processEvents()
-    check(page._dither.isEnabled(), "抖动 comes back on an opaque picture")
+    check(page._dither.isEnabled(), "抖动 stays selectable on an opaque picture")
+
+    # 1.6.12 的 3/4/5：点预览里的色块要像点列表一样选中；已经显示色块时，重绘、放大、
+    # 切到别的窗口再回来都不能把它弄丢（老代码把色块缓存在 _dim_pixmap 里只交出一次，
+    # 第二次重绘就变成 None）；再点同一行 = 取消选中，并退回上一个预览。
+    from PySide6.QtCore import QPoint as _QPoint  # noqa: PLC0415
+    from PySide6.QtTest import QTest as _QTest  # noqa: PLC0415
+
+    page.resize(1200, 800)
+    page.show()
+    app.processEvents()
+
+    block = int(page.result.indices[page.result.indices >= 0][0])
+    page._view.regionClicked.emit(block)
+    app.processEvents()
+    check(page._view._selected == block, "clicking a colour block in 预览 selects that colour")
+    check(page._list.current() == block, "and the colour list highlights the same row")
+
+    first_shot = page._view.grab().toImage()
+    app.processEvents()
+    check(
+        page._view.grab().toImage() == first_shot,
+        "the block survives a second repaint (it used to be handed out only once)",
+    )
+    page._view.zoom_by(1.25)
+    app.processEvents()
+    check(page._view._dim_pixmap() is not None, "and it is still painted after zooming in")
+    page._view.reset_zoom()
+    app.processEvents()
+
+    rows = page._list._list
+
+    def _click(index: int) -> None:
+        row = page._list._row_of(index)
+        item = rows.item(row)
+        rect = rows.visualItemRect(item)
+        check(not rect.isEmpty(), f"the row for colour {index} has a clickable rect")
+        _QTest.mouseClick(rows.viewport(), _Qt.MouseButton.LeftButton, pos=rect.center())
+        app.processEvents()
+
+    other = 1 if block == 0 else 0
+    page._select(block)
+    app.processEvents()
+    _click(other)
+    check(page._view._selected == other, "clicking another row moves the block to it")
+    check(page._list.current() == other, "and the list follows the click")
+    _click(other)
+    check(
+        page._view._selected == block,
+        "clicking the same colour again steps back to the preview before it",
+    )
+    _click(block)
+    check(
+        page._view._selected == -1 and page._list.current() == -1,
+        "with nothing to step back to it simply puts the colour away",
+    )
+    page._select(block)
+    app.processEvents()
 
     # 颜色数量: the 32 ceiling belongs to Bambu Studio, not to us, so the page has
     # to say so — the user asked for a bigger number and got "拓竹还没放开".
@@ -639,6 +715,108 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     spent = sorted({parent for entry in capped.palette for parent in entry.filament_ids})
     check(len(spent) <= 1, f"耗材上限 1 really spends one spool ({spent})")
     check(capped.printed_pixels > 0, "and the picture is still printed, not blanked")
+
+    # 耗材方案 (m00480「多给用户选项，让用户自己选择用那一组耗材」): 匹配不再只给一个
+    # 答案，右边「耗材方案」把几套搭配并排列出来，每套自带平均/最差 ΔE00、差块个数与
+    # 卷数，点一下就换过去。每一套都必须落在「耗材上限」之内 —— 那是用户对这台机器的
+    # 交代，不是程序可以越过的建议。
+    from PySide6.QtWidgets import QLabel as _QLabel  # noqa: PLC0415
+
+    from .core.image_matching import spool_usage as _spool_usage  # noqa: PLC0415
+    from .ui.picture_page import BudgetOption as _PlanOption  # noqa: PLC0415
+
+    check(
+        bool(page._plans) and all(isinstance(option, _PlanOption) for option in page._plans),
+        f"匹配给出 {len(page._plans)} 套耗材搭配",
+    )
+    check(
+        page._plan_key == page._plans[0].key and page._base is page._plans[0].result,
+        "第一套就是单答案匹配会给的那一套，也是页面正在显示的",
+    )
+
+    def _plan_rows() -> list[tuple[str, str]]:
+        """Read (名称, 数字) straight off the panel instead of trusting the state."""
+        found: list[tuple[str, str]] = []
+        for index in range(len(page._plans)):
+            row = page._plan_layout.itemAt(index).widget()
+            labels = [child.text() for child in row.findChildren(_QLabel)]
+            button = page._plan_group.button(index)
+            found.append((button.text() if button is not None else "", " ".join(labels)))
+        return found
+
+    def _overspent() -> list[str]:
+        """名字 + 卷数 of every 方案 (or 用到的耗材 row) that breaks 耗材上限."""
+        ceiling = page._settings().max_spools
+        blamed = (
+            [
+                f"{option.title} {len(option.spools)} 卷"
+                for option in page._plans
+                if len(option.spools) > ceiling
+            ]
+            if ceiling
+            else []
+        )
+        used = _spool_usage(page._base, page._library)
+        if ceiling and len(used) > ceiling:
+            blamed.append(f"用到的耗材 {len(used)} 卷")
+        return blamed
+
+    seen = _plan_rows()
+    check(
+        len(seen) == len(page._plans) and all(name for name, _numbers in seen),
+        f"每一套都有一个单选行 ({[name for name, _numbers in seen]})",
+    )
+    check(
+        all("平均 ΔE00" in numbers and "差块" in numbers and "卷" in numbers
+            for _name, numbers in seen),
+        "每行的平均/最差色差、差块个数和卷数都印在屏幕上，不用悬停",
+    )
+    check(
+        len([button for button in page._plan_group.buttons() if button.isChecked()]) == 1,
+        "同时只有一套被选中",
+    )
+    check(
+        all(option.title and option.note and option.spools for option in page._plans),
+        "每套都写清楚它是什么、代价是什么、用哪几卷",
+    )
+    check(not _overspent(), f"没有一套超过耗材上限 {page._settings().max_spools} ({_overspent()})")
+    check(
+        "用到的耗材" in page._plan_hint.text(),
+        f"面板下方的说明写出了这套用哪几卷，got {page._plan_hint.text()[:40]!r}",
+    )
+
+    check(len(page._plans) >= 2, f"图片装不下时不只一套可选（{len(page._plans)} 套）")
+    if len(page._plans) >= 2:
+        chosen = page._plans[1]
+
+        def _click_plan(index: int) -> None:
+            """Click the real radio, so Qt moves the tick before the handler runs."""
+            button = page._plan_group.button(index)
+            check(button is not None, f"第 {index + 1} 套方案有一个可点的单选行")
+            _QTest.mouseClick(button, _Qt.MouseButton.LeftButton)
+            app.processEvents()
+
+        _click_plan(1)
+        check(page._plan_key == chosen.key, "点第二行就换成第二套")
+        check(page._base is chosen.result, "而且页面真换了那张图（_base 换成它的结果）")
+        check(page._dirty, "换方案之后工程文件需要重新保存")
+        checked = [button.text() for button in page._plan_group.buttons() if button.isChecked()]
+        check(checked == [chosen.title], f"单选状态跟着走 ({checked})")
+        _click_plan(0)
+        check(page._plan_key == page._plans[0].key, "点回第一行就回到第一套")
+
+    # 上限越小越容易越界:1 卷和 2 卷各重匹配一次,方案和「用到的耗材」都不许超。
+    for small in (1, 2):
+        page._spool_cap.setValue(small)
+        page._on_rematch()
+        app.processEvents()
+        check(
+            bool(page._plans) and not _overspent(),
+            f"耗材上限 {small} 时每一套都在上限之内 ({_overspent()})",
+        )
+    page._spool_cap.setValue(_DEFAULT_SPOOL_CAP)
+    page._on_rematch()
+    app.processEvents()
 
     # 三色配方 (m00840 #1): always part of the pool, and the two checkboxes that
     # used to gate 混色 / 三色 are gone (m01647 item 5).

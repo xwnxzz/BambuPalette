@@ -1497,6 +1497,10 @@ def main() -> int:
     sample = TEMP / "sample.png"
     _make_sample(sample)
     page = window._picture_page
+    # The picture page has its own tab, and Qt does not deliver mouse clicks to a
+    # hidden widget — the 耗材方案 checks below click real radios.
+    window._tabs.setCurrentWidget(page)
+    app.processEvents()
     page.loadImage(sample)
     app.processEvents()
     result = page.result
@@ -2130,6 +2134,111 @@ def main() -> int:
             page._undo()
             app.processEvents()
             check(page._usage.text() == usage_saved, "undo puts the spool list back")
+
+            # --- the plans the cap allows (1.6.12: 「耗材方案」) -----------------
+            from PySide6.QtTest import QTest as _QTest  # noqa: PLC0415
+
+            # This picture is flat enough to print exactly with four rolls, and
+            # then every recipe agrees, so only one plan is worth offering.
+            # Squeeze the cap to three so the panel has to show a real choice.
+            remembered_cap = page._spool_cap.value()
+            page._spool_cap.setValue(3)
+            page._on_rematch()
+            app.processEvents()
+            check(
+                bool(page._plans) and page._plan_key == page._plans[0].key,
+                "a match offers 耗材方案 and starts on the first one",
+            )
+            check(page._base is page._plans[0].result, "the preview is that first plan")
+            check(
+                len(page._plans) >= 2,
+                f"a tight cap offers several recipes, got {len(page._plans)}",
+            )
+            cap = page._spool_cap.value()
+            over = [
+                option.key for option in page._plans if cap and len(option.spools) > cap
+            ]
+            check(not over, f"no plan asks for more than 耗材上限 {cap}, got {over}")
+            check(
+                len(page._plans) == len({frozenset(option.spools) for option in page._plans}),
+                "two plans never spend the very same rolls",
+            )
+            check(
+                all(option.key != "extra" for option in page._plans),
+                "the plan that asked for one roll more is gone",
+            )
+            # The button group is the live set: `_refresh_plans` rebuilds the rows
+            # and forgets the old buttons on the spot, while the old *widgets*
+            # linger as children until Qt runs their deferred deletion.
+            buttons = page._plan_group.buttons()
+            check(
+                len(buttons) == len(page._plans),
+                f"the panel has one radio per plan, got {len(buttons)} for "
+                f"{len(page._plans)} plans",
+            )
+            check(
+                sum(1 for button in buttons if button.isChecked()) == 1,
+                "exactly one plan is checked",
+            )
+            check(
+                sorted(button.text() for button in buttons)
+                == sorted(option.title for option in page._plans),
+                "each radio is named after its plan",
+            )
+            numbers = [
+                label.text() for label in page._plan_box.findChildren(_QLabel)
+            ]
+            check(
+                any("差块" in text and "用 " in text for text in numbers),
+                f"each row shows 差块 and the roll count, got {numbers}",
+            )
+            check(
+                all(
+                    f"平均 ΔE00 {option.fidelity[0]:.2f}" in " ".join(numbers)
+                    for option in page._plans
+                ),
+                "the average ΔE00 on screen is the plan's own",
+            )
+            hint = page._plan_hint.text()
+            check("用到的耗材" in hint, f"the hint names the rolls, got {hint!r}")
+            check(
+                all(use.display_name in hint for use in _spool_usage(page._base, library)),
+                "… and every roll of the selected plan is named there",
+            )
+            second = page._plans[1]
+            check(
+                buttons[1].isVisible() and buttons[1].isEnabled(),
+                "the second plan's radio is on screen and clickable",
+            )
+            _QTest.mouseClick(buttons[1], Qt.MouseButton.LeftButton)
+            app.processEvents()
+            check(page._plan_key == second.key, "clicking a plan switches to it")
+            check(page._base is second.result, "… and the picture follows it")
+            check(
+                buttons[1].isChecked() and not buttons[0].isChecked(),
+                "… and the radio moved with it",
+            )
+            check(
+                all(
+                    use.display_name in page._plan_hint.text()
+                    for use in _spool_usage(page._base, library)
+                ),
+                "… and the hint now names the rolls of that plan",
+            )
+            _QTest.mouseClick(buttons[0], Qt.MouseButton.LeftButton)
+            app.processEvents()
+            check(
+                page._plan_key == page._plans[0].key
+                and page._base is page._plans[0].result,
+                "clicking the first plan brings the first answer back",
+            )
+            page._spool_cap.setValue(remembered_cap)
+            page._on_rematch()
+            app.processEvents()
+            check(
+                len(page._plans) == 1 and page._plan_key == page._plans[0].key,
+                f"an exactly printable picture offers one plan, got {len(page._plans)}",
+            )
 
             # --- one project file per picture (m08102 item 5) -------------------
             import json  # noqa: PLC0415

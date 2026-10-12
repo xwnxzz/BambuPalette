@@ -112,8 +112,8 @@ def main() -> int:
     page._list.pin(len(result.palette) - 1, reorder=True)
     page._view.setSelected(len(result.palette) - 1)
     app.processEvents()
-    window.grab().save(str(OUT / "ui-picture.png"))
-    print("wrote", OUT / "ui-picture.png")
+    window.grab().save(str(OUT / "picture-page.png"))
+    print("wrote", OUT / "picture-page.png")
 
     page.buildPlate()
     print("plate:", page.plate.stats())

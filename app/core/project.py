@@ -86,6 +86,10 @@ class ProjectState:
     replaced: dict[int, PaletteEntry] = field(default_factory=dict)
     plate: PlateSettings = field(default_factory=PlateSettings)
     engine: str = DEFAULT_ENGINE
+    #: 匹配时选的是哪一套耗材搭配（``BudgetOption.key``）。文件里的颜色表本来就是那
+    #: 一套的结果，这个 key 只是让「打开工程」能说出当初选的是哪一套；没有这个键的
+    #: 旧文件读成空字符串，页面照旧按文件里的颜色表显示。
+    plan: str = ""
     #: 保存时那张「用到的耗材」清单，读回来只用于显示与核对（真正的耗材归属跟着
     #: 调色板走，耗材库里没有的那一卷会照实标出来）。
     spools: list[dict] = field(default_factory=list)
@@ -291,6 +295,7 @@ def save_project(
     library: FilamentLibrary | None = None,
     version: str = "",
     preview: Image.Image | None = None,
+    plan: str = "",
 ) -> Path:
     """Write one ``.bpproj`` file.  Returns the path actually written."""
     target = Path(path)
@@ -303,6 +308,7 @@ def save_project(
         "version": version,
         "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "engine": engine,
+        "plan": str(plan),
         "image": {
             "name": image_name,
             "file": _SOURCE,
@@ -451,6 +457,7 @@ def load_project(
         replaced=replaced,
         plate=plate,
         engine=engine,
+        plan=str(document.get("plan") or ""),
         spools=list(document.get("spools") or []),
         colours=list(document.get("colours") or []),
         saved_at=str(document.get("saved_at") or ""),

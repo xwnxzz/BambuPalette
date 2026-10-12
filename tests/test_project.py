@@ -159,6 +159,34 @@ class ProjectRoundTripTests(unittest.TestCase):
         # nothing after the user deletes a colour or swaps one out.
         self.assertEqual(state.plate.base_index, 1)
 
+    def test_the_spool_recipe_that_was_picked_is_remembered(self):
+        # 「耗材方案」:工程文件要记住当初挑的是哪一套,不然「打开工程」只能干说一句
+        # 「工程里存的那一套」。
+        library = _library()
+        written = save_project(
+            self._dir / "plan",
+            image=_picture(),
+            image_name="方案",
+            base=_base_match(library),
+            library=library,
+            plan="distinct",
+        )
+        self.assertEqual(load_project(written, library=library).plan, "distinct")
+
+        # 1.6.11 及更早的工程没有 plan 这个键:读成空字符串,而不是拒绝整个文件。
+        older = self._dir / "older.bpproj"
+        with zipfile.ZipFile(written) as source, zipfile.ZipFile(
+            older, "w", zipfile.ZIP_DEFLATED
+        ) as target:
+            for name in source.namelist():
+                payload = source.read(name)
+                if name == "工程.json":
+                    document = json.loads(payload.decode("utf-8"))
+                    document.pop("plan")
+                    payload = json.dumps(document, ensure_ascii=False).encode("utf-8")
+                target.writestr(name, payload)
+        self.assertEqual(load_project(older, library=library).plan, "")
+
     def test_mixed_recipes_come_back_with_their_percentages(self):
         library = _library()
         base = _base_match(library)
