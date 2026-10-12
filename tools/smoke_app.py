@@ -1626,7 +1626,28 @@ def main() -> int:
             from app.spectral import color as _spectral_color
             from app.ui.colour_picker import ColourDetail, ColourPickerDialog, LIST_CHUNK
 
-            check(isinstance(page._detail, ColourDetail), "the picture page has a 选中的颜色 panel")
+            # 1.6.13 #2: the detail is asked for with a double click and opens in a
+            # window of its own; the column keeps 耗材方案 + 这个模型需要的颜色 only.
+            check(isinstance(page._detail, ColourDetail), "the colour detail widget is still there")
+            check(
+                page._detail_window().isAncestorOf(page._detail)
+                and not page._detail_window().isVisible(),
+                "双击之前它待在关着的「颜色详情」窗口里",
+            )
+            check(
+                not page._detail_window().isModal(),
+                "那个窗口不是模态的：开着也能继续点色块",
+            )
+            page._on_colour_activated(0)
+            app.processEvents()
+            check(
+                page._detail_window().isVisible()
+                and "颜色详情" in page._detail_window().windowTitle(),
+                f"看详情会打开一个写明颜色的窗口，got {page._detail_window().windowTitle()!r}",
+            )
+            page._detail_window().close()
+            app.processEvents()
+            check(not page._detail_window().isVisible(), "关掉它之后还留在原来的色块上")
             check(
                 page._base is not None
                 and page._base.palette == result.palette
@@ -2118,12 +2139,11 @@ def main() -> int:
                 and "background-color" in usage_text,
                 "each spool is shown with its own colour",
             )
-            # The label lives inside a scroll area inside the card (a 41-spool
-            # library needs the scrollbar), so the card is one level further up.
-            usage_panel = page._usage_scroll.parent()
+            # 1.6.13 #1: the rolls belong to the 方案 that spends them, so the list
+            # lives inside 「耗材方案」 instead of in a card of its own.
             check(
-                any(label.text() == "用到的耗材" for label in usage_panel.findChildren(_QLabel)),
-                "the panel is titled 用到的耗材",
+                page._plan_box.isAncestorOf(page._usage),
+                "the spool list lives in the 耗材方案 panel",
             )
             # An edit has to refresh the list, not leave the previous sentence up.
             usage_saved = page._usage.text()
@@ -2199,11 +2219,14 @@ def main() -> int:
                 ),
                 "the average ΔE00 on screen is the plan's own",
             )
-            hint = page._plan_hint.text()
-            check("用到的耗材" in hint, f"the hint names the rolls, got {hint!r}")
             check(
-                all(use.display_name in hint for use in _spool_usage(page._base, library)),
-                "… and every roll of the selected plan is named there",
+                page._usage.text().startswith("共")
+                and all(use.display_name in page._usage.text() for use in _spool_usage(page._base, library)),
+                "「用到的耗材」 names every roll of the selected plan",
+            )
+            check(
+                page._plan_hint.text() == page._plans[0].note,
+                f"the hint is that plan's own note, got {page._plan_hint.text()!r}",
             )
             second = page._plans[1]
             check(
@@ -2220,10 +2243,10 @@ def main() -> int:
             )
             check(
                 all(
-                    use.display_name in page._plan_hint.text()
+                    use.display_name in page._usage.text()
                     for use in _spool_usage(page._base, library)
                 ),
-                "… and the hint now names the rolls of that plan",
+                "… and 「用到的耗材」 follows that plan",
             )
             _QTest.mouseClick(buttons[0], Qt.MouseButton.LeftButton)
             app.processEvents()
@@ -2238,6 +2261,94 @@ def main() -> int:
             check(
                 len(page._plans) == 1 and page._plan_key == page._plans[0].key,
                 f"an exactly printable picture offers one plan, got {len(page._plans)}",
+            )
+
+            # --- 筛选耗材 / 按当前色块重新匹配 (1.6.13 #3/#4) --------------------
+            from app.ui.plan_filter import (  # noqa: PLC0415
+                FORBIDDEN as _FILTER_FORBIDDEN,
+                REQUIRED as _FILTER_REQUIRED,
+                SpoolFilterDialog,
+            )
+
+            check(
+                page._filter_button.isEnabled() and "筛选耗材" == page._filter_button.text(),
+                "「筛选耗材」与「重新匹配」并排放在「耗材方案」面板上",
+            )
+            check(
+                page._filter_hint.text() == "每一卷都可以用。",
+                f"没筛选时说清楚，got {page._filter_hint.text()!r}",
+            )
+            demanded = sorted(page._plans[0].spools)[0]
+            banned = next(
+                (
+                    filament.id
+                    for filament in page._library.visible
+                    if filament.id not in page._plans[0].spools
+                ),
+                "",
+            )
+            dialog = SpoolFilterDialog(
+                library.visible,
+                [demanded],
+                [banned] if banned else [],
+                cap=page._spool_cap.value(),
+            )
+            check(
+                dialog.required() == (demanded,)
+                and dialog.forbidden() == ((banned,) if banned else ()),
+                "筛选窗口按传进去的答案摆好每一行",
+            )
+            row = dialog._list.item(0)
+            dialog._on_row_clicked(row)
+            check(
+                int(row.data(Qt.ItemDataRole.UserRole + 1))
+                in (_FILTER_REQUIRED, _FILTER_FORBIDDEN)
+                and row.text().startswith(("必须有 · ", "不要用 · ")),
+                f"点一行就换一档并写在行上，got {row.text()[:16]!r}",
+            )
+            dialog.close()
+            page._require = frozenset({demanded})
+            page._avoid = frozenset({banned}) if banned else frozenset()
+            page._update_filter_hint()
+            check(
+                demanded in page._filter_hint.text() or page._spool_name(demanded) in page._filter_hint.text(),
+                f"筛选条件写在面板上，got {page._filter_hint.text()!r}",
+            )
+            page._on_rematch()
+            app.processEvents()
+            check(
+                bool(page._plans) and all(demanded in option.spools for option in page._plans),
+                "「必须有」那一卷每一套都用上了",
+            )
+            check(
+                not banned or all(banned not in option.spools for option in page._plans),
+                "「不要用」那一卷一套都没碰",
+            )
+            keep = len(page._result.palette)
+            page._list.select([0])
+            page._on_delete_colours()
+            app.processEvents()
+            unpainted = page._result.total_pixels - page._result.printed_pixels
+            page._on_rematch_blocks()
+            app.processEvents()
+            check(
+                bool(page._plans)
+                and len(page._base.palette) < keep
+                and page._base.total_pixels - page._base.printed_pixels == unpainted,
+                "「按当前色块重新匹配」不再自己加回删掉的色块",
+            )
+            check(
+                all(demanded in option.spools for option in page._plans),
+                "… 也没忘了「必须有」那一卷",
+            )
+            page._require = frozenset()
+            page._avoid = frozenset()
+            page._update_filter_hint()
+            page._on_rematch()
+            app.processEvents()
+            check(
+                len(page._result.palette) == keep and not page._deleted,
+                "「重新匹配」从图片重来，删掉的颜色回来了",
             )
 
             # --- one project file per picture (m08102 item 5) -------------------

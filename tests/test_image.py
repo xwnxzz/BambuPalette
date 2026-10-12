@@ -37,7 +37,9 @@ from app.core.image_matching import (  # noqa: E402
     match_fidelity_report,
     match_image,
     match_options,
+    plan_caption,
     reduce_colours,
+    rematch_options,
     sort_palette,
 )
 from app.core.library import Filament, FilamentLibrary  # noqa: E402
@@ -988,14 +990,72 @@ class BudgetOptionTests(unittest.TestCase):
         options = match_options(
             _quadrant_image(), self.palette, MatchSettings(max_colours=4, max_spools=2)
         )
-        known = {key for key, _title, _note, _objective in _PLAN_SPECS}
         self.assertEqual([option.key for option in options][0], "closest")
         for option in options:
-            self.assertIn(option.key, known)
+            self.assertEqual(plan_caption(option.key), (option.title, option.note))
             self.assertTrue(option.title.strip())
             self.assertTrue(option.note.strip())
             self.assertNotIn("…", option.title + option.note)
             self.assertTrue(set(option.spools) <= {filament.id for filament in self.library.filaments})
+
+    def test_more_than_one_group_is_offered_for_the_same_objective(self):
+        # 「耗材方案太少了，多推荐几组」: inside one objective the runner-up roll
+        # sets are listed too, each a different 方案 rather than a repeat.
+        options = match_options(
+            _quadrant_image(), self.palette, MatchSettings(max_colours=4, max_spools=2)
+        )
+        self.assertGreaterEqual(len(options), 2)
+        alternates = [option for option in options if "#" in option.key]
+        self.assertTrue(alternates, [option.key for option in options])
+        for option in alternates:
+            self.assertIn("备选", option.title)
+            self.assertIn("另一种搭法", option.note)
+        rolls = [frozenset(option.spools) for option in options]
+        self.assertEqual(len(rolls), len(set(rolls)))
+
+    def test_a_demanded_roll_is_spent_by_every_option(self):
+        # 「必须包含」: the user has this roll loaded, so every 方案 prints with it.
+        gold = self._spool("耗材金")
+        options = match_options(
+            _quadrant_image(),
+            self.palette,
+            MatchSettings(max_colours=4, max_spools=3),
+            require=[gold],
+        )
+        self.assertTrue(options)
+        for option in options:
+            self.assertIn(gold, option.spools)
+
+    def test_a_forbidden_roll_is_printed_by_no_option(self):
+        # 「不要用」: a colour whose recipe names it is a colour this print cannot
+        # make, so the block is repainted rather than the roll simply not listed.
+        red = self._spool("耗材红")
+        options = match_options(
+            _quadrant_image(),
+            self.palette,
+            MatchSettings(max_colours=4, max_spools=3),
+            avoid=[red],
+        )
+        self.assertTrue(options)
+        for option in options:
+            self.assertNotIn(red, option.spools)
+
+    def test_a_filter_that_cannot_be_met_offers_nothing(self):
+        # Four rolls demanded inside a cap of one: there is no plan to show, and
+        # showing one that breaks either instruction would be a lie.
+        every = [filament.id for filament in self.library.filaments]
+        options = match_options(
+            _quadrant_image(),
+            self.palette,
+            MatchSettings(max_colours=4, max_spools=1),
+            require=every,
+        )
+        self.assertEqual(options, [])
+
+    def _spool(self, name: str) -> str:
+        return next(
+            filament.id for filament in self.library.filaments if filament.name == name
+        )
 
     def test_the_defect_count_is_the_third_fidelity_number(self):
         options = match_options(
@@ -1044,6 +1104,113 @@ class BudgetOptionTests(unittest.TestCase):
         )
         empty = replace(result, palette=[], counts=np.array([], dtype=np.int64), means=None)
         self.assertEqual(match_fidelity(empty), (0.0, 0.0))
+
+
+class RematchTests(unittest.TestCase):
+    """「按当前色块重新匹配」: fix the blocks, then ask which rolls to load.
+
+    The picture is not consulted again.  A 删除 block is outside ``indices``, so it
+    cannot come back; a 合并 block carries its target's colour, so the pair is
+    matched to that colour instead of to the average of the two.
+    """
+
+    def setUp(self):
+        self.library = _library()
+        self.catalog = MixCatalog(self.library.filaments, engine=ENGINE_BAMBU).build()
+        self.palette = build_palette(self.library, self.catalog)
+
+    def _entry_for(self, name: str):
+        wanted = self._spool(name)
+        return next(
+            entry
+            for entry in self.palette
+            if not entry.is_mix and wanted in entry.filament_ids
+        )
+
+    def _spool(self, name: str) -> str:
+        return next(
+            filament.id for filament in self.library.filaments if filament.name == name
+        )
+
+    def _plain(self, cap: int = 0):
+        return match_image(
+            _quadrant_image(), self.palette, MatchSettings(max_colours=4, max_spools=cap)
+        )
+
+    def test_a_block_that_was_pointed_at_another_colour_is_matched_to_it(self):
+        result = self._plain()
+        white = self._entry_for("耗材白")
+        black = self._entry_for("耗材黑")
+        position = next(
+            index for index, entry in enumerate(result.palette) if entry.key == white.key
+        )
+        means = np.asarray(result.means).copy()
+        means[position] = np.asarray(black.rgb, dtype=np.uint8)
+
+        options = rematch_options(
+            replace(result, means=means), self.palette, result.settings
+        )
+        self.assertTrue(options)
+        keys = {entry.key for entry in options[0].result.palette}
+        self.assertIn(black.key, keys)
+        self.assertNotIn(white.key, keys)
+        # Every block now wants a colour the library prints exactly, and the two
+        # blocks that want black are one colour on the plate.
+        self.assertEqual(match_fidelity_report(options[0].result), (0.0, 0.0, 0))
+
+    def test_a_deleted_block_does_not_come_back(self):
+        result = self._plain()
+        red = self._entry_for("耗材红")
+        red_index = next(
+            index for index, entry in enumerate(result.palette) if entry.key == red.key
+        )
+        red_count = int(result.counts[red_index])
+        keep = [index for index in range(len(result.palette)) if index != red_index]
+        indices = np.asarray(result.indices)
+        live = np.full(indices.shape, -1, dtype=indices.dtype)
+        for new_index, old_index in enumerate(keep):
+            live = np.where(indices == old_index, new_index, live)
+
+        deleted = replace(
+            result,
+            palette=[result.palette[index] for index in keep],
+            counts=np.asarray(result.counts)[keep],
+            means=np.asarray(result.means)[keep],
+            indices=live,
+        )
+        options = rematch_options(deleted, self.palette, result.settings)
+        self.assertTrue(options)
+        keys = {entry.key for entry in options[0].result.palette}
+        self.assertNotIn(red.key, keys)
+        self.assertEqual(len(options[0].result.palette), 3)
+        # What was deleted stays unprinted, whatever the re-match chooses.
+        unprinted = int(np.count_nonzero(np.asarray(options[0].result.indices) < 0))
+        self.assertEqual(unprinted, red_count)
+
+    def test_a_hand_picked_colour_survives_the_rematch(self):
+        result = self._plain()
+        white = self._entry_for("耗材白")
+        gold = self._entry_for("耗材金")
+        position = next(
+            index for index, entry in enumerate(result.palette) if entry.key == white.key
+        )
+        options = rematch_options(
+            result, self.palette, result.settings, pinned={position: gold}
+        )
+        self.assertTrue(options)
+        keys = {entry.key for entry in options[0].result.palette}
+        self.assertIn(gold.key, keys)
+        self.assertNotIn(white.key, keys)
+
+    def test_a_rematch_still_obeys_the_cap_and_the_filter(self):
+        result = self._plain()
+        red = self._spool("耗材红")
+        settings = MatchSettings(max_colours=4, max_spools=2)
+        options = rematch_options(result, self.palette, settings, avoid=[red])
+        self.assertTrue(options)
+        for option in options:
+            self.assertLessEqual(len(option.spools), 2)
+            self.assertNotIn(red, option.spools)
 
 
 if __name__ == "__main__":

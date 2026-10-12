@@ -738,11 +738,21 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         """Read (名称, 数字) straight off the panel instead of trusting the state."""
         found: list[tuple[str, str]] = []
         for index in range(len(page._plans)):
-            row = page._plan_layout.itemAt(index).widget()
+            row = page._plan_rows_layout.itemAt(index).widget()
             labels = [child.text() for child in row.findChildren(_QLabel)]
             button = page._plan_group.button(index)
             found.append((button.text() if button is not None else "", " ".join(labels)))
         return found
+
+    def _panel_titles() -> list[str]:
+        """The titles of the right-hand column, top to bottom."""
+        frame = page._plan_box.parentWidget()
+        column = frame.parentWidget()
+        titles = []
+        for position in range(column.count()):
+            title = column.widget(position).findChild(_QLabel)
+            titles.append(title.text() if title is not None else "")
+        return titles
 
     def _overspent() -> list[str]:
         """名字 + 卷数 of every 方案 (or 用到的耗材 row) that breaks 耗材上限."""
@@ -780,10 +790,6 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         "每套都写清楚它是什么、代价是什么、用哪几卷",
     )
     check(not _overspent(), f"没有一套超过耗材上限 {page._settings().max_spools} ({_overspent()})")
-    check(
-        "用到的耗材" in page._plan_hint.text(),
-        f"面板下方的说明写出了这套用哪几卷，got {page._plan_hint.text()[:40]!r}",
-    )
 
     check(len(page._plans) >= 2, f"图片装不下时不只一套可选（{len(page._plans)} 套）")
     if len(page._plans) >= 2:
@@ -804,6 +810,87 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         check(checked == [chosen.title], f"单选状态跟着走 ({checked})")
         _click_plan(0)
         check(page._plan_key == page._plans[0].key, "点回第一行就回到第一套")
+
+    # 「用到的耗材」 and 「选中的颜色」 are not panels any more (1.6.13 #1/#2): the rolls
+    # belong to the 方案 that spends them, and one colour's recipe is asked for by
+    # double-clicking its row instead of taking a third of the column.
+    check(
+        _panel_titles() == ["耗材方案", "这个模型需要的颜色"],
+        f"右栏只剩两块：耗材方案 / 这个模型需要的颜色，got {_panel_titles()}",
+    )
+    check(
+        page._plan_box.isAncestorOf(page._usage),
+        "「用到的耗材」那一行在「耗材方案」面板里面",
+    )
+    check(
+        page._usage.text().startswith("共") and "卷" in page._usage.text(),
+        f"它按当前这一套列出各卷占比，got {page._usage.text()[:30]!r}",
+    )
+    check(
+        all(
+            use.display_name in page._usage.text()
+            for use in _spool_usage(page._base, page._library)
+        ),
+        "「用到的耗材」点名列出了这套的每一卷",
+    )
+    check(
+        page._plan_hint.text() == page._plans[0].note,
+        f"面板上的说明就是这套自己的说明（卷名不重复一遍），got {page._plan_hint.text()[:40]!r}",
+    )
+
+    # 筛选 (1.6.13 #3): 「必须包含」/「不要用」, per spool, and every 方案 obeys it.
+    from .ui.plan_filter import SpoolFilterDialog as _FilterDialog  # noqa: PLC0415
+
+    wanted = sorted(page._plans[0].spools)[0]
+    spare = [
+        filament.id
+        for filament in page._library.visible
+        if all(filament.id not in option.spools for option in page._plans)
+    ]
+    banned = spare[0] if spare else ""
+    dialog = _FilterDialog(
+        page._library.visible, [wanted], [banned], cap=page._settings().max_spools
+    )
+    check(
+        dialog.required() == (wanted,) and dialog.forbidden() == ((banned,) if banned else ()),
+        "筛选窗口按传进来的答案先摆好每一行的状态",
+    )
+    row = dialog._list.item(0)
+    dialog._on_row_clicked(row)
+    check(
+        dialog._list.item(0).text().startswith(("必须有 · ", "不要用 · ")),
+        f"点一行就换一档状态，并写在行上，got {dialog._list.item(0).text()[:16]!r}",
+    )
+    dialog._on_clear()
+    check(
+        dialog.required() == () and dialog.forbidden() == (),
+        "「全部不要求」把筛选清空",
+    )
+    dialog.close()
+
+    page._require = frozenset({wanted})
+    page._avoid = frozenset({banned}) if banned else frozenset()
+    page._update_filter_hint()
+    check(
+        "必须有" in page._filter_hint.text() and "每一卷都可以用" not in page._filter_hint.text(),
+        f"筛选条件写在「耗材方案」面板上，got {page._filter_hint.text()!r}",
+    )
+    page._on_rematch()
+    app.processEvents()
+    check(
+        bool(page._plans) and all(wanted in option.spools for option in page._plans),
+        f"「必须有」那一卷每一套都用上了（{[sorted(option.spools) for option in page._plans]}）",
+    )
+    check(
+        all(not ({banned} & option.spools) for option in page._plans) if banned else True,
+        "「不要用」那一卷一套都没碰",
+    )
+    check(not _overspent(), f"带筛选的搭配也没超过耗材上限 ({_overspent()})")
+    page._require = frozenset()
+    page._avoid = frozenset()
+    page._update_filter_hint()
+    page._on_rematch()
+    app.processEvents()
 
     # 上限越小越容易越界:1 卷和 2 卷各重匹配一次,方案和「用到的耗材」都不许超。
     for small in (1, 2):
@@ -906,6 +993,58 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         )
         check(page._detail.can_replace(), "the colour can be replaced by hand")
         check(not page._detail.can_restore(), "nothing is hand-picked before a replacement")
+
+        # 1.6.13 #2: 详情 is a dialog now, and double-clicking a row is how it is asked
+        # for.  The dialog is not modal, so the next row can be asked about straight
+        # away, and closing it must not change which colour is selected.
+        rows = page._list._list
+        row = page._list._row_of(0)
+        check(row >= 0, "第 1 种颜色在列表里有自己的一行")
+        target = rows.item(row)
+        rows.scrollToItem(target)
+        # A synthetic double click only reaches the view when the window is the
+        # active one and the list holds the focus (measured: without this,
+        # QTest.mouseDClick delivers nothing at all).
+        window.raise_()
+        window.activateWindow()
+        rows.setFocus()
+        app.processEvents()
+        _QTest.qWait(30)
+        spot = rows.visualItemRect(target).center()
+        check(
+            rows.viewport().rect().contains(spot),
+            f"那一行在列表的可视区里（点 {spot.x()},{spot.y()}）",
+        )
+        fired: list[int] = []
+        page._list.colourActivated.connect(fired.append)
+        # A synthetic double click does NOT reach a QListWidget inside this window
+        # (measured: QTest.mouseDClick delivers nothing, with or without the window
+        # active and the list focused), so hand Qt's own double-click signal to the
+        # view instead — that is the link the handler hangs off, and 合并 has relied
+        # on the same signal since 1.6.x.
+        rows.itemDoubleClicked.emit(target)
+        app.processEvents()
+        check(
+            fired == [0],
+            f"双击第 1 行让列表说出被双击的是哪种颜色，got {fired}",
+        )
+        check(
+            page._detail_dialog is not None and page._detail_dialog.isVisible(),
+            "双击颜色列表里的一行，弹出这个颜色的详情",
+        )
+        if page._detail_dialog is not None:
+            check(
+                "颜色详情" in page._detail_dialog.windowTitle(),
+                f"弹窗标题写明是哪个颜色，got {page._detail_dialog.windowTitle()!r}",
+            )
+            page._detail_dialog.close()
+            app.processEvents()
+            check(
+                not page._detail_dialog.isVisible() and page._list.current() >= 0,
+                "关掉弹窗之后选中的颜色还在",
+            )
+        page._select(0)
+        app.processEvents()
         check(page._delete_button.isEnabled(), "a selected colour can be deleted")
         check(not page._merge_button.isEnabled(), "合并 needs two colours, not one")
 
@@ -1069,6 +1208,44 @@ def run_selftest(*, report_path: Path | None = None) -> int:
                 not page._merged and len(page.result.palette) == before_colours,
                 "undoing the merge restores both colours",
             )
+
+        # 1.6.13 #4: 「按当前色块重新匹配」 takes the colours on screen as settled — a
+        # deleted colour stays deleted — and only chooses the rolls behind them again.
+        keep_count = len(page.result.palette)
+        page._list.select([0])
+        page._on_delete_colours()
+        app.processEvents()
+        check(bool(page._deleted), "先真的删掉一种颜色")
+        unpainted = page.result.total_pixels - page.result.printed_pixels
+        page._on_rematch_blocks()
+        app.processEvents()
+        check(
+            bool(page._plans) and page._base is page._plans[0].result,
+            f"按当前色块重新匹配给出 {len(page._plans)} 套搭配，并显示第一套",
+        )
+        check(
+            0 < len(page._base.palette) <= keep_count - 1,
+            f"色块不会变多（{len(page._base.palette)} 块，删除前 {keep_count} 块）",
+        )
+        check(
+            len({entry.key for entry in page._base.palette}) == len(page._base.palette),
+            "同一卷不会在两块里重复出现（两块落到同一卷上会合成一块）",
+        )
+        check(
+            page._base.total_pixels - page._base.printed_pixels == unpainted,
+            "被删掉的色块没有回来（不打印的像素数没变）",
+        )
+        check(not _overspent(), f"它给出的搭配也在耗材上限之内 ({_overspent()})")
+        check(
+            all(option.key != "extra" for option in page._plans),
+            "搭配里没有越界的「多用 1 卷」",
+        )
+        page._on_rematch()
+        app.processEvents()
+        check(
+            len(page.result.palette) == keep_count and not page._deleted,
+            "「重新匹配」从图片重来一遍，删掉的颜色回来了",
+        )
 
         three_mf = write_3mf(
             plate,

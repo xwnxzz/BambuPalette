@@ -16,7 +16,7 @@ from dataclasses import dataclass, replace
 from itertools import combinations
 from math import comb
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 from PIL import Image
@@ -1054,14 +1054,19 @@ def _spool_ids(entry: PaletteEntry) -> tuple[str, ...]:
     return tuple(str(value) for value in entry.filament_ids)
 
 
-def _renumber(
+def _renumber_sources(
     kept: list[PaletteEntry], folded: np.ndarray
-) -> tuple[list[PaletteEntry], np.ndarray, np.ndarray]:
+) -> tuple[list[PaletteEntry], np.ndarray, np.ndarray, list[int]]:
     """Recount ``folded`` and renumber largest-first, dropping empty entries.
 
     ``folded`` holds compact indices into ``kept``.  Entries no pixel points at
     any more are dropped outright — keeping one would put an unused filament in
     the plate's slot list, which is the one thing the budget promises not to do.
+
+    The fourth value is which position of ``kept`` each surviving entry came
+    from, in the same order.  「按当前色块重新匹配」 needs that link: two blocks can
+    be folded into one region, and the region then keeps the picture colour of
+    the block that survived rather than the average of everything in it.
     """
     live = np.unique(folded[folded >= 0])
     counts = np.array(
@@ -1075,7 +1080,16 @@ def _renumber(
     final = np.full(folded.shape, -1, dtype=_INDEX_DTYPE)
     valid = folded >= 0
     final[valid] = rank_of_live[np.searchsorted(live, folded[valid])]
-    return [kept[int(live[int(position)])] for position in order], counts[order], final
+    sources = [int(live[int(position)]) for position in order]
+    return [kept[source] for source in sources], counts[order], final, sources
+
+
+def _renumber(
+    kept: list[PaletteEntry], folded: np.ndarray
+) -> tuple[list[PaletteEntry], np.ndarray, np.ndarray]:
+    """Recount ``folded`` and renumber largest-first, dropping empty entries."""
+    entries, counts, final, _sources = _renumber_sources(kept, folded)
+    return entries, counts, final
 
 
 def _affordable_nearest(
@@ -1097,6 +1111,59 @@ def _affordable_nearest(
     best_value = float("inf")
     for candidate in candidates:
         if len(_spool_ids(candidate)) > budget:
+            continue
+        value = _color.delta_e_2000(entry.lab, candidate.lab)
+        if value < best_value:
+            best_value = value
+            best = candidate
+    return best
+
+
+def _nearest_spending(
+    entry: PaletteEntry, spool: str, palette: Sequence[PaletteEntry] | None
+) -> PaletteEntry | None:
+    """The closest colour that is printed FROM ``spool``, or ``None``.
+
+    「必须包含」 is a demand about the machine, not about the picture: the user has
+    that roll loaded or wants it used up, so some region has to be printed with
+    it.  This finds the colour that roll can print which is closest to what the
+    region wanted.  Only the palette's head is searched — spools and
+    two-filament mixes — for the same reason as :func:`_affordable_nearest`.
+    """
+    if palette is None:
+        return None
+    candidates = getattr(palette, "head", None)
+    if candidates is None:
+        candidates = palette
+    best = None
+    best_value = float("inf")
+    for candidate in candidates:
+        if spool not in _spool_ids(candidate):
+            continue
+        value = _color.delta_e_2000(entry.lab, candidate.lab)
+        if value < best_value:
+            best_value = value
+            best = candidate
+    return best
+
+
+def _nearest_free(
+    entry: PaletteEntry, banned: frozenset[str], palette: Sequence[PaletteEntry] | None
+) -> PaletteEntry | None:
+    """The closest colour that spends none of ``banned``, or ``None``.
+
+    「不要用」 has to reach the colour picking itself, not just the roll list: a
+    colour whose recipe names a banned spool is a colour this print cannot make.
+    """
+    if palette is None:
+        return None
+    candidates = getattr(palette, "head", None)
+    if candidates is None:
+        candidates = palette
+    best = None
+    best_value = float("inf")
+    for candidate in candidates:
+        if banned & set(_spool_ids(candidate)):
             continue
         value = _color.delta_e_2000(entry.lab, candidate.lab)
         if value < best_value:
@@ -1173,15 +1240,35 @@ def _objective_distinct(worst: np.ndarray, weights: np.ndarray) -> tuple[float, 
 _budget_objective: BudgetObjective = _objective_closest
 
 
-def _fit_spool_budget(
+@dataclass(frozen=True)
+class _Fit:
+    """One way of spending 「耗材上限」: what it prints and which rolls it buys."""
+
+    entries: list[PaletteEntry]
+    counts: np.ndarray
+    indices: np.ndarray
+    #: Which position of the colour list each surviving entry came from, in the
+    #: same order.  「按当前色块重新匹配」 needs it: a region that swallowed another
+    #: one keeps the picture colour of the block that survived (the rule 合并
+    #: follows), not the average of everything folded into it.
+    sources: tuple[int, ...]
+    #: Every roll the printed colours need.
+    spools: frozenset[str]
+
+
+def _budget_fits(
     kept: list[PaletteEntry],
     indices: np.ndarray,
     budget: int,
     palette: Sequence[PaletteEntry] | None = None,
     counts: Sequence[int] | np.ndarray | None = None,
     objective: BudgetObjective = _objective_closest,
-) -> tuple[list[PaletteEntry], np.ndarray, np.ndarray] | None:
-    """Re-pick ``kept`` so the plan never asks for more than ``budget`` spools.
+    *,
+    limit: int = 1,
+    require: frozenset[str] = frozenset(),
+    avoid: frozenset[str] = frozenset(),
+) -> list[_Fit]:
+    """Every way of spending ``budget`` worth offering, best first.
 
     This is a choice, not a walk.  Taking the colours largest region first and
     refusing every one that needs a spool the budget has already spent is the
@@ -1189,15 +1276,29 @@ def _fit_spool_budget(
     41-spool library it scored weighted ΔE00 1.813 where the best four rolls the
     picture asked for score 1.249 — 31% worse — and the roll that prints a
     549-pixel nose sat one combination away from the answer it printed.  So the
-    rolls the picture actually asks for are scored as subsets and the best one
-    is printed.  ``kept`` is expected largest-first with ``counts`` the pixels
-    behind each entry.  Returns ``None`` when nothing has to be dropped, so the
-    caller keeps the untouched result.
+    rolls the picture actually asks for are scored as subsets.  ``kept`` is
+    expected largest-first with ``counts`` the pixels behind each entry.
+
+    ``limit`` asks for the best ``limit`` different roll sets rather than only
+    the winner: 「耗材方案太少了，多推荐几组」 is answered by ranking the same
+    subsets the search already scores, not by a second search.  ``require`` and
+    ``avoid`` are the user's 筛选: a plan that cannot spend a demanded roll, or
+    that spends a forbidden one, is not a plan and is left out — the cap and the
+    filter are instructions about this machine, not preferences to trade against
+    picture quality.
+
+    Returns ``[]`` when nothing has to be dropped, so the caller keeps the
+    untouched result — which is also why the untouched rolls are checked against
+    the filter first: a picture that already fits still has to obey 「不要用」.
     """
     if budget <= 0 or len(kept) < 2:
-        return None
+        return []
 
     pool = list(kept)
+    #: Which position of ``kept`` each entry of ``pool`` came from.  The fallback
+    #: colour appended below answers for position 0: it is chosen to match the
+    #: largest region, which is what it stands in for.
+    origin = list(range(len(pool)))
     labs = [np.asarray(entry.lab, dtype=np.float64) for entry in pool]
     needs = [set(_spool_ids(entry)) for entry in pool]
     if counts is not None and len(counts) == len(pool):
@@ -1208,8 +1309,9 @@ def _fit_spool_budget(
             dtype=np.float64,
         )
 
-    if len(set().union(*needs)) <= budget:
-        return None  # the picture already fits; there is nothing to decide
+    untouched = frozenset().union(*needs)
+    if len(untouched) <= budget and require <= untouched and not (avoid & untouched):
+        return []  # the picture already fits; there is nothing to decide
 
     # The rolls worth choosing between, in the order the picture asks for them,
     # so a cap can only ever cut the tail of the picture's own wish list.
@@ -1219,7 +1321,7 @@ def _fit_spool_budget(
             if spool not in rolls and len(rolls) < _BUDGET_ROLL_LIMIT:
                 rolls.append(spool)
     if not rolls:
-        return None
+        return []
 
     matrix: np.ndarray | None = None
 
@@ -1248,21 +1350,16 @@ def _fit_spool_budget(
         worst[surplus] = columns[surplus].min(axis=1)
         return objective(worst, weights), printable
 
-    size = min(budget, len(rolls))
-    best_score: tuple[float, ...] = (float("inf"),)
-    best_printable: list[int] = []
-    chosen: list[str] = []
-    if comb(len(rolls), size) <= _BUDGET_SUBSET_LIMIT:
-        for candidate in combinations(rolls, size):
-            score, printable = _score(candidate)
-            if score < best_score:
-                best_score, chosen, best_printable = score, list(candidate), printable
-    else:
-        # Too many combinations to walk: grow the set by whichever roll helps
-        # most, then swap rolls in and out until nothing improves.
-        while len(chosen) < size:
+    def _walk(
+        available: Sequence[str], width: int
+    ) -> tuple[tuple[float, ...], list[str], list[int]] | None:
+        """Grow a set roll by roll, then swap rolls in and out until nothing improves."""
+        chosen: list[str] = []
+        best_score: tuple[float, ...] = (float("inf"),)
+        best_printable: list[int] = []
+        while len(chosen) < width:
             gain: tuple[tuple[float, ...], str, list[int]] | None = None
-            for spool in rolls:
+            for spool in available:
                 if spool in chosen:
                     continue
                 score, printable = _score([*chosen, spool])
@@ -1272,11 +1369,13 @@ def _fit_spool_budget(
                 break
             chosen = [*chosen, gain[1]]
             best_score, best_printable = gain[0], gain[2]
+        if not chosen:
+            return None
         improved = True
         while improved:
             improved = False
             for position in range(len(chosen)):
-                for spool in rolls:
+                for spool in available:
                     if spool in chosen:
                         continue
                     trial = list(chosen)
@@ -1285,12 +1384,72 @@ def _fit_spool_budget(
                     if score < best_score:
                         chosen, best_score, best_printable = trial, score, printable
                         improved = True
-
-    if best_printable:
-        printable = best_printable
-        if len(printable) == len(pool):
+        if not best_printable:
             return None
-    else:
+        return best_score, chosen, best_printable
+
+    size = min(budget, len(rolls))
+    # With 「必须包含」 in force the answer is not necessarily a full ``size`` set:
+    # the demanded rolls have to be spent, and a smaller set is allowed to be
+    # that answer, so the smaller widths are walked as well.
+    widths = [size]
+    if require:
+        widths = list(range(size, max(len(require), 1) - 1, -1))
+
+    found: list[tuple[tuple[float, ...], list[str], list[int]]] = []
+    for width in widths:
+        if width < 1:
+            continue
+        if comb(len(rolls), width) <= _BUDGET_SUBSET_LIMIT:
+            for candidate in combinations(rolls, width):
+                score, printable = _score(candidate)
+                if printable:
+                    found.append((score, list(candidate), printable))
+        else:
+            # Too many combinations to walk: grow the set by whichever roll helps
+            # most, then swap rolls in and out until nothing improves.  The
+            # alternatives come from forbidding one roll of the winner at a time.
+            walked = _walk(rolls, width)
+            if walked is None:
+                continue
+            found.append(walked)
+            if limit > 1:
+                for spool in walked[1]:
+                    rest = [value for value in rolls if value != spool]
+                    if len(rest) < width:
+                        continue
+                    alternative = _walk(rest, width)
+                    if alternative is not None:
+                        found.append(alternative)
+                    if len(found) >= limit:
+                        break
+    found.sort(key=lambda item: (item[0], len(item[1]), item[1]))
+
+    def _build(printable: list[int]) -> _Fit:
+        """Print ``printable`` and fold everything else into it."""
+        ranks = {position: rank for rank, position in enumerate(printable)}
+        remap = np.full(len(pool), -1, dtype=_INDEX_DTYPE)
+        for position in range(len(pool)):
+            if position in ranks:
+                remap[position] = ranks[position]
+                continue
+            remap[position] = min(
+                range(len(printable)),
+                key=lambda rank: _color.delta_e_2000(labs[position], labs[printable[rank]]),
+            )
+        folded = np.where(indices >= 0, remap[np.clip(indices, 0, None)], -1).astype(_INDEX_DTYPE)
+        entries, region_counts, final, sources = _renumber_sources(
+            [pool[position] for position in printable], folded
+        )
+        return _Fit(
+            entries=entries,
+            counts=region_counts,
+            indices=final,
+            sources=tuple(origin[printable[source]] for source in sources),
+            spools=frozenset(spool for entry in entries for spool in _spool_ids(entry)),
+        )
+
+    if not found:
         # Not one of the colours the picture picked can be printed inside the
         # budget — a budget of one against a picture whose dominant colour is a
         # mix, say.  Repainting with the closest affordable colour is the only
@@ -1302,26 +1461,47 @@ def _fit_spool_budget(
             printable = [0]
         else:
             pool.append(fallback)
+            origin.append(0)
             labs.append(np.asarray(fallback.lab, dtype=np.float64))
             printable = [len(pool) - 1]
+        fit = _build(printable)
+        if require - fit.spools or (avoid & fit.spools):
+            return []  # the only plan left breaks the filter; say so instead
+        return [fit]
 
-    # Everything the search refused is repainted with the surviving colour it
-    # is closest to; ``remap`` holds positions within ``printable``, so the
-    # entries are re-expressed before renumbering, which indexes the list it is
-    # handed.
-    ranks = {position: rank for rank, position in enumerate(printable)}
-    remap = np.full(len(pool), -1, dtype=_INDEX_DTYPE)
-    for position in range(len(pool)):
-        if position in ranks:
-            remap[position] = ranks[position]
-            continue
-        remap[position] = min(
-            range(len(printable)),
-            key=lambda rank: _color.delta_e_2000(labs[position], labs[printable[rank]]),
-        )
+    fits: list[_Fit] = []
+    seen: set[frozenset[str]] = set()
+    for _value, _choice, printable in found:
+        if len(fits) >= limit:
+            break
+        spent = frozenset().union(*(needs[position] for position in printable))
+        if require - spent or (avoid & spent):
+            continue  # a plan that cannot obey the filter is not a plan
+        if spent in seen:
+            continue  # the same rolls under two objectives: list them once
+        seen.add(spent)
+        fits.append(_build(printable))
+    return fits
 
-    folded = np.where(indices >= 0, remap[np.clip(indices, 0, None)], -1).astype(_INDEX_DTYPE)
-    return _renumber([pool[position] for position in printable], folded)
+
+def _fit_spool_budget(
+    kept: list[PaletteEntry],
+    indices: np.ndarray,
+    budget: int,
+    palette: Sequence[PaletteEntry] | None = None,
+    counts: Sequence[int] | np.ndarray | None = None,
+    objective: BudgetObjective = _objective_closest,
+) -> tuple[list[PaletteEntry], np.ndarray, np.ndarray] | None:
+    """The best single plan inside ``budget``, or ``None`` when nothing changes.
+
+    A thin wrapper over :func:`_budget_fits` kept for the callers and the tests
+    that only ever want one answer.
+    """
+    fits = _budget_fits(kept, indices, budget, palette, counts, objective)
+    if not fits:
+        return None
+    fit = fits[0]
+    return fit.entries, fit.counts, fit.indices
 
 
 @dataclass
@@ -1333,15 +1513,23 @@ class _Prepared:
     together and the exact palette search are the slow steps, and they are the
     same whichever rolls the user ends up printing.  Only the budget fit and the
     per-region means are redone per 方案.
+
+    ``pictures`` is the colour each surviving block has to match, aligned with
+    ``kept``.  It is ``None`` when the answer is the picture itself (the colours
+    are then averaged out of ``image`` at the end), and set when the answer is
+    the *current* blocks — 「按当前色块重新匹配」: there the block's colour already
+    includes the user's 合并 and 更换颜色, so re-matching has to aim at that, not at
+    the original pixels.
     """
 
-    image: Image.Image
+    image: Image.Image | None
     palette: Sequence[PaletteEntry]
     kept: list[PaletteEntry]
     counts: np.ndarray
     indices: np.ndarray
     config: MatchSettings
     name: str
+    pictures: np.ndarray | None = None
 
 
 def _prepare(
@@ -1419,47 +1607,110 @@ def _prepare(
     )
 
 
+def _region_means(prepared: _Prepared, fit: _Fit) -> np.ndarray | None:
+    """The picture colour behind every surviving block, in ``fit`` order."""
+    if not len(fit.entries):
+        return None
+    if prepared.pictures is not None:
+        # ''按当前色块重新匹配'': the block colour is the target, so a region that
+        # swallowed another one keeps the picture colour of the block that
+        # survived instead of averaging the two.
+        return np.asarray(
+            [prepared.pictures[source] for source in fit.sources], dtype=np.uint8
+        )
+    if prepared.image is None:
+        return None
+    pixels = np.asarray(prepared.image.convert("RGB"), dtype=np.float64).reshape(-1, 3)
+    flat = fit.indices.reshape(-1)
+    valid = flat >= 0
+    totals = np.zeros((len(fit.entries), 3), dtype=np.float64)
+    np.add.at(totals, flat[valid], pixels[valid])
+    totals /= np.maximum(fit.counts, 1)[:, None]
+    return np.rint(totals).astype(np.uint8)
+
+
+def _identity_fit(prepared: _Prepared) -> _Fit:
+    """The plan that changes nothing: print every surviving colour as it is."""
+    return _Fit(
+        entries=list(prepared.kept),
+        counts=prepared.counts,
+        indices=prepared.indices,
+        sources=tuple(range(len(prepared.kept))),
+        spools=frozenset(
+            spool for entry in prepared.kept for spool in _spool_ids(entry)
+        ),
+    )
+
+
+def _plans(
+    prepared: _Prepared,
+    max_spools: int,
+    objective: BudgetObjective,
+    *,
+    limit: int = 1,
+    require: frozenset[str] = frozenset(),
+    avoid: frozenset[str] = frozenset(),
+    progress: ProgressFn | None = None,
+) -> list[MatchResult]:
+    """Up to ``limit`` ways of printing ``prepared``, best first.
+
+    「最多用 N 卷料」 comes after the merge: folding two invisible shades together
+    frees spools for free, so the budget should only have to work on colours that
+    actually survived.  An empty list means nothing can be printed under these
+    instructions — the picture needs more rolls than the cap allows, or the 筛选
+    of demanded / forbidden rolls cannot be met.
+    """
+    _report(progress, "按「耗材上限」合并颜色", 0.90)
+    fits = _budget_fits(
+        prepared.kept,
+        prepared.indices,
+        max_spools,
+        prepared.palette,
+        prepared.counts,
+        objective,
+        limit=limit,
+        require=require,
+        avoid=avoid,
+    )
+    if not fits:
+        # Nothing to decide: the picture already fits inside the cap and inside
+        # the 筛选, so the colours survive exactly as prepared.  (When it does
+        # not, the empty list is the honest answer: there is no plan to offer.)
+        spools = frozenset(
+            spool for entry in prepared.kept for spool in _spool_ids(entry)
+        )
+        capped = max_spools <= 0 or len(spools) <= max_spools
+        if capped and require <= spools and not (avoid & spools):
+            fits = [_identity_fit(prepared)]
+    results: list[MatchResult] = []
+    for fit in fits:
+        _report(progress, "统计每种颜色的像素", 0.96)
+        results.append(
+            MatchResult(
+                width=int(fit.indices.shape[1]),
+                height=int(fit.indices.shape[0]),
+                palette=fit.entries,
+                indices=fit.indices,
+                counts=fit.counts,
+                settings=prepared.config,
+                source=prepared.name,
+                means=_region_means(prepared, fit),
+            )
+        )
+    return results
+
+
 def _plan(
     prepared: _Prepared,
     max_spools: int,
     objective: BudgetObjective,
     progress: ProgressFn | None = None,
 ) -> MatchResult:
-    """Print ``prepared`` with at most ``max_spools`` rolls, ranked by ``objective``.
-
-    「最多用 N 卷料」 comes after the merge: folding two invisible shades together
-    frees spools for free, so the budget should only have to work on colours that
-    actually survived.
-    """
-    kept, ordered_counts, final = prepared.kept, prepared.counts, prepared.indices
-    _report(progress, "按「耗材上限」合并颜色", 0.90)
-    budgeted = _fit_spool_budget(
-        kept, final, max_spools, prepared.palette, ordered_counts, objective
-    )
-    if budgeted is not None:
-        kept, ordered_counts, final = budgeted
-    means = None
-    if len(kept):
-        _report(progress, "统计每种颜色的像素", 0.96)
-        pixels = np.asarray(prepared.image.convert("RGB"), dtype=np.float64).reshape(-1, 3)
-        flat = final.reshape(-1)
-        valid = flat >= 0
-        totals = np.zeros((len(kept), 3), dtype=np.float64)
-        np.add.at(totals, flat[valid], pixels[valid])
-        totals /= np.maximum(ordered_counts, 1)[:, None]
-        means = np.rint(totals).astype(np.uint8)
-    # The picture's own average colour per region, so the UI can show
-    # 「图片 #xxxxxx → 匹配 #yyyyyy」 and the user can judge the match.
-    return MatchResult(
-        width=int(final.shape[1]),
-        height=int(final.shape[0]),
-        palette=kept,
-        indices=final,
-        counts=ordered_counts,
-        settings=prepared.config,
-        source=prepared.name,
-        means=means,
-    )
+    """The single best way of printing ``prepared``; raises when there is none."""
+    results = _plans(prepared, max_spools, objective, progress=progress)
+    if not results:
+        raise ValueError("这些条件下没有能用的耗材搭配。")
+    return results[0]
 
 
 def match_image(
@@ -1550,6 +1801,118 @@ class BudgetOption:
         return match_fidelity_report(self.result)[2]
 
 
+def _collapse(prepared: _Prepared) -> _Prepared:
+    """Fold blocks that ended up with the same colour into one.
+
+    Two blocks can come out identical: 「合并」 folds one into another, or the
+    palette answers two regions with the very same recipe.  On the plate they are
+    one colour and one row, and — the reason this matters here — one roll
+    requirement instead of two, which is what lets a small 「耗材上限」 go further.
+    The surviving block is the largest one and keeps its own picture colour,
+    which is the rule 合并 follows.
+    """
+    entries = list(prepared.kept)
+    groups: dict[str, list[int]] = {}
+    order: list[str] = []
+    for position, entry in enumerate(entries):
+        if entry.key not in groups:
+            groups[entry.key] = []
+            order.append(entry.key)
+        groups[entry.key].append(position)
+    if len(order) == len(entries):
+        return prepared
+    rank = {key: index for index, key in enumerate(order)}
+    remap = np.array([rank[entry.key] for entry in entries], dtype=_INDEX_DTYPE)
+    folded = np.where(
+        prepared.indices >= 0, remap[np.clip(prepared.indices, 0, None)], -1
+    ).astype(_INDEX_DTYPE)
+    survivors = [groups[key][0] for key in order]
+    kept, counts, final, sources = _renumber_sources(
+        [entries[position] for position in survivors], folded
+    )
+    pictures = None
+    if prepared.pictures is not None:
+        pictures = np.asarray(
+            [prepared.pictures[survivors[int(source)]] for source in sources],
+            dtype=np.uint8,
+        )
+    return replace(prepared, kept=kept, counts=counts, indices=final, pictures=pictures)
+
+
+def _with_required(
+    prepared: _Prepared,
+    require: frozenset[str],
+    palette: Sequence[PaletteEntry] | None,
+    *,
+    pinned: frozenset[int] = frozenset(),
+) -> _Prepared:
+    """Swap colours in so every demanded roll is really spent.
+
+    「必须包含」 is about the machine — this roll is loaded, or the user wants it
+    used up — so it has to reach the recipes.  For each demanded roll the picture
+    does not spend yet, the block that can take it most cheaply gives up its
+    colour for the closest colour that roll can print.  The pixels do not move;
+    only what a block is printed with does.  When no block can take it the
+    palette simply cannot print that roll, and the plans are dropped later, which
+    is what 「没有符合筛选的搭配」 means.
+    """
+    if not require:
+        return prepared
+    entries = list(prepared.kept)
+    for spool in sorted(require):
+        spent = frozenset(
+            value for entry in entries for value in _spool_ids(entry)
+        )
+        if spool in spent:
+            continue
+        best: tuple[float, int, PaletteEntry] | None = None
+        for position, entry in enumerate(entries):
+            if position in pinned:
+                continue
+            replacement = _nearest_spending(entry, spool, palette)
+            if replacement is None or replacement.key == entry.key:
+                continue
+            cost = float(prepared.counts[position]) * _color.delta_e_2000(
+                entry.lab, replacement.lab
+            )
+            if best is None or cost < best[0]:
+                best = (cost, position, replacement)
+        if best is None:
+            continue  # nothing in the palette prints this roll
+        entries[best[1]] = best[2]
+    return replace(prepared, kept=entries)
+
+
+def _without_banned(
+    prepared: _Prepared,
+    avoid: frozenset[str],
+    palette: Sequence[PaletteEntry] | None,
+    *,
+    pinned: frozenset[int] = frozenset(),
+) -> _Prepared:
+    """Take the forbidden rolls out of the recipes.
+
+    「不要用」 is not advice about a list of rolls, it is about what may be
+    printed: a colour whose recipe names a forbidden spool is a colour this print
+    cannot make, so the block is re-pointed at the closest colour that spends
+    none of them.  When nothing at all is left, the block keeps its colour and
+    the plans that would need it are dropped — the same honest 「没有符合筛选的搭配」.
+    """
+    if not avoid:
+        return prepared
+    entries = list(prepared.kept)
+    changed = False
+    for position, entry in enumerate(entries):
+        if position in pinned or not (avoid & set(_spool_ids(entry))):
+            continue
+        replacement = _nearest_free(entry, avoid, palette)
+        if replacement is None or replacement.key == entry.key:
+            continue
+        entries[position] = replacement
+        changed = True
+    return replace(prepared, kept=entries) if changed else prepared
+
+
 #: The 耗材方案 the page offers, in the order the user sees them.  ``key`` is what
 #: a project file remembers about the chosen one.  Every one of them fits inside
 #: 「耗材上限」: that cap is the user's own instruction about how many rolls this
@@ -1558,26 +1921,42 @@ class BudgetOption:
 #: user's pig 「总体最接近」 keeps the average lowest and 「小色块优先」 costs average
 #: to print the nose — and that is a choice about the picture, not a computable
 #: fact, so the user makes it.
-_PLAN_SPECS: tuple[tuple[str, str, str, BudgetObjective], ...] = (
+#: ... and how many rows each one offers.  「耗材方案太少了，多推荐几组」 is answered
+#: with more *different roll sets* inside the same rules: the same subsets the
+#: search already scores are ranked, so the second row is the runner-up rather
+#: than a worse objective.  Three are shown for the default reading of the
+#: picture, two for each of the narrower ones — enough to choose between without
+#: burying the panel in near-duplicates.
+_PLAN_SPECS: tuple[tuple[str, str, str, BudgetObjective, int], ...] = (
     (
         "closest",
         "总体最接近",
         "整张图算下来最像；个别小色块可能差一点。",
         _objective_closest,
+        3,
     ),
     (
         "worst",
         "最不像的色块优先",
         "先把差得最明显的那一块拉回来，平均会稍差。",
         _objective_worst,
+        2,
     ),
     (
         "distinct",
         "小色块优先",
         "眼睛、鼻子这类小色块更准；超过 ΔE00 5 的色块最少。",
         _objective_distinct,
+        2,
     ),
 )
+
+
+def _option_title(key: str, title: str, rank: int) -> tuple[str, str]:
+    """（key，名称）for the ``rank``-th best rolls of one objective."""
+    if rank <= 0:
+        return key, title
+    return f"{key}#{rank}", f"{title}（备选 {rank}）"
 
 
 def plan_caption(key: str) -> tuple[str, str]:
@@ -1585,12 +1964,67 @@ def plan_caption(key: str) -> tuple[str, str]:
 
     「打开工程」 hands the page the plan the file was saved with, and that key can
     name a 方案 this build no longer offers (an older file, a hand-edited one).
-    The row still has to say something true, so it says where it came from.
+    The row still has to say something true, so it says where it came from.  A
+    key ending in ``#N`` is the Nth alternative of the same objective, so it is
+    described by its base spec plus 「备选」.
     """
-    for spec_key, title, note, _objective in _PLAN_SPECS:
-        if spec_key == key:
-            return title, note
+    base, _, rank = key.partition("#")
+    for spec_key, title, note, _objective, _count in _PLAN_SPECS:
+        if spec_key != base:
+            continue
+        if rank.isdigit() and int(rank) > 0:
+            return f"{title}（备选 {rank}）", f"{note}同一目标下的另一种搭法。"
+        return title, note
     return "工程里存的那一套", "保存工程时用的搭配；点「重新匹配」可以再挑一套。"
+
+
+def _offer_options(
+    prepared: _Prepared,
+    *,
+    require: frozenset[str] = frozenset(),
+    avoid: frozenset[str] = frozenset(),
+    progress: ProgressFn | None = None,
+) -> list[BudgetOption]:
+    """Turn the plans every spec asks for into the rows the page shows.
+
+    Two candidates that end up printing the same rolls are the same 方案 and only
+    the first is kept, so a picture that fits inside 「耗材上限」 with room to spare
+    is offered fewer rows rather than duplicates.  A candidate that cannot obey
+    the 筛选 never reaches the list: the cap and the demanded / forbidden rolls are
+    instructions about this machine, not preferences to trade against picture
+    quality.
+    """
+    cap = prepared.config.max_spools
+    total = max(1, sum(spec[4] for spec in _PLAN_SPECS))
+    options: list[BudgetOption] = []
+    seen: set[frozenset[str]] = set()
+    done = 0
+    for key, title, note, objective, count in _PLAN_SPECS:
+        _report(progress, f"试着搭配耗材（{title}）", 0.88 + 0.1 * done / total)
+        results = _plans(
+            prepared, cap, objective, limit=count, require=require, avoid=avoid
+        )
+        for rank, result in enumerate(results):
+            done += 1
+            rolls = frozenset(
+                spool for entry in result.palette for spool in _spool_ids(entry)
+            )
+            if require - rolls or (avoid & rolls):
+                continue  # a plan that breaks the 筛选 is not a plan
+            if rolls in seen:
+                continue  # the same rolls under two objectives: list them once
+            seen.add(rolls)
+            option_key, option_title = _option_title(key, title, rank)
+            options.append(
+                BudgetOption(
+                    key=option_key,
+                    title=option_title,
+                    note=note if rank <= 0 else f"{note}同一目标下的另一种搭法。",
+                    result=result,
+                )
+            )
+    _report(progress, "完成", 1.0)
+    return options
 
 
 def match_options(
@@ -1598,6 +2032,8 @@ def match_options(
     palette: Sequence[PaletteEntry],
     settings: MatchSettings | None = None,
     *,
+    require: Iterable[str] = (),
+    avoid: Iterable[str] = (),
     progress: ProgressFn | None = None,
 ) -> list[BudgetOption]:
     """Every 耗材方案 worth showing for ``source``, best first and deduplicated.
@@ -1606,23 +2042,97 @@ def match_options(
     pig, four rolls print the nose pale whichever way the search is pointed —
     one 方案 gets the average down, another spends a little average to print the
     nose exactly — and that is a choice about the picture, so it is offered
-    rather than assumed.  Two candidates that end up printing the same rolls are
-    the same 方案 and only the first is kept, so a picture that fits inside
-    「耗材上限」 with room to spare is offered one option, and every option obeys
-    the cap.
+    rather than assumed.
+
+    ``require`` and ``avoid`` are the user's 筛选: rolls this print must load and
+    rolls it must not.  They are applied to the recipes before the rolls are
+    chosen, so a demanded roll really is spent and a forbidden one really is not
+    — and a plan that cannot manage that is left out instead of shown.
     """
     prepared = _prepare(source, palette, settings, progress)
-    cap = prepared.config.max_spools
-    total = len(_PLAN_SPECS)
-    options: list[BudgetOption] = []
-    seen: set[frozenset[str]] = set()
-    for position, (key, title, note, objective) in enumerate(_PLAN_SPECS):
-        _report(progress, f"试着搭配耗材（{title}）", 0.88 + 0.1 * position / total)
-        result = _plan(prepared, cap, objective)
-        rolls = frozenset(spool for entry in result.palette for spool in _spool_ids(entry))
-        if rolls in seen:
-            continue
-        seen.add(rolls)
-        options.append(BudgetOption(key=key, title=title, note=note, result=result))
-    _report(progress, "完成", 1.0)
-    return options
+    wanted = frozenset(require)
+    banned = frozenset(avoid)
+    if wanted:
+        _report(progress, "换成「必须包含」的耗材", 0.86)
+        prepared = _with_required(prepared, wanted, palette)
+    if banned:
+        _report(progress, "换掉「不要用」的耗材", 0.87)
+        prepared = _without_banned(prepared, banned, palette)
+    prepared = _collapse(prepared)
+    return _offer_options(prepared, require=wanted, avoid=banned, progress=progress)
+
+
+def rematch_options(
+    result: MatchResult,
+    palette: Sequence[PaletteEntry],
+    settings: MatchSettings | None = None,
+    *,
+    pinned: Mapping[int, PaletteEntry] | None = None,
+    require: Iterable[str] = (),
+    avoid: Iterable[str] = (),
+    progress: ProgressFn | None = None,
+) -> list[BudgetOption]:
+    """「按当前色块重新匹配」: keep the blocks on screen, re-choose the rolls.
+
+    The picture is not consulted again.  The blocks are already the answer — 删除的
+    颜色 are outside ``indices`` and a 合并 left its target's colour in ``means`` —
+    so each one is answered with the closest colour the library can print and the
+    rolls are fitted inside 「耗材上限」 exactly as a normal match.  That is what
+    makes the button useful: fix the blocks first, then ask what to load.
+
+    ``pinned`` holds the blocks the user replaced by hand (block index of
+    ``result`` → the colour they chose): those keep their colour, so re-matching
+    does not silently undo a 更换颜色.
+    """
+    if not palette:
+        raise ValueError("调色板是空的，请先添加耗材。")
+    if not len(result.palette):
+        return []
+    config = (settings or result.settings or MatchSettings()).clamped()
+    wanted = frozenset(require)
+    banned = frozenset(avoid)
+    choices = dict(pinned or {})
+
+    targets = np.asarray(
+        [result.region_colour(index) for index in range(len(result.palette))],
+        dtype=np.uint8,
+    )
+    _report(progress, "读取当前色块", 0.10)
+    labs = _color.lab_from_rgb(targets)
+
+    def _search_rows(rows_done: int, rows_total: int) -> None:
+        _report(
+            progress,
+            "在耗材与混色库里寻找最接近的颜色",
+            0.20 + 0.60 * rows_done / max(1, rows_total),
+        )
+
+    chosen = _nearest_entries(labs, palette, _palette_table(palette), _search_rows)
+    entries = [
+        choices.get(index, palette[int(chosen[index])])
+        for index in range(len(result.palette))
+    ]
+    prepared = _Prepared(
+        image=None,
+        palette=palette,
+        kept=entries,
+        counts=np.asarray(result.counts, dtype=np.int64),
+        indices=np.asarray(result.indices, dtype=_INDEX_DTYPE).copy(),
+        config=config,
+        name=result.source,
+        pictures=targets,
+    )
+    prepared = _collapse(prepared)
+    pinned_keys = {entry.key for entry in choices.values()}
+    held = frozenset(
+        position
+        for position, entry in enumerate(prepared.kept)
+        if entry.key in pinned_keys
+    )
+    if wanted:
+        _report(progress, "换成「必须包含」的耗材", 0.86)
+        prepared = _with_required(prepared, wanted, palette, pinned=held)
+    if banned:
+        _report(progress, "换掉「不要用」的耗材", 0.87)
+        prepared = _without_banned(prepared, banned, palette, pinned=held)
+    return _offer_options(prepared, require=wanted, avoid=banned, progress=progress)

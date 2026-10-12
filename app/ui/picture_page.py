@@ -59,6 +59,7 @@ from ..core.image_matching import (
     build_palette,
     match_options,
     plan_caption,
+    rematch_options,
     spool_usage,
 )
 from ..core.library import FilamentLibrary
@@ -83,6 +84,7 @@ from .colour_picker import (
     entry_recipe_text,
     hex_of,
 )
+from .plan_filter import SpoolFilterDialog
 from .selectable import selectable_text
 from .swatch import swatch_pixmap
 
@@ -124,7 +126,10 @@ PAGE_HINT = (
     f"{MAX_PAINTED_FILAMENTS} 个耗材位，第 {MAX_PAINTED_FILAMENTS + 1} 种颜色在切片时会被"
     "丢掉（我们已经就这条限制向拓竹提了工单）。耗材上限 0 表示不限制。\n"
     "改到一半可以存成工程接着改：Ctrl+S 保存（第一次会问存哪儿），Ctrl+Shift+S 换一个文件名；"
-    "工程里装着原图、这张预览、用到的颜色和耗材，下次「打开工程」就回到现在这一步。"
+    "工程里装着原图、这张预览、用到的颜色和耗材，下次「打开工程」就回到现在这一步。\n"
+    "双击颜色列表里的一行，看这个颜色的详情（图片里的颜色、匹配到的颜色和它的配方）；"
+    "「筛选耗材」先说好哪几卷必须用、哪几卷不要用，之后每套搭配都照这个来；"
+    "「按当前色块重新匹配」拿现在这些色块重新挑卷，删除、合并和手改过的颜色都留着。"
 )
 
 
@@ -924,6 +929,14 @@ class PicturePage(QWidget):
         self._rematch_button = QPushButton("重新匹配")
         self._rematch_button.clicked.connect(self._on_rematch)
 
+        # 「按当前色块重新匹配」 is 重新匹配's neighbour and its opposite: 重新匹配
+        # reads the picture again (and drops the edits, because the blocks it was
+        # made of are gone), while this one takes the blocks on screen as the
+        # question and only asks which rolls print them.  Two buttons rather than
+        # one with a mode, because the user knows which question they are asking.
+        self._rematch_blocks_button = QPushButton("按当前色块重新匹配")
+        self._rematch_blocks_button.clicked.connect(self._on_rematch_blocks)
+
         # 打开 / 保存工程 sit next to 导入图片: all three are file actions on the
         # picture, and a session that is put down and picked up again is the
         # whole point of the project file.  Neither is accented — the blue
@@ -963,6 +976,7 @@ class PicturePage(QWidget):
         top.addWidget(self._max_dimension)
         top.addWidget(self._dither)
         top.addWidget(self._rematch_button)
+        top.addWidget(self._rematch_blocks_button)
         top.addStretch(1)
 
         self._width_spin = QDoubleSpinBox()
@@ -1084,45 +1098,14 @@ class PicturePage(QWidget):
         list_layout.addLayout(actions)
 
         self._detail = ColourDetail()
-
-        # 「用到了哪些耗材」: the colour list says which colours the print needs,
-        # this says which rolls to put in the AMS and how much of each they
-        # contribute.  It is its own line of text rather than a column in the
-        # list because a mixed colour is printed FROM two or three spools — the
-        # two lists do not line up row for row and never could.
-        self._usage = QLabel("")
-        self._usage.setProperty("role", "hint")
-        self._usage.setTextFormat(Qt.TextFormat.RichText)
-        self._usage.setWordWrap(True)
-        self._usage.setMinimumHeight(58)
-
-        # The list tells the user which colours the print needs; the detail
-        # panel explains the one they clicked. Stacked, because both matter and
-        # the right column is narrow.
-        #
-        # The detail panel is taller than its share of a short window (two
-        # cards, a recipe, a hint and two buttons), and a 「更换颜色」 button
-        # that is off the bottom of the screen is the same as no button, so it
-        # gets a scroll area of its own.
-        detail_scroll = QScrollArea()
-        detail_scroll.setWidgetResizable(True)
-        detail_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        detail_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        detail_scroll.setWidget(self._detail)
-
-        # Same treatment for 用到的耗材: a 41-spool library can put a dozen rolls
-        # on that list, and three of them are the common case — scroll rather
-        # than clip, so the row for the roll that is missing from the AMS is
-        # reachable instead of hidden under the bottom edge.
-        usage_scroll = QScrollArea()
-        usage_scroll.setWidgetResizable(True)
-        usage_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        usage_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        usage_scroll.setWidget(self._usage)
-        self._usage_scroll = usage_scroll
+        # 「选中的颜色」 used to be a panel of its own, permanently showing whichever
+        # colour was last clicked.  The colour list above is where colours get
+        # picked, so the recipe and the ΔE00 of one colour became a dialog the user
+        # asks for (双击一行) instead of a third of the column that sits empty.
+        self._detail_dialog: QDialog | None = None
 
         # 「耗材方案」: a match is not one answer, it is a few, and the user is the
-        # one who knows whether a fifth roll is worth loading for this print.  Each
+        # one who knows whether a different set of rolls suits this print.  Each
         # row carries its own numbers — 平均 / 最差 ΔE00 and how many rolls — so the
         # comparison happens on screen instead of inside the program's head, which
         # is exactly what the old single-answer 「重新匹配」 hid.
@@ -1131,36 +1114,72 @@ class PicturePage(QWidget):
         self._plan_group = QButtonGroup(self)
         self._plan_group.setExclusive(True)
         self._plan_group.idClicked.connect(self._on_plan_clicked)
+
+        # 筛选: 「必须有这几卷」 and 「这几卷不要用」 are facts about the printer (what is
+        # already in the AMS, what ran out), not about the picture, so they are set
+        # once and every match from then on obeys them.
+        self._require: frozenset[str] = frozenset()
+        self._avoid: frozenset[str] = frozenset()
+        self._filter_button = QPushButton("筛选耗材")
+        self._filter_button.clicked.connect(self._on_filter)
+        self._filter_hint = QLabel("")
+        self._filter_hint.setProperty("role", "hint")
+        self._filter_hint.setWordWrap(True)
+        self._update_filter_hint()
+
         self._plan_box = QWidget()
         self._plan_layout = QVBoxLayout(self._plan_box)
         self._plan_layout.setContentsMargins(0, 0, 0, 0)
-        self._plan_layout.setSpacing(2)
+        self._plan_layout.setSpacing(6)
+        filter_row = QHBoxLayout()
+        filter_row.setSpacing(6)
+        filter_row.addWidget(self._filter_button)
+        filter_row.addWidget(self._filter_hint, 1)
+        self._plan_layout.addLayout(filter_row)
+
+        # The 方案 rows are rebuilt on every match, so they live in a widget of
+        # their own; the filter line, the hint and the roll list around them are
+        # reused as they are.
+        self._plan_rows = QWidget()
+        self._plan_rows_layout = QVBoxLayout(self._plan_rows)
+        self._plan_rows_layout.setContentsMargins(0, 0, 0, 0)
+        self._plan_rows_layout.setSpacing(2)
+        self._plan_layout.addWidget(self._plan_rows)
+
         self._plan_hint = QLabel("")
         self._plan_hint.setProperty("role", "hint")
         self._plan_hint.setWordWrap(True)
-        # The rows are rebuilt in place; the hint label is reused, so it is the one
-        # widget the rebuild must not delete.
         self._plan_layout.addWidget(self._plan_hint)
+
+        # 「用到了哪些耗材」 is not a panel of its own any more: it answers the same
+        # question the 方案 rows disagree about — 用哪几卷 — so it sits under them,
+        # for the 方案 that is picked.  A 41-spool library can put a dozen rolls
+        # here, and three of them are the common case, so it scrolls rather than
+        # clips and the roll that is missing from the AMS stays reachable.
+        self._usage = QLabel("")
+        self._usage.setProperty("role", "hint")
+        self._usage.setTextFormat(Qt.TextFormat.RichText)
+        self._usage.setWordWrap(True)
+        self._usage.setMinimumHeight(58)
+        usage_scroll = QScrollArea()
+        usage_scroll.setWidgetResizable(True)
+        usage_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        usage_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        usage_scroll.setWidget(self._usage)
+        self._usage_scroll = usage_scroll
+        self._plan_layout.addWidget(usage_scroll, 1)
         self._refresh_plans()
 
         right = QSplitter(Qt.Orientation.Vertical)
-        # 耗材方案 comes first: it decides what every panel under it says.
+        # 耗材方案 comes first: it decides what the panel under it says, and it now
+        # answers the printer's question (which rolls to load) as well.
         right.addWidget(self._wrap(self._plan_box, "耗材方案"))
         right.addWidget(self._wrap(list_box, "这个模型需要的颜色"))
-        right.addWidget(self._wrap(detail_scroll, "选中的颜色"))
-        # 「用到的耗材」 goes last: it answers the printer's question (which rolls
-        # to load) rather than the picture's, and it is the one line here that
-        # stays readable at a glance while the user edits.
-        right.addWidget(self._wrap(usage_scroll, "用到的耗材"))
-        right.setStretchFactor(0, 0)
+        right.setStretchFactor(0, 2)
         right.setStretchFactor(1, 3)
-        right.setStretchFactor(2, 2)
-        right.setStretchFactor(3, 1)
         right.setCollapsible(0, False)
         right.setCollapsible(1, False)
-        right.setCollapsible(2, False)
-        right.setCollapsible(3, False)
-        right.setSizes([190, 330, 250, 170])
+        right.setSizes([430, 350])
 
         pictures = QSplitter(Qt.Orientation.Horizontal)
         # 原图 and 预览 both zoom and pan with the same gesture; the hint is a
@@ -1231,6 +1250,8 @@ class PicturePage(QWidget):
     def _set_controls_enabled(self, enabled: bool) -> None:
         for widget in (
             self._rematch_button,
+            self._rematch_blocks_button,
+            self._filter_button,
             self._save_project_button,
             self._width_spin,
             self._base_spin,
@@ -1578,7 +1599,12 @@ class PicturePage(QWidget):
         self._begin_match()
         try:
             options = match_options(
-                self._image, palette, self._settings(), progress=self._report_match
+                self._image,
+                palette,
+                self._settings(),
+                require=self._require,
+                avoid=self._avoid,
+                progress=self._report_match,
             )
         except Exception as error:  # pragma: no cover - defensive
             QMessageBox.warning(self, "匹配失败", str(error))
@@ -1589,13 +1615,74 @@ class PicturePage(QWidget):
         finally:
             self._end_match()
         if not options:
-            QMessageBox.warning(self, "匹配失败", "这一版没有找到能用的耗材搭配。")
+            QMessageBox.warning(
+                self,
+                "匹配失败",
+                "按现在的筛选条件没有找到能用的耗材搭配，先放宽筛选或者提高耗材上限。"
+                if (self._require or self._avoid)
+                else "这一版没有找到能用的耗材搭配。",
+            )
             self._set_controls_enabled(self._result is not None)
             return
         # The first 方案 is 「总体最接近」, the answer a single-answer matcher would
         # have given, so 「重新匹配」 still lands where it always did and the other
         # rows are the alternatives the user can now see instead of never being
         # told about.
+        self._adopt_options(options)
+
+    def _on_rematch_blocks(self) -> None:
+        """「按当前色块重新匹配」: keep the colours on screen, re-choose the rolls.
+
+        Not the same button as 重新匹配.  That one reads the picture again and
+        starts from the colours it finds; this one takes the blocks as settled —
+        a deleted colour stays deleted, a merge prints the colour it was merged
+        into, a hand-picked colour stays picked — and only asks 「哪几卷、怎么混」
+        again.  See :func:`app.core.image_matching.rematch_options`.
+        """
+        if self._result is None or self._library is None:
+            return
+        palette = self._match_palette()
+        if not palette:
+            self._status.setText("调色板是空的，请先添加耗材。")
+            return
+        # 手改过的颜色是用户定下来的，重新匹配不能悄悄换回去。`pinned` 按当前色块
+        # 的下标给出它们；编辑簿记用的是基准下标，`_live_map` 负责翻过来。
+        pinned = {
+            index: self._replaced[source]
+            for index, source in enumerate(self._live_map)
+            if source in self._replaced
+        }
+        self._begin_match()
+        try:
+            options = rematch_options(
+                self._result,
+                palette,
+                self._settings(),
+                pinned=pinned,
+                require=self._require,
+                avoid=self._avoid,
+                progress=self._report_match,
+            )
+        except Exception as error:  # pragma: no cover - defensive
+            QMessageBox.warning(self, "匹配失败", str(error))
+            return
+        finally:
+            self._end_match()
+        if not options:
+            QMessageBox.warning(
+                self, "匹配失败", "按现在的色块和筛选，没有找到能用的耗材搭配。"
+            )
+            return
+        self._adopt_options(options)
+
+    def _adopt_options(self, options: list[BudgetOption]) -> None:
+        """Make ``options[0]`` the match on screen, with the rest listed under it.
+
+        Every edit so far was made against the previous 方案 and the rolls it spent,
+        so the edit history starts over.  A hand-picked colour is not lost — it is
+        carried in as one of the blocks (「按当前色块重新匹配」 pins it) — but
+        undoing across that boundary would undo a colour that is still on screen.
+        """
         self._plans = options
         self._plan_key = options[0].key
         self._base = options[0].result
@@ -1623,10 +1710,10 @@ class PicturePage(QWidget):
         shorter than any diff.  ``placeholder`` replaces the rows with one sentence
         (used while a match is running, when the old rows are already wrong).
         """
-        while self._plan_layout.count():
-            item = self._plan_layout.takeAt(0)
+        while self._plan_rows_layout.count():
+            item = self._plan_rows_layout.takeAt(0)
             widget = item.widget()
-            if widget is not None and widget is not self._plan_hint:
+            if widget is not None:
                 widget.deleteLater()
         for button in self._plan_group.buttons():
             self._plan_group.removeButton(button)
@@ -1634,7 +1721,6 @@ class PicturePage(QWidget):
             self._plan_hint.setText(
                 placeholder or "匹配一张图片后，这里会列出几套耗材搭配，自己挑一套。"
             )
-            self._plan_layout.addWidget(self._plan_hint)
             return
         for index, option in enumerate(self._plans):
             average, worst = option.fidelity
@@ -1657,21 +1743,81 @@ class PicturePage(QWidget):
             line.addWidget(button)
             line.addWidget(numbers)
             line.addStretch(1)
-            self._plan_layout.addWidget(row)
-        self._plan_layout.addWidget(self._plan_hint)
+            self._plan_rows_layout.addWidget(row)
         self._update_plan_hint()
 
-    def _update_plan_hint(self) -> None:
-        option = self._selected_plan()
-        if option is None:
-            self._plan_hint.setText("")
+    # -- 筛选：哪几卷必须用、哪几卷不要用 ---------------------------------
+    def _ordered_ids(self, ids: frozenset[str]) -> list[str]:
+        """``ids`` in library order, so the line reads like the 耗材库 page."""
+        if self._library is None:
+            return sorted(ids)
+        return [filament.id for filament in self._library if filament.id in ids]
+
+    def _spool_name(self, filament_id: str) -> str:
+        if self._library is None:
+            return filament_id
+        filament = self._library.get(filament_id)
+        return filament.display_name if filament is not None else filament_id
+
+    def _update_filter_hint(self) -> None:
+        """One line saying what the filter demands (「没有筛选」 when it demands nothing)."""
+        parts = []
+        if self._require:
+            parts.append(
+                "必须有：" + "、".join(self._spool_name(fid) for fid in self._ordered_ids(self._require))
+            )
+        if self._avoid:
+            parts.append(
+                "不要用：" + "、".join(self._spool_name(fid) for fid in self._ordered_ids(self._avoid))
+            )
+        self._filter_hint.setText("；".join(parts) + "。" if parts else "每一卷都可以用。")
+
+    def _on_filter(self) -> None:
+        """Ask which rolls may be spent, then match again with that demand in hand."""
+        if self._image is None or self._library is None:
             return
-        rolls = "、".join(
-            use.display_name for use in spool_usage(option.result, self._library)
+        dialog = SpoolFilterDialog(
+            list(self._library.visible),
+            self._require,
+            self._avoid,
+            cap=self._spool_cap.value(),
+            parent=self,
         )
-        self._plan_hint.setText(
-            f"{option.note}\n用到的耗材（{len(option.spools)} 卷）：{rolls}"
-        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        require = frozenset(dialog.required())
+        avoid = frozenset(dialog.forbidden())
+        if require == self._require and avoid == self._avoid:
+            return
+        if not self._confirm_filter():
+            return
+        self._require = require
+        self._avoid = avoid
+        self._update_filter_hint()
+        # The filter is a rule about the rolls, so it invalidates the match that is
+        # on screen: the rows above it were chosen without knowing it.
+        self._on_rematch()
+
+    def _confirm_filter(self) -> bool:
+        """Warn before a new filter throws the edits away (it re-matches)."""
+        if not (self._deleted or self._merged or self._replaced):
+            return True
+        ask = QMessageBox(self)
+        ask.setWindowTitle("换筛选要重新匹配")
+        ask.setIcon(QMessageBox.Icon.Warning)
+        ask.setText("换个筛选会把这张图重新匹配一遍，现在这些改动会丢。")
+        ask.setInformativeText("删除 / 合并 / 更换过的颜色只对当前这一套搭配有效。")
+        change = ask.addButton("换筛选", QMessageBox.ButtonRole.AcceptRole)
+        ask.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        ask.setDefaultButton(change)
+        ask.exec()
+        return ask.clickedButton() is change
+
+
+    def _update_plan_hint(self) -> None:
+        """The note only — 「用到的耗材」 right below this line names the rolls."""
+        option = self._selected_plan()
+        self._plan_hint.setText(option.note if option is not None else "")
 
     def _selected_plan(self) -> BudgetOption | None:
         for option in self._plans:
@@ -1818,7 +1964,52 @@ class PicturePage(QWidget):
         self._select(index)
 
     def _on_colour_activated(self, index: int) -> None:
+        """双击一行 = 「这个颜色到底是什么」: 图片里的颜色、匹配到的颜色、配方.
+
+        The details used to sit in a panel of their own, permanently showing
+        whichever row was last clicked.  They are something the user asks about
+        (double-click) rather than something that costs a third of the column,
+        and the dialog is not modal so the next row can be asked about straight
+        away — :meth:`_show_colour` keeps it in step with the selection.
+        """
         self._select(index)
+        if self._result is None or not 0 <= index < len(self._result.palette):
+            return
+        entry = self._result.palette[index]
+        dialog = self._detail_window()
+        dialog.setWindowTitle(f"颜色详情 · {entry.color_hex.upper()} · {entry.short_label}")
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _detail_window(self) -> QDialog:
+        """The 颜色详情 dialog, built on first use.
+
+        It is a shell around ``self._detail`` (the same :class:`ColourDetail` the
+        smoke test and the self-test read), so 「更换颜色」 stays on the action row
+        where it always was instead of moving into a pop-up.
+        """
+        if self._detail_dialog is None:
+            dialog = QDialog(self)
+            dialog.setObjectName("colourDetailDialog")
+            dialog.setMinimumWidth(380)
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.Shape.NoFrame)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            scroll.setWidget(self._detail)
+            buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+            buttons.rejected.connect(dialog.close)
+            close = buttons.button(QDialogButtonBox.StandardButton.Close)
+            if close is not None:
+                close.setText("关闭")
+            box = QVBoxLayout(dialog)
+            box.setContentsMargins(12, 12, 12, 12)
+            box.setSpacing(8)
+            box.addWidget(scroll, 1)
+            box.addWidget(buttons)
+            self._detail_dialog = dialog
+        return self._detail_dialog
 
     # -- the user's edits: 删除 / 合并 / 更换颜色 / 撤销 / 恢复 ---------------
     def _current_index(self) -> int:
