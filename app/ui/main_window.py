@@ -80,6 +80,13 @@ from .swatch import ColorField, swatch_icon
 
 _HEX_QUERY = re.compile(r"^[0-9a-fA-F]{1,6}$")
 
+#: 打开软件时「目标颜色」里预置的颜色（m02366 item 1：用户要求「打开软件后目标颜色
+#: RGB 默认填写 000」）。以前它是「未选择」状态、三个数字框是空白，而空着的数字框读
+#: 出来就是 (0, 0, 0)，于是点「找最接近的颜色」会拿纯黑去查、屏幕上却什么都没写，
+#: 看起来像按钮查错了东西。现在预置成纯黑：数字框里明明白白写着 0 / 0 / 0，
+#: 用户想查别的颜色就改它，清空成「未选择」也照旧可以。
+DEFAULT_TARGET_HEX = "#000000"
+
 # How long the launcher waits, after showing the window, before it starts the
 # first mix-catalogue build.  Long enough for the window to paint (a zero timer
 # loses the race against the paint event), short enough not to feel like a pause.
@@ -210,9 +217,10 @@ class MainWindow(QMainWindow):
         self._show_all_button.clicked.connect(self._clear_filters)
         self._show_all_button.setEnabled(False)
 
-        # Deliberately UNSET: the target is whatever the user wants to print, so
-        # showing a made-up colour here would be a lie until they fill one in.
-        self._target_color = ColorField()
+        # 预置纯黑（见 DEFAULT_TARGET_HEX）：空的数字框读出来也是 (0,0,0)，但屏幕上
+        # 是白的，点「找最接近的颜色」就像在查一个没人填过的目标。用户清空它仍然可以
+        # 回到「未选择」，那时按原来的办法借用表格里选中的颜色。
+        self._target_color = ColorField(DEFAULT_TARGET_HEX)
         self._find_button = QPushButton("找最接近的颜色")
         # Deliberately always clickable — exactly like 确认 in the 添加耗材 dialog.
         # Pressing it before choosing a colour is not an error: it borrows the
@@ -1318,6 +1326,8 @@ class MainWindow(QMainWindow):
         empty 目标颜色 the old code only wrote a hint, which reads as a broken
         button.  So the target is taken from, in order: the colour the user is
         looking at in the table, then the R / G / B numbers as they stand.
+        软件打开时这个字段已经是纯黑（``DEFAULT_TARGET_HEX``），所以「借用」这一步
+        只有在用户自己把目标颜色清空之后才会用到（m02366 item 1）。
         """
         target = self._target_color.hex()
         borrowed = ""

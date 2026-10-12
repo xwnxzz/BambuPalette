@@ -219,8 +219,10 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         "every engine keeps a white + black mix neutral (no blue cast)",
     )
     check(
-        not window._target_color.isSet(),
-        "the 目标颜色 picker starts with no preset colour",
+        window._target_color.isSet()
+        and window._target_color.hex() == "#000000"
+        and window._target_color.rgb() == (0, 0, 0),
+        "目标颜色 starts pre-set to 000 (m02366 item 1)",
     )
     # Clicking a mix marks it with a ring in its OWN colour, and blank space clears
     # the selection again — the old build dimmed every other mix and boxed the
@@ -1343,6 +1345,136 @@ def run_selftest(*, report_path: Path | None = None) -> int:
             "按色块边缘选择：点在旁边的空白上选中最近的那一块",
         )
         page._set_pick_mode(_pp.PICK_COLOUR, save=False)
+
+        # 1.6.17 (m02366 item 2/3)：切到「按色块边缘选择」之后，列表一行是一块，
+        # 删除 / 合并 / 更换颜色都按块来，而且每一样都能撤销——包括切换选择方式本身。
+        class _StubDialog:  # noqa: N801 自检里不弹窗：直接说「用户按了确定、挑了哪个」
+            def __init__(self, choice, chosen):
+                self._choice = choice
+                self._chosen = chosen
+
+            def exec(self):
+                return _pp.QDialog.DialogCode.Accepted
+
+            def chosen(self):
+                return self._chosen if self._chosen is not None else self._choice
+
+        page._set_pick_mode(_pp.PICK_EDGE, save=False)
+        app.processEvents()
+        blocks = page._blocks
+        block_count = 0 if blocks is None else blocks.count
+        check(blocks is not None and block_count > 0, f"按色块边缘选择数出 {block_count} 个色块")
+        check(
+            page._list.row_count() == block_count,
+            f"列表一行一块（{page._list.row_count()} 行 / {block_count} 块）",
+        )
+        check(
+            page._list.row_ids() == blocks.order(),
+            f"列表从上到下就是块从大到小的顺序（{page._list.row_ids()[:4]}… / {blocks.order()[:4]}…）",
+        )
+        biggest = blocks.order()[0]
+        page._list.clear_selection()
+        page._on_region_clicked(biggest)
+        app.processEvents()
+        check(
+            page._view._selected == -1
+            and page._view._selected_mask is not None
+            and np.array_equal(page._view._selected_mask, blocks.mask(biggest)),
+            "点图片选中的是一整块：预览高亮这块的全部像素，不再按「一种颜色」高亮",
+        )
+
+        # 删除：只让选中的那几块留空，别的块照打。
+        block_pixels = page.result.printed_pixels
+        steps = len(page._undo_stack)
+        page._on_delete_colours()
+        app.processEvents()
+        check(
+            page.result.printed_pixels == block_pixels - blocks.size(biggest),
+            f"删除一块只让这一块留空（少印 {block_pixels - page.result.printed_pixels} 像素）",
+        )
+        check(len(page._undo_stack) == steps + 1, "块级删除记了一步历史")
+        page._undo()
+        app.processEvents()
+        check(page.result.printed_pixels == block_pixels, "Ctrl+Z 把这一块印回来")
+
+        # 合并：在选中的块里挑一种颜色，所有选中的块都变成它。
+        page._set_pick_mode(_pp.PICK_EDGE, save=False)
+        app.processEvents()
+        blocks = page._blocks
+        pair = list(blocks.order()[:2]) if blocks is not None and blocks.count >= 2 else []
+        merged = False
+        if len(pair) == 2 and blocks.value(pair[0]) != blocks.value(pair[1]):
+            merged = True
+            page._list.select(pair)
+            keep_entry = page.result.palette[blocks.value(pair[1])]
+            real_merge = _pp.MergeDialog
+            _pp.MergeDialog = lambda *args, **kwargs: _StubDialog(1, None)
+            try:
+                page._on_merge_colours()
+                app.processEvents()
+            finally:
+                _pp.MergeDialog = real_merge
+            picked = page._picked_blocks()[1]
+            keys = {
+                page.result.palette[value].key
+                for value in page.result.indices[picked].tolist()
+            }
+            check(keys == {keep_entry.key}, "合并把选中的块都变成挑中的那种颜色")
+            check(len(page._block_edits) == 2, "合并给每一块各记了一条色块级改动")
+            page._undo()
+            app.processEvents()
+            check(not page._block_edits, "Ctrl+Z 撤销合并，色块级改动回到空")
+
+        # 更换颜色：选中的块一起换。
+        if merged:
+            page._list.select(pair)
+            current = {page.result.palette[blocks.value(label)].key for label in pair}
+            wanted = next(
+                (entry for entry in page._candidate_palette() if entry.key not in current),
+                None,
+            )
+            if wanted is not None:
+                real_picker = _pp.ColourPickerDialog
+                _pp.ColourPickerDialog = lambda *args, **kwargs: _StubDialog(0, wanted)
+                try:
+                    page._on_replace()
+                    app.processEvents()
+                finally:
+                    _pp.ColourPickerDialog = real_picker
+                picked = page._picked_blocks()[1]
+                hexes = {
+                    page.result.palette[value].color_hex
+                    for value in page.result.indices[picked].tolist()
+                }
+                check(hexes == {wanted.color_hex}, "更换颜色把选中的块一起换成新颜色")
+                check(
+                    wanted.key in [entry.key for entry in page.result.palette],
+                    "新颜色进了色表",
+                )
+                page._undo()
+                app.processEvents()
+                check(not page._block_edits, "Ctrl+Z 撤销更换颜色")
+
+        # 切换选择方式本身也算一步：Ctrl+Z 能把用户带回上一种模式。
+        page._set_pick_mode(_pp.PICK_COLOUR, save=False)
+        app.processEvents()
+        steps = len(page._undo_stack)
+        page._pick_combo.setCurrentIndex(1)
+        app.processEvents()
+        check(page._mode == _pp.PICK_EDGE, "从下拉里切到按色块边缘选择")
+        check(len(page._undo_stack) == steps + 1, "切换选择方式算一步历史")
+        page._undo()
+        app.processEvents()
+        check(page._mode == _pp.PICK_COLOUR, "Ctrl+Z 把选择方式也退回去")
+        page._redo()
+        app.processEvents()
+        check(page._mode == _pp.PICK_EDGE, "Ctrl+Y 再切回来")
+        page._undo()
+        app.processEvents()
+        check(
+            page._list.row_count() == len(page.result.palette),
+            "回到颜色模式：列表又是一行一种颜色",
+        )
 
         # 合并: only reachable through the dialog, so drive the non-UI half.
         if len(page.result.palette) >= 2:

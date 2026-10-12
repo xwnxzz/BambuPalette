@@ -267,10 +267,18 @@ class ColourDetail(QWidget):
         self._recipe.setText(entry_recipe_text(entry, library))
         self._hint.setVisible(False)
 
-        if changed:
-            original_hex = original.color_hex.upper() if original is not None else "自动匹配色"
+        if changed and original is None:
+            # 1.6.17: a colour that a block-level edit brought in has no
+            # automatic match to compare against (it exists only because the
+            # user painted it), so there is no ΔE00 to quote — say so instead of
+            # crashing on the missing entry.
             self._difference.setText(
-                f"已手动更换：程序原本匹配到 {original_hex}（ΔE00 "
+                "已换成你挑的颜色（这一块本来没有自动匹配的颜色可比）。"
+                "按 Ctrl+Z（或点「撤销」）可以退回来。"
+            )
+        elif changed:
+            self._difference.setText(
+                f"已手动更换：程序原本匹配到 {original.color_hex.upper()}（ΔE00 "
                 f"{float(_color.delta_e_2000(_color.lab_from_rgb(image_rgb), _color.lab_from_rgb(original.rgb))):.2f}）。"
                 "按 Ctrl+Z（或点「撤销」）可以退回来。"
             )

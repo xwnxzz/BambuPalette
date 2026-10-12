@@ -1394,10 +1394,15 @@ def main() -> int:
     check(nearest is not None, "nearest_recipe returns something for #982C29")
     if nearest is not None:
         check(len(nearest.color_hex) == 7, f"nearest recipe has a hex, got {nearest.color_hex!r}")
-    # The target colour must start UNSET: a pre-filled colour would claim the user
-    # already aimed at something they never chose.
-    check(window._target_color.hex() == "", "the 目标颜色 field starts with no preset colour")
-    check(not window._target_color.isSet(), "the target colour reports itself unset")
+    # m02366 item 1 (1.6.17): the target colour starts PRE-SET to 000.  It used to
+    # start blank, but a blank field still reads (0, 0, 0) — so 找最接近的颜色
+    # quietly searched for black while the box looked empty and the user had no
+    # way to see what was being searched for.
+    check(window._target_color.hex() == "#000000", "the 目标颜色 field starts at 000")
+    check(
+        window._target_color.isSet() and window._target_color.rgb() == (0, 0, 0),
+        "the target colour starts as a real, visible #000000",
+    )
     # Deliberately clickable with nothing chosen, exactly like 确认 in 添加耗材:
     # pressing it early explains what is missing instead of being greyed out.
     check(window._find_button.isEnabled(), "找最接近的颜色 can be pressed right away")

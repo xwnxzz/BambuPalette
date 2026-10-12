@@ -51,6 +51,7 @@ from PySide6.QtWidgets import (
 
 from .. import __version__
 from ..core import paths
+from ..core.blocks import BlockMap, label_blocks, min_block_pixels
 from ..core.image_matching import (
     BudgetOption,
     MatchResult,
@@ -144,7 +145,12 @@ PAGE_HELP = (
     "· 「按当前色块重新匹配」拿现在这些色块重新挑卷，删除、合并和手改过的颜色都留着。\n"
     f"· 点图片时默认「{PICK_MODE_LABELS[PICK_COLOUR]}」：点在哪一块就选哪一块。描边这类细线"
     f"一条只有一两个像素宽，不好点，换成「{PICK_MODE_LABELS[PICK_EDGE]}」后会选离你点的位置"
-    "最近的那一块，点歪一点也能选中。"
+    "最近的那一块，点歪一点也能选中。\n"
+    f"· 选了「{PICK_MODE_LABELS[PICK_EDGE]}」，右边的清单就变成一行一块（第 N 块、它印出来的"
+    "颜色、配方和占比）：点图选中的是整块，下面那排按钮也跟着按块来——「删除」删掉选中的"
+    "那几块（留空、不打印），「合并」在你选的这些块里挑一种颜色、把选中的块全变成它，"
+    "「更换颜色」把选中的块一起换掉。切回「按颜色选择」清单和按钮立刻回到一种颜色一行；"
+    "换选择方式本身也进撤销历史（Ctrl+Z 能退回去）。"
 )
 
 
@@ -174,6 +180,68 @@ def _nearest_edge(result: MatchResult, x: int, y: int, *, fallback: int) -> int:
     distances = (xs + left - x) ** 2 + (ys + top - y) ** 2
     closest = int(np.argmin(distances))
     return int(window[ys[closest], xs[closest]])
+
+
+def _nearest_label(labels: np.ndarray, x: int, y: int, *, fallback: int) -> int:
+    """The block whose pixel is nearest to ``(x, y)``, within :data:`EDGE_PICK_RADIUS`.
+
+    The block-numbered twin of :func:`_nearest_edge`: same window, same
+    distance rule, but the answer is a block id instead of a palette index, so
+    「按色块边缘选择」 can say 「这一块」 rather than 「这一种颜色」 (m02366 item 2).
+    """
+    height, width = labels.shape
+    left = max(0, x - EDGE_PICK_RADIUS)
+    right = min(width, x + EDGE_PICK_RADIUS + 1)
+    top = max(0, y - EDGE_PICK_RADIUS)
+    bottom = min(height, y + EDGE_PICK_RADIUS + 1)
+    window = np.asarray(labels[top:bottom, left:right])
+    ys, xs = np.nonzero(window >= 0)
+    if not len(ys):
+        return fallback
+    distances = (xs + left - x) ** 2 + (ys + top - y) ** 2
+    closest = int(np.argmin(distances))
+    return int(window[ys[closest], xs[closest]])
+
+
+def _live_means(
+    base_means: np.ndarray, indices: np.ndarray, live: np.ndarray, count: int
+) -> np.ndarray:
+    """每种 live 颜色的「图里本色」：它那些像素原来所在颜色的加权平均。
+
+    图片本身没变，变的只是「这些像素打印成什么」，所以块级编辑改过的像素仍然沿用
+    它原来所在颜色的本色——详情窗口左边那个 swatch 就是图上这一块的颜色。
+    """
+    base_flat = indices.ravel()
+    live_flat = live.ravel()
+    keep = (base_flat >= 0) & (live_flat >= 0)
+    if not keep.any():
+        return np.zeros((count, 3), dtype=base_means.dtype)
+    slots = live_flat[keep].astype(np.int64)
+    targets = np.asarray(base_means, dtype=np.float64)[base_flat[keep]]
+    codes = (slots[:, None] * 3 + np.arange(3, dtype=np.int64)).ravel()
+    sums = np.bincount(codes, weights=targets.ravel(), minlength=count * 3)[: count * 3]
+    weights = np.bincount(slots, minlength=count).astype(np.float64)
+    weights[weights == 0] = 1.0
+    return (sums.reshape(count, 3) / weights[:, None]).astype(base_means.dtype)
+
+
+@dataclass(frozen=True)
+class BlockPaint:
+    """One 色块级 edit: exactly these pixels now print ``entry`` (``None`` = 留空).
+
+    「按色块边缘选择」 下删除 / 合并 / 更换颜色都不再是「这一种颜色全改」，而是
+    「这几块改」——所以它们不能记在 ``_deleted`` / ``_merged`` / ``_replaced`` 里
+    （那三本账是整张图按颜色算的），只能按像素记。``mask`` 指向 ``_base.indices``
+    的像素坐标，那个坐标系在编辑之间永远不变，撤销/恢复只要把这一步从列表里拿掉
+    或放回去就回到原样。
+    """
+
+    #: 与 ``_base.indices`` 同形状的 bool 蒙版：这一步改的是哪些像素。
+    mask: np.ndarray
+    #: 这些像素改成哪种颜色；``None`` 表示删除（留空、变透明）。
+    entry: PaletteEntry | None
+    #: 改之前这些像素属于哪些色块，用来在改动之后把选中的块找回来。
+    labels: tuple[int, ...] = ()
 
 
 def _to_qimage(image: Image.Image) -> QImage:
@@ -222,6 +290,10 @@ class PictureView(QWidget):
         self._dragged = False
         #: 「按颜色选择」 or 「按色块边缘选择」 — owned by the page, saved in settings.
         self._pick_mode = DEFAULT_PICK_MODE
+        #: 「按色块边缘选择」下的色块编号图（``-1`` = 没打印），点图片时用它找块。
+        self._block_labels: np.ndarray | None = None
+        #: 选中的那一堆色块的并集掩码；比单个颜色更宽，因为「多选」可以选好几块。
+        self._selected_mask: np.ndarray | None = None
 
     # -- contents ---------------------------------------------------------
     def setResult(self, result: MatchResult | None, source: QImage | None) -> None:
@@ -230,6 +302,7 @@ class PictureView(QWidget):
         self._source = source
         self._matched = self._build_matched(result) if result is not None else None
         self._selected = -1
+        self._selected_mask = None
         self._highlight = None
         same_picture = (
             previous is not None
@@ -250,9 +323,42 @@ class PictureView(QWidget):
             # made of it.  Dimming it made the upload look like a washed-out
             # copy of the preview.
             return
-        if index == self._selected:
+        if index == self._selected and self._selected_mask is None:
             return
         self._selected = int(index)
+        self._selected_mask = None
+        self._highlight = None
+        self.update()
+
+    def setBlockLabels(self, labels: np.ndarray | None) -> None:
+        """The block numbering 「按色块边缘选择」 points with (``None`` = no blocks)."""
+        self._block_labels = None if labels is None else np.asarray(labels)
+        if self._selected_mask is not None:
+            self._highlight = None
+            self.update()
+
+    def setSelectedMask(self, mask: np.ndarray | None) -> None:
+        """Highlight a whole set of blocks at once.
+
+        One colour is not one thing on screen — the eyebrows, the outline and a
+        patch of the body can all print with the same spool — so 「按色块边缘选择」
+        selects several blocks, and the preview has to draw exactly those
+        (m02366 item 2/3).
+        """
+        if self._plain:
+            return
+        if mask is None:
+            changed = self._selected_mask is not None
+            self._selected_mask = None
+        else:
+            wanted = np.asarray(mask, dtype=bool)
+            changed = self._selected_mask is None or not np.array_equal(
+                self._selected_mask, wanted
+            )
+            self._selected_mask = wanted
+        if not changed:
+            return
+        self._selected = -1
         self._highlight = None
         self.update()
 
@@ -385,17 +491,33 @@ class PictureView(QWidget):
         repaint: zooming in and out or clicking another window wiped it.
         """
         result = self._result
-        if self._plain or result is None or self._selected < 0:
+        if self._plain or result is None:
+            return None
+        keep = self._keep_mask(result)
+        if keep is None:
             return None
         if self._highlight is None:
-            self._highlight = self._build_highlight(result, self._selected)
+            self._highlight = self._build_highlight(result, keep)
         return self._highlight
 
-    def _build_highlight(self, result: MatchResult, selected: int) -> QPixmap:
-        """Fade everything but ``selected`` and outline the region that keeps it."""
+    def _keep_mask(self, result: MatchResult) -> np.ndarray | None:
+        """Which pixels stay lit: the selected blocks, or every pixel of one colour.
+
+        ``None`` means nothing is selected, which has to mean nothing is drawn:
+        列表说没选中，预览就不能还画着一块（m00830 item 2）。
+        """
+        if self._selected_mask is not None:
+            if self._selected_mask.shape == result.indices.shape:
+                return self._selected_mask
+            return None
+        if self._selected < 0:
+            return None
+        return result.indices == self._selected
+
+    def _build_highlight(self, result: MatchResult, keep: np.ndarray) -> QPixmap:
+        """Fade everything but ``keep`` and outline the region that keeps it."""
         height, width = result.indices.shape
         canvas = np.zeros((height, width, 4), dtype=np.uint8)
-        keep = result.indices == selected
         printed = result.indices >= 0
         # A wash rather than a solid fill: the rest of the picture stays legible
         # as context, so a small highlighted region is not floating in a void.
@@ -542,10 +664,21 @@ class PictureView(QWidget):
         self._pick_mode = resolve_pick_mode(mode)
 
     def _pick_index(self, result: MatchResult, x: int, y: int) -> int:
-        """The block a click at ``(x, y)`` means in the current 「点图片时」 mode."""
-        exact = int(result.indices[y, x])
+        """What a click at ``(x, y)`` means in the current 「点图片时」 mode.
+
+        「按颜色选择」 answers with a palette index; 「按色块边缘选择」 answers with a
+        block id — and that is the whole difference between 「我要改这种颜色」 and
+        「我要改这一块」 (m02366 item 2).
+        """
         if self._pick_mode != PICK_EDGE:
-            return exact
+            return int(result.indices[y, x])
+        exact = int(result.indices[y, x])
+        labels = self._block_labels
+        if labels is not None and labels.shape == result.indices.shape:
+            own = int(labels[y, x])
+            if own >= 0:
+                return own
+            return _nearest_label(labels, x, y, fallback=-1)
         return _nearest_edge(result, x, y, fallback=exact)
 
 
@@ -568,6 +701,8 @@ class ColourList(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._result: MatchResult | None = None
+        #: 设上它，行就变成「一块一块」而不是「一种颜色一种颜色」（m02366 item 2/3）。
+        self._blocks: BlockMap | None = None
         self._order: list[int] = []
         self._pinned = -1
         self._suppress = False
@@ -611,12 +746,31 @@ class ColourList(QWidget):
         layout.addWidget(self._list, 1)
         layout.addWidget(self._summary)
 
-    def setResult(self, result: MatchResult | None) -> None:
+    def setContent(self, result: MatchResult | None, blocks: BlockMap | None = None) -> None:
+        """Show ``result`` — its colours, or its blocks when ``blocks`` is given.
+
+        The list is the one place the user points at what they want to change, so
+        in 「按色块边缘选择」 it lists blocks (one row each, largest first) and the
+        row ids are block labels; in 「按颜色选择」 it lists colours and the ids are
+        palette indices.
+        """
         self._result = result
+        self._blocks = blocks
         self._pinned = -1
         self._picked = set()
-        self._order = list(range(len(result.palette))) if result is not None else []
+        if result is None:
+            self._order = []
+        elif blocks is not None:
+            self._order = blocks.order()
+        else:
+            self._order = list(range(len(result.palette)))
         self.refresh()
+
+    def setResult(self, result: MatchResult | None) -> None:
+        self.setContent(result)
+
+    def setBlocks(self, blocks: BlockMap | None) -> None:
+        self.setContent(self._result, blocks)
 
     def refresh(self) -> None:
         """Rebuild the rows, keeping the pinned selection and the order."""
@@ -630,6 +784,24 @@ class ColourList(QWidget):
 
     def current(self) -> int:
         return self._pinned
+
+    def row_count(self) -> int:
+        """How many rows are on screen: one per colour, or one per block (1.6.17)."""
+        return self._list.count()
+
+    def row_ids(self) -> list[int]:
+        """What the rows carry, top to bottom.
+
+        A palette index in 「按颜色选择」, a **block id** in 「按色块边缘选择」 — the
+        read-back the tests and the self-checks use to see what the user is
+        actually pointing at (``value_of`` answers with the colour instead).
+        """
+        ids = []
+        for row in range(self._list.count()):
+            item = self._list.item(row)
+            if item is not None:
+                ids.append(int(item.data(Qt.ItemDataRole.UserRole)))
+        return ids
 
     def selected_indices(self) -> list[int]:
         """Every selected colour, in list order — the input to 删除 / 合并.
@@ -651,8 +823,20 @@ class ColourList(QWidget):
     def entries(self) -> list[PaletteEntry]:
         return list(self._result.palette) if self._result is not None else []
 
+    def value_of(self, index: int) -> int:
+        """The palette index a row stands for.
+
+        A colour row IS a palette index; a block row answers with the colour that
+        block prints with, which is what 详情 / 更换颜色 need (``-1`` if it is gone).
+        """
+        if self._blocks is not None:
+            if 0 <= int(index) < self._blocks.count:
+                return self._blocks.value(index)
+            return -1
+        return int(index)
+
     def pin(self, index: int, *, reorder: bool = False) -> None:
-        """Make ``index`` the current colour and reveal its row.
+        """Make ``index`` the current row and reveal it.
 
         ``reorder=True`` also moves it to the top of the list.  A plain click
         must NOT reorder: the list used to shuffle on every click, so the row
@@ -660,15 +844,18 @@ class ColourList(QWidget):
         clicked (the user reported exactly that).  The order is now the sort order
         and nothing else; only the sample screenshots ask for a colour to be
         shown first.
+
+        ``index`` is validated against the rows that are actually there, not
+        against ``result.palette``: in 「按色块边缘选择」 the rows carry block
+        labels, which are neither palette indices nor in palette order.
         """
-        result = self._result
-        if result is None or not (0 <= index < len(result.palette)):
+        if self._result is None or self._row_of(int(index)) < 0:
             return
         self._pinned = int(index)
         if not reorder:
             self._reveal()
             return
-        self._order = [self._pinned] + [i for i in range(len(result.palette)) if i != self._pinned]
+        self._order = [self._pinned] + [one for one in self._order if one != self._pinned]
         self._refresh()
 
     def _row_of(self, index: int) -> int:
@@ -772,21 +959,10 @@ class ColourList(QWidget):
         self._list.clear()
         if result is not None:
             total = max(1, result.printed_pixels)
-            for index in self._order:
-                entry = result.palette[index]
-                count = int(result.counts[index])
-                image_hex = hex_of(result.region_colour(index))
-                share = count / total * 100.0
-                row = QListWidgetItem(
-                    compare_pixmap(image_hex, entry.color_hex, 44, 20),
-                    f"{image_hex} → {entry.color_hex}    {share:.1f}%\n"
-                    f"{entry_recipe_text(entry, self._library, compact=True)}",
-                )
-                row.setData(Qt.ItemDataRole.UserRole, int(index))
-                # No hover tooltip here: the row already prints the picture's
-                # own colour, the matched colour, the share and the recipe, so
-                # the black pop-up only repeated it.
-                self._list.addItem(row)
+            if self._blocks is not None:
+                self._fill_block_rows(result, total)
+            else:
+                self._fill_colour_rows(result, total)
             # Deleting or merging rebuilds the rows, and the user's selection has
             # to come back with them; a colour that is gone simply drops out.
             live = {
@@ -805,12 +981,64 @@ class ColourList(QWidget):
         # whatever happens to be row 0 now.
         self._reveal()
 
+    def _fill_colour_rows(self, result: MatchResult, total: int) -> None:
+        """「按颜色选择」：一行一种颜色，行号就是调色板下标。"""
+        for index in self._order:
+            entry = result.palette[index]
+            count = int(result.counts[index])
+            image_hex = hex_of(result.region_colour(index))
+            share = count / total * 100.0
+            row = QListWidgetItem(
+                compare_pixmap(image_hex, entry.color_hex, 44, 20),
+                f"{image_hex} → {entry.color_hex}    {share:.1f}%\n"
+                f"{entry_recipe_text(entry, self._library, compact=True)}",
+            )
+            row.setData(Qt.ItemDataRole.UserRole, int(index))
+            # No hover tooltip here: the row already prints the picture's
+            # own colour, the matched colour, the share and the recipe, so
+            # the black pop-up only repeated it.
+            self._list.addItem(row)
+
+    def _fill_block_rows(self, result: MatchResult, total: int) -> None:
+        """「按色块边缘选择」：一行一块（m02366 item 2/3）。
+
+        The row id is the block label, NOT a palette index — that is why
+        ``value_of`` exists.  The text still names the colour the block prints
+        with, because 更换颜色 / 合并 are about colours even here.
+        """
+        blocks = self._blocks
+        assert blocks is not None
+        for rank, label in enumerate(self._order, start=1):
+            value = blocks.value(label)
+            share = blocks.size(label) / total * 100.0
+            if 0 <= value < len(result.palette):
+                entry = result.palette[value]
+                image_hex = hex_of(result.region_colour(value))
+                text = (
+                    f"第 {rank} 块  {image_hex} → {entry.color_hex}    {share:.1f}%\n"
+                    f"{entry_recipe_text(entry, self._library, compact=True)}"
+                )
+                icon = compare_pixmap(image_hex, entry.color_hex, 44, 20)
+            else:
+                text = f"第 {rank} 块    {share:.1f}%"
+                icon = compare_pixmap("#FFFFFF", "#FFFFFF", 44, 20)
+            row = QListWidgetItem(icon, text)
+            row.setData(Qt.ItemDataRole.UserRole, int(label))
+            self._list.addItem(row)
+
     def _update_summary(self) -> None:
         result = self._result
         if result is None:
             self._summary.setText("导入图片后，这里列出打印需要的颜色。")
             return
         selected = len(self.selected_indices())
+        if self._blocks is not None:
+            extra = f" · 选中 {selected} 块" if selected else ""
+            self._summary.setText(
+                f"{result.width}×{result.height} 像素 · 实心 {result.printed_pixels} 像素"
+                f" · 共 {self._blocks.count} 个色块{extra}"
+            )
+            return
         extra = f" · 选中 {selected} 种" if selected else ""
         self._summary.setText(
             f"{result.width}×{result.height} 像素 · 实心 {result.printed_pixels} 像素"
@@ -961,6 +1189,14 @@ class PicturePage(QWidget):
         self._merged: dict[int, int] = {}
         #: ``original index -> PaletteEntry``, the 「更换颜色」 replacements.
         self._replaced: dict[int, PaletteEntry] = {}
+        #: 「按色块边缘选择」 的块级编辑，按发生顺序叠加（m02366 item 3）。每一条都是
+        #: 像素级的，因为「删除这一块」跟「删除这一种颜色」在图上不是一回事。
+        self._block_edits: list[BlockPaint] = []
+        #: 当前匹配上认出来的色块；只在块模式下建（顺序、掩码都由它出）。
+        self._blocks: BlockMap | None = None
+        #: 当前「点图片时」的方式。存在页面里（而不是只问 view），是因为历史、
+        #: 列表和块表都要看它（m02439 的答复：切换方式本身算一步撤销）。
+        self._mode: str = DEFAULT_PICK_MODE
         self._undo_stack: list[tuple] = []
         self._redo_stack: list[tuple] = []
         #: Live palette index -> original index, rebuilt by ``_compose``.
@@ -1115,6 +1351,8 @@ class PicturePage(QWidget):
         self._list.colourDeselected.connect(self._on_colour_deselected)
         self._list.colourActivated.connect(self._on_colour_activated)
         self._list.selectionChanged.connect(self._update_actions)
+        # 块模式下「多选」是一组色块，预览要画的是这一组的并集，不只是光标那一行。
+        self._list.selectionChanged.connect(self._sync_block_highlight)
 
         # 「删除 / 合并 / 更换颜色 / 撤销 / 恢复」 sit in ONE row right under the
         # colour list, in that order: the first three all act on the selection
@@ -1428,6 +1666,7 @@ class PicturePage(QWidget):
         self._deleted = set()
         self._merged = {}
         self._replaced = {}
+        self._block_edits = []
         self._undo_stack = []
         self._redo_stack = []
         self._on_rematch()
@@ -1505,6 +1744,12 @@ class PicturePage(QWidget):
             )
         ]
         self._plan_key = state.plan
+        # 色块级的改动（哪几块被删掉 / 合并 / 换成了什么）跟删除、合并、更换一起存，
+        # 打开工程要把它们摆回同样的顺序，预览才是保存时的那张 (m02366 item 3).
+        self._block_edits = [
+            BlockPaint(mask=np.asarray(mask, dtype=bool), entry=entry)
+            for mask, entry in state.block_paints
+        ]
         self._refresh_plans()
         self._stale = False
         self._apply_edits()
@@ -1518,7 +1763,9 @@ class PicturePage(QWidget):
             edits.append(f"合并 {len(self._merged)} 种")
         if self._replaced:
             edits.append(f"更换 {len(self._replaced)} 种")
-        tail = f"；里面记着{'、'.join(edits)}颜色" if edits else ""
+        if self._block_edits:
+            edits.append(f"色块改动 {len(self._block_edits)} 处")
+        tail = f"；里面记着{'、'.join(edits)}" if edits else ""
         self._status.setText(
             f"已打开工程 {path.name}"
             + (f"（保存于 {state.saved_at}）" if state.saved_at else "")
@@ -1572,6 +1819,9 @@ class PicturePage(QWidget):
                 version=__version__,
                 preview=render_preview(self._result),
                 plan=self._plan_key,
+                # 色块级的删除 / 合并 / 更换颜色 (m02366 item 3)：整块一起改，改的是像素
+                # 而不是「哪一种颜色」，所以文件里存的是掩码，见 save_project.
+                block_paints=[(edit.mask, edit.entry) for edit in self._block_edits],
             )
         except Exception as error:
             QApplication.restoreOverrideCursor()
@@ -1581,10 +1831,13 @@ class PicturePage(QWidget):
         self._project_path = written
         self._dirty = False
         spools = len(spool_usage(self._result, self._library))
+        blocks = (
+            f" + {len(self._block_edits)} 处色块改动" if self._block_edits else ""
+        )
         self._status.setText(
             f"已保存工程 {written.name}（{written.parent}）："
-            f"原图 + 预览 + {len(self._result.palette)} 种颜色 + {spools} 卷耗材。"
-            "下次「打开工程」就回到这一步。"
+            f"原图 + 预览 + {len(self._result.palette)} 种颜色 + {spools} 卷耗材"
+            f"{blocks}。下次「打开工程」就回到这一步。"
         )
 
     def _confirm_discard(self, action: str) -> bool:
@@ -1794,6 +2047,9 @@ class PicturePage(QWidget):
         self._deleted = set()
         self._merged = {}
         self._replaced = {}
+        # 块编辑记的是上一张匹配里某几块的像素；换了一张匹配，那些像素不再代表
+        # 用户当时点的那一块，所以一起清掉（Ctrl+Z 能把它们和旧匹配一起拿回来）。
+        self._block_edits = []
         # A new match is a new picture: whatever the project file holds is now
         # one step behind.
         self._dirty = True
@@ -1995,6 +2251,8 @@ class PicturePage(QWidget):
         self._deleted = set()
         self._merged = {}
         self._replaced = {}
+        # 方案换了就是换了一张图，色块级的改动跟着上一张走（Ctrl+Z 能一起拿回来）。
+        self._block_edits = []
         # A different 方案 is a different picture: the project file needs saving
         # again, and the mesh has to be rebuilt from the new colours.
         self._dirty = True
@@ -2055,35 +2313,53 @@ class PicturePage(QWidget):
     def _show_colour(self, index: int, *, keep_picked: bool = False) -> None:
         """Put ``index`` on screen without touching the preview history.
 
+        ``index`` is whatever the list's rows carry: a palette index in
+        「按颜色选择」, a **block id** in 「按色块边缘选择」 (m02366 item 2).  In 块模式
+        the highlight is that block's pixels, not every pixel of its colour —
+        which is the whole difference between 「这一块」 and 「这一种颜色」.
+
         ``keep_picked`` is for taking the highlight off one block while a
         multi-selection stays put: 「多选」 is a set of colours the user is about to
         删除 or 合并, so clearing the preview must not empty that set (m01411 item 3).
         """
         index = int(index)
         self._shown = index
-        self._view.setSelected(index)
-        self._original_view.setSelected(index)
+        blocks = self._blocks
+        # 块模式下 view 自己认不出块编号，一切高亮都由页面上算好的掩码说了算。
+        self._view.setSelected(-1 if blocks is not None else index)
+        self._original_view.setSelected(-1 if blocks is not None else index)
         if index < 0:
             # 「取消选中」: no colour, so no block, no detail and no row highlight.
             if not keep_picked:
                 self._list.clear_selection()
+            if blocks is not None:
+                self._view.setSelectedMask(None)
             self._detail.clear()
             return
         self._list.pin(index)
+        if blocks is not None:
+            if not 0 <= index < blocks.count:
+                self._view.setSelectedMask(None)
+                self._detail.clear()
+                return
+            self._sync_block_highlight()
         if self._result is None:
             return
-        if not 0 <= index < len(self._result.palette):
+        value = self._list.value_of(index)
+        if not 0 <= value < len(self._result.palette):
+            self._detail.clear()
             return
         original = None
         changed = False
-        if index < len(self._live_map):
-            source = self._live_map[index]
-            if self._base is not None and source < len(self._base.palette):
+        if value < len(self._live_map):
+            source = self._live_map[value]
+            if self._base is not None and 0 <= source < len(self._base.palette):
                 original = self._base.palette[source]
-            changed = source in self._replaced
+            # ``-1`` = 块级编辑带进来的新颜色，本来就是「换过的」，没有原色可比。
+            changed = source < 0 or source in self._replaced
         self._detail.setSelection(
             self._result,
-            index,
+            value,
             library=self._library,
             changed=changed,
             original=original,
@@ -2128,11 +2404,15 @@ class PicturePage(QWidget):
         (double-click) rather than something that costs a third of the column,
         and the dialog is not modal so the next row can be asked about straight
         away — :meth:`_show_colour` keeps it in step with the selection.
+
+        块模式下一行是一块，问的仍然是「这一块打印成什么颜色」，所以整段按
+        ``value_of`` 折算后的调色板下标走 (m02366 item 3).
         """
         self._select(index)
-        if self._result is None or not 0 <= index < len(self._result.palette):
+        value = self._list.value_of(index)
+        if self._result is None or not 0 <= value < len(self._result.palette):
             return
-        entry = self._result.palette[index]
+        entry = self._result.palette[value]
         dialog = self._detail_window()
         dialog.setWindowTitle(f"颜色详情 · {entry.color_hex.upper()} · {entry.short_label}")
         dialog.show()
@@ -2170,12 +2450,18 @@ class PicturePage(QWidget):
 
     # -- the user's edits: 删除 / 合并 / 更换颜色 / 撤销 / 恢复 ---------------
     def _current_index(self) -> int:
+        """The palette index the highlighted row stands for (``-1`` = none).
+
+        行号在块模式下是块编号，所以这里统一过一遍 ``value_of``：调用方（更换颜色、
+        详情）要的永远是「调色板里哪一种颜色」，不是「第几块」。
+        """
         index = self._list.current()
         if index < 0:
             return -1
-        if self._result is None or not 0 <= index < len(self._result.palette):
+        value = self._list.value_of(index)
+        if self._result is None or not 0 <= value < len(self._result.palette):
             return -1
-        return index
+        return value
 
     def _snapshot(self) -> tuple:
         """Everything one step of history has to put back.
@@ -2185,6 +2471,11 @@ class PicturePage(QWidget):
         switch replace the match itself — a new ``_base``, a new list of plans, a
         newly checked row — so those travel with the snapshot too, and Ctrl+Z after
         a re-match lands exactly where the user was (m01411 item 1).
+
+        1.6.17 adds two more: the 色块级 edits (``_block_edits`` — the user asked for
+        撤销/恢复 on them too) and「点图片时」 itself, because switching between
+        「按颜色选择」 and 「按色块边缘选择」 changes what the list shows and therefore
+        has to be one step the user can take back (m02439 的答复).
         """
         return (
             set(self._deleted),
@@ -2193,16 +2484,29 @@ class PicturePage(QWidget):
             self._base,
             list(self._plans),
             self._plan_key,
+            list(self._block_edits),
+            self._mode,
         )
 
     def _restore(self, snapshot: tuple) -> None:
-        deleted, merged, replaced, base, plans, plan_key = snapshot
+        (
+            deleted,
+            merged,
+            replaced,
+            base,
+            plans,
+            plan_key,
+            block_edits,
+            mode,
+        ) = snapshot
         self._deleted = set(deleted)
         self._merged = dict(merged)
         self._replaced = dict(replaced)
         self._base = base
         self._plans = list(plans)
         self._plan_key = plan_key
+        self._block_edits = list(block_edits)
+        self._mode = mode
 
     def _push(self) -> None:
         """Remember the state before an edit, and drop the redo history."""
@@ -2244,6 +2548,11 @@ class PicturePage(QWidget):
         would leave the deleted pixels behind.  Deleted pixels become ``-1``,
         which is exactly the transparent index the matcher already uses — so
         ``build_plate`` gives them no base plate and no colour prism.
+
+        1.6.17 的色块级编辑（m02366 item 3）叠在最后一步：它们记的是「哪些像素改成
+        什么」，跟颜色编号无关。所以先按颜色把 ``_base`` 折算成 live 编号，再把每一步
+        的掩码刷上去；刷上去需要的颜色如果当前调色板里没有就追加一个位子——「把这几块
+        换成这个颜色」当然可以带进来一种新颜色。
         """
         base = self._base
         if base is None:
@@ -2267,38 +2576,70 @@ class PicturePage(QWidget):
             if index not in gone and index not in merged
         ]
         palette = [self._replaced.get(index, base.palette[index]) for index in alive]
-        if alive:
-            totals = np.bincount(
-                indices[indices >= 0].ravel(), minlength=len(base.palette)
-            )
-            counts = np.asarray([totals[index] for index in alive], dtype=base.counts.dtype)
-        else:
-            counts = np.zeros(0, dtype=base.counts.dtype)
-        means = None
-        if base.means is not None and len(base.means) == len(base.palette):
-            means = np.asarray([base.means[index] for index in alive], dtype=base.means.dtype)
-
         live = np.full(indices.shape, -1, dtype=np.int32)
         for position, original in enumerate(alive):
             mask = indices == original
             if mask.any():
                 live[mask] = position
-        self._live_map = alive
+
+        # live 位子 -> 原调色板下标（``-1`` = 块级编辑带进来的新颜色，图里没有它）。
+        origins: list[int] = list(alive)
+        if self._block_edits:
+            slot_of: dict[str, int] = {}
+            for position, entry in enumerate(palette):
+                slot_of.setdefault(entry.key, position)
+            for edit in self._block_edits:
+                mask = edit.mask
+                if mask.shape != live.shape or not mask.any():
+                    continue
+                if edit.entry is None:
+                    live[mask] = -1
+                    continue
+                slot = slot_of.get(edit.entry.key)
+                if slot is None:
+                    slot = len(palette)
+                    palette.append(edit.entry)
+                    origins.append(-1)
+                    slot_of[edit.entry.key] = slot
+                live[mask] = slot
+
+        if palette:
+            totals = np.bincount(live[live >= 0].ravel(), minlength=len(palette))
+            counts = np.asarray(totals[: len(palette)], dtype=base.counts.dtype)
+        else:
+            counts = np.zeros(0, dtype=base.counts.dtype)
+        means = None
+        if palette and base.means is not None and len(base.means) == len(base.palette):
+            means = _live_means(base.means, indices, live, len(palette))
+
+        self._live_map = origins
         return replace(
             base,
             palette=palette,
             indices=live,
             counts=counts,
             means=means,
+            # 色块级编辑之后「每种颜色的色差」这本账不再对得上：它按原来的颜色记，
+            # 而现在同一片地方改了打印色。宁可退回按块的均值算（``_fidelity_values``
+            # 的第二条路），也不要拿旧数字冒充。
+            source_values=None if self._block_edits else base.source_values,
+            source_counts=None if self._block_edits else base.source_counts,
         )
 
-    def _apply_edits(self, keep: int | None = None) -> None:
+    def _apply_edits(
+        self, keep: int | None = None, *, reselect: np.ndarray | None = None
+    ) -> None:
         """Recompose the live result and show it everywhere.
 
         ``keep`` is the palette index the edit was about (the colour the user merged
         into, the one they swapped); the highlight follows it so the detail panel still
         shows what the edit produced.  If that colour is gone — the user deleted the very
         colour they had picked — nothing is selected instead.
+
+        ``reselect`` is the pixels a 色块级 edit just touched: the block ids from
+        before it are meaningless afterwards, so the blocks covering those pixels
+        are found again and stay selected, which is what lets the user act twice
+        in a row without hunting for the same block again (m02366 item 3).
 
         What must never happen is 预览 drawing a block while the list claims nothing is
         selected: that dim wash and outline over an unclaimed colour is 「没有选择颜色的时候
@@ -2315,39 +2656,131 @@ class PicturePage(QWidget):
         self._preview_history.clear()
         result = self._result
         if result is None:
+            self._blocks = None
             self._view.setResult(None, self._source_qimage)
             self._original_view.setResult(None, self._source_qimage)
+            self._view.setBlockLabels(None)
             self._list.setResult(None)
             self._refresh_base_combo()
             self._detail.clear()
             self._update_actions()
             self._announce_edits()
             return
+        blocks = self._build_blocks(result)
+        self._blocks = blocks
         self._view.setResult(result, self._source_qimage)
         self._original_view.setResult(result, self._source_qimage)
-        self._list.setResult(result)
+        self._view.setBlockLabels(blocks.labels if blocks is not None else None)
+        self._list.setContent(result, blocks)
         self._refresh_base_combo()
-        target = self._live_map.index(anchor) if anchor in self._live_map else -1
-        if 0 <= target < len(result.palette):
-            self._select(target)
+        if blocks is not None:
+            # 块模式：选中的是块编号，跟调色板下标没有关系，所以整条高亮都走块表。
+            wanted = self._blocks_after(reselect)
+            if wanted:
+                self._list.select(wanted)
+            if wanted:
+                self._select(wanted[0])
+            else:
+                self._show_colour(-1)
         else:
-            self._show_colour(-1)
+            target = self._live_map.index(anchor) if anchor in self._live_map else -1
+            if 0 <= target < len(result.palette):
+                self._select(target)
+            else:
+                self._show_colour(-1)
         self._update_actions()
         self._announce_edits()
 
+    # -- 色块：认出它们、画它们、改完之后把选中的找回来 --------------------
+    def _build_blocks(self, result: MatchResult | None) -> BlockMap | None:
+        """The block table of the current match — ``None`` outside 块模式.
+
+        The threshold comes from the printed pixel count (:func:`min_block_pixels`):
+        an anti-aliased edge is hundreds of single-pixel specks, and a list with
+        one row per speck is unreadable and unclickable (measured on the reported
+        pig: 953 blocks, 773 of them a single pixel).
+        """
+        if result is None or self._mode != PICK_EDGE:
+            return None
+        return label_blocks(result.indices, min_pixels=min_block_pixels(result.printed_pixels))
+
+    def _blocks_after(self, mask: np.ndarray | None) -> list[int]:
+        """Which blocks to select after an edit: the ones covering ``mask``.
+
+        A block counts as「还是刚才那一块」 when at least half of it lies inside the
+        pixels the edit touched — a merge of three blocks into one gives back that
+        one block, a 更换颜色 on one block gives back that block, and a block that
+        merely shares a border with the edit is not dragged in.
+        """
+        blocks = self._blocks
+        if blocks is None or mask is None or not mask.any():
+            return []
+        labels = blocks.labels
+        if labels.shape != mask.shape:
+            return []
+        touched = labels[mask]
+        wanted = []
+        for label in np.unique(touched):
+            label = int(label)
+            if label < 0:
+                continue
+            shared = int(np.count_nonzero(touched == label))
+            if shared * 2 >= blocks.size(label):
+                wanted.append(label)
+        return wanted
+
+    def _sync_block_highlight(self) -> None:
+        """Draw the union of the selected blocks in 预览 (m02366 item 2/3).
+
+        「多选」 in 块模式 is a set of blocks, so the picture has to show that set
+        and not just the row the cursor is on.  In 颜色模式 nothing changes: the
+        view keeps using ``_selected`` and its palette-index mask.
+        """
+        blocks = self._blocks
+        if blocks is None or self._result is None:
+            return
+        mask = None
+        for label in self._list.selected_indices():
+            if not 0 <= label < blocks.count:
+                continue
+            one = blocks.mask(label)
+            mask = one if mask is None else (mask | one)
+        if mask is None:
+            # 一块都没选：预览不许还画着东西（m00830 item 2）。
+            if self._list.current() >= 0 and self._blocks is not None:
+                label = self._list.current()
+                if 0 <= label < blocks.count:
+                    self._view.setSelectedMask(blocks.mask(label))
+                    return
+            self._view.setSelectedMask(None)
+            return
+        self._view.setSelectedMask(mask)
+
     def _on_pick_mode_changed(self, index: int) -> None:
         mode = self._pick_combo.itemData(index)
-        self._set_pick_mode(mode if isinstance(mode, str) else DEFAULT_PICK_MODE)
+        # 切换选择方式本身算一步，Ctrl+Z 能把用户带回上一种模式（m02439 的答复）。
+        self._set_pick_mode(
+            mode if isinstance(mode, str) else DEFAULT_PICK_MODE, record=True
+        )
 
-    def _set_pick_mode(self, mode: str, *, save: bool = True) -> None:
-        """Point the view and the combo at ``mode``, and remember the choice.
+    def _set_pick_mode(self, mode: str, *, save: bool = True, record: bool = False) -> None:
+        """Point the view, the list and the combo at ``mode``, and remember it.
 
         m01411 item 4: 「按颜色选择」 is what this page always did — 点在哪一块就是
         哪一块; 「按色块边缘选择」 picks the block whose edge is nearest instead, so the
         one-pixel brows and outlines of a picture like the reporter's pig can be hit
         at all.  Whichever they used last is what they get next time.
+
+        1.6.17: the mode now also decides what the list LISTS — colours or blocks —
+        and switching it is a step of its own in the history, so Ctrl+Z takes the
+        user back to the other mode (m02439 的答复).  ``record=False`` is for the
+        undo/redo/load paths, which are restoring a mode that is already recorded.
         """
         mode = resolve_pick_mode(mode)
+        if record and mode != self._mode:
+            self._push()
+        switched = mode != self._mode
+        self._mode = mode
         self._view.setPickMode(mode)
         row = self._pick_combo.findData(mode)
         if row >= 0 and row != self._pick_combo.currentIndex():
@@ -2356,6 +2789,20 @@ class PicturePage(QWidget):
             self._pick_combo.blockSignals(False)
         if save:
             save_settings({"pick_mode": mode})
+        # ``_build_ui`` sets the saved mode before the list exists yet; there is
+        # nothing to re-list at that point, only the view to point at the mode.
+        if switched and getattr(self, "_list", None) is not None:
+            # 列表整个换了内容，旧的选中集（颜色编号 vs 块编号）不能带过去。
+            self._list.clear_selection()
+            self._apply_edits()
+            self._status.setText(
+                "点图片时改成「{0}」：{1}".format(
+                    PICK_MODE_LABELS.get(mode, mode),
+                    "点一下选中一整块，多选可以攒成一组色块。"
+                    if mode == PICK_EDGE
+                    else "点一下选中一种颜色，多选可以攒成一组颜色。",
+                )
+            )
 
     def _on_multi_toggled(self, on: bool) -> None:
         """「多选」：click to add a colour, click again to drop it — no Ctrl."""
@@ -2367,7 +2814,11 @@ class PicturePage(QWidget):
         style.polish(self._multi_button)
 
     def _update_actions(self) -> None:
-        """ 删除 needs one colour, 合并 needs two, and the history drives the rest."""
+        """删除 needs one row, 合并 needs two, and the history drives the rest.
+
+        一行在「按颜色选择」里是一种颜色、在「按色块边缘选择」里是一块，所以这条规则
+        两种模式共用：块模式下它就是「删除要选一块、合并要选两块」(m02366 item 3).
+        """
         picked = self._list.selected_indices() if self._result is not None else []
         live = bool(self._result is not None and len(self._result.palette))
         self._delete_button.setEnabled(live and len(picked) >= 1)
@@ -2388,6 +2839,8 @@ class PicturePage(QWidget):
             parts.append(f"合并 {len(self._merged)} 种颜色")
         if self._replaced:
             parts.append(f"手动更换 {len(self._replaced)} 种颜色")
+        if self._block_edits:
+            parts.append(f"色块级改动 {len(self._block_edits)} 处")
         if not parts:
             # When the match found more than one way to spend the rolls, say so:
             # the panel is on the right, and a user who does not scroll that far
@@ -2397,12 +2850,18 @@ class PicturePage(QWidget):
                 if len(self._plans) > 1
                 else ""
             )
+            hint = (
+                "点图片选一整块，多选可以攒成一组色块；点「更换颜色」把这些块一起换掉，"
+                "也可以「删除」（留空不打印）或「合并」（都变成其中一种颜色）。"
+                if self._blocks is not None
+                else "点击右侧颜色看图片高光，点击图片看它属于哪种颜色；点「更换颜色」可以"
+                "手动换掉不合适的颜色，多选颜色后可以「删除」（留空不打印）或「合并」。"
+            )
             self._status.setText(
-                "匹配完成：{0}×{1} 像素，{2} 种颜色。{3}点击右侧颜色看图片高光，"
-                "点击图片看它属于哪种颜色；点「更换颜色」可以手动换掉不合适的颜色，"
-                "多选颜色后可以「删除」（留空不打印）或「合并」。".format(
+                "匹配完成：{0}×{1} 像素，{2} 种颜色。{3}".format(
                     result.width, result.height, len(result.palette), choices
                 )
+                + hint
             )
             return
         printed = result.printed_pixels
@@ -2447,9 +2906,53 @@ class PicturePage(QWidget):
             )
         self._usage.setText(f"共 {len(uses)} 卷：" + " · ".join(parts))
 
+    def _picked_blocks(self) -> tuple[list[int], np.ndarray | None]:
+        """（选中的块编号, 它们合起来的掩码）—— 块模式下三个动作的输入。
+
+        颜色模式下这三个动作拿的是「哪几种颜色」，块模式下拿的是「哪几块」；
+        掩码是它们的像素，因为块级编辑记的就是像素 (m02366 item 3).
+        """
+        blocks = self._blocks
+        if blocks is None:
+            return [], None
+        labels = [
+            int(label)
+            for label in self._list.selected_indices()
+            if 0 <= int(label) < blocks.count
+        ]
+        if not labels:
+            return [], None
+        mask = None
+        for label in labels:
+            one = blocks.mask(label)
+            mask = one if mask is None else (mask | one)
+        return labels, mask
+
+    def _delete_blocks(self, labels: list[int]) -> None:
+        """「删除」 in 块模式：这几块留空，别的块照打 (m02366 item 3)."""
+        blocks = self._blocks
+        if blocks is None:
+            return
+        masks = [blocks.mask(label) for label in labels if 0 <= label < blocks.count]
+        if not masks:
+            return
+        mask = masks[0]
+        for one in masks[1:]:
+            mask = mask | one
+        self._push()
+        self._block_edits.append(BlockPaint(mask=mask, entry=None, labels=tuple(sorted(labels))))
+        self._apply_edits(reselect=mask)
+        self._status.setText(
+            f"已删除 {len(masks)} 块：这些地方留空、变成透明，不打印也没有底板。"
+            "Ctrl+Z 可以撤销。"
+        )
+
     def _on_delete_colours(self) -> None:
         picked = self._list.selected_indices()
         if not picked:
+            return
+        if self._blocks is not None:
+            self._delete_blocks(picked)
             return
         originals = [self._live_map[i] for i in picked if 0 <= i < len(self._live_map)]
         if not originals:
@@ -2462,9 +2965,62 @@ class PicturePage(QWidget):
             "不打印也没有底板。Ctrl+Z 可以撤销。"
         )
 
+    def _merge_blocks(self, labels: list[int]) -> None:
+        """「合并」 in 块模式：在选中的块里挑一种颜色，所有选中的块都变成它.
+
+        用户的原话是「用户在选中的色块里选一个颜色，把所有选中的色块变成选择的颜色」
+        (m02366 item 3)：所以对话框里列的是这些块当前打印的颜色（去重，一种一行），
+        选定之后每一块都被刷成那种颜色——它们会因此变成同色的块，本来就挨着的会连成
+        一整块。颜色本身没有新增，所以调色板里的位子照旧。
+        """
+        blocks = self._blocks
+        result = self._result
+        if blocks is None or result is None:
+            return
+        entries: list[PaletteEntry] = []
+        seen: set[str] = set()
+        for label in labels:
+            value = blocks.value(label)
+            if not 0 <= value < len(result.palette):
+                continue
+            entry = result.palette[value]
+            if entry.key in seen:
+                continue
+            seen.add(entry.key)
+            entries.append(entry)
+        if len(entries) < 2:
+            return
+        dialog = MergeDialog(entries, parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        choice = dialog.chosen()
+        if not 0 <= choice < len(entries):
+            return
+        target = entries[choice]
+        masks = [blocks.mask(label) for label in labels if 0 <= label < blocks.count]
+        if not masks:
+            return
+        mask = masks[0]
+        for one in masks[1:]:
+            mask = mask | one
+        self._push()
+        for label in labels:
+            if 0 <= label < blocks.count:
+                self._block_edits.append(
+                    BlockPaint(mask=blocks.mask(label), entry=target, labels=(int(label),))
+                )
+        self._apply_edits(reselect=mask)
+        self._status.setText(
+            f"已把选中的 {len(masks)} 块都换成 {target.color_hex}，"
+            "这些地方整块都用它打印。Ctrl+Z 可以撤销。"
+        )
+
     def _on_merge_colours(self) -> None:
         picked = self._list.selected_indices()
         if len(picked) < 2 or self._result is None:
+            return
+        if self._blocks is not None:
+            self._merge_blocks(picked)
             return
         entries = [self._result.palette[index] for index in picked]
         dialog = MergeDialog(entries, parent=self)
@@ -2491,6 +3047,8 @@ class PicturePage(QWidget):
         self._redo_stack.append(self._snapshot())
         self._restore(self._undo_stack.pop())
         self._dirty = True
+        # 撤销的那一步可能是「切换选择方式」，所以连模式一起摆回去（不记新的一步）。
+        self._set_pick_mode(self._mode, save=False)
         self._apply_edits()
         # The step may have been a re-match or a 方案 switch, so the rows on the
         # right are re-drawn from the plans that came back with it.
@@ -2503,11 +3061,55 @@ class PicturePage(QWidget):
         self._undo_stack.append(self._snapshot())
         self._restore(self._redo_stack.pop())
         self._dirty = True
+        self._set_pick_mode(self._mode, save=False)
         self._apply_edits()
         self._refresh_plans()
         self._status.setText("已恢复刚才撤销的那一步。")
 
+    def _replace_blocks(self) -> None:
+        """「更换颜色」 in 块模式：选中的块一起换成同一种颜色 (m02366 item 3)."""
+        labels, mask = self._picked_blocks()
+        result = self._result
+        if not labels or mask is None or result is None or self._library is None:
+            return
+        index = self._current_index()
+        value = index if index >= 0 else self._list.value_of(labels[0])
+        if not 0 <= value < len(result.palette):
+            return
+        entry = result.palette[value]
+        entries = self._candidate_palette()
+        if not entries:
+            self._status.setText("调色板是空的，请先添加耗材。")
+            return
+        # 「要替换的图片颜色」 is the colour of the block the user is looking at:
+        # 块模式下列表里一行是一块，选中的那一块就是问题所在。
+        dialog = ColourPickerDialog(
+            entries,
+            result.region_colour(value),
+            library=self._library,
+            current_key=entry.key,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        chosen = dialog.chosen()
+        if chosen is None:
+            return
+        self._push()
+        for label in labels:
+            if 0 <= label < self._blocks.count:
+                self._block_edits.append(
+                    BlockPaint(mask=self._blocks.mask(label), entry=chosen, labels=(int(label),))
+                )
+        self._apply_edits(reselect=mask)
+        self._status.setText(
+            f"已把选中的 {len(labels)} 块换成 {chosen.color_hex}。Ctrl+Z 可以撤销。"
+        )
+
     def _on_replace(self) -> None:
+        if self._blocks is not None:
+            self._replace_blocks()
+            return
         index = self._current_index()
         if index < 0 or self._result is None or self._library is None:
             return

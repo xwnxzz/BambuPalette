@@ -384,6 +384,195 @@ class ProjectRoundTripTests(unittest.TestCase):
             self.assertIn("share", row)
 
 
+class BlockPaintTests(unittest.TestCase):
+    """色块级改动（1.6.17）的存取：删除留空、换成某个颜色，撤销要能一步步倒回去。"""
+
+    def setUp(self) -> None:
+        self._dir = Path(self.enterContext(_temp_dir()))
+
+    def _masks(self, base: MatchResult) -> tuple[np.ndarray, np.ndarray]:
+        first = np.zeros(base.indices.shape, dtype=bool)
+        first[0:3, 1:3] = True
+        second = np.zeros(base.indices.shape, dtype=bool)
+        second[1:5, 3] = True
+        return first, second
+
+    def test_block_edits_survive_the_round_trip(self):
+        library = _library()
+        base = _base_match(library)
+        first, second = self._masks(base)
+        replacement = _palette(library)[3]
+        written = save_project(
+            self._dir / "blocks",
+            image=_picture(),
+            image_name="色块",
+            base=base,
+            library=library,
+            block_paints=[(first, replacement), (second, None)],
+        )
+        with zipfile.ZipFile(written) as archive:
+            names = set(archive.namelist())
+        # 一张图层就装得下所有色块改动；没有改动时这个成员不出现。
+        self.assertIn("色块图层.npy", names)
+
+        state = load_project(written, library=None)
+        self.assertEqual(len(state.block_paints), 2)
+        # 第二块是「删除留空」，读回来还是空的——不能被当成「没改过」。
+        self.assertIsNone(state.block_paints[1]["entry"])
+        self.assertTrue(np.array_equal(state.block_paints[0]["mask"], first))
+        self.assertTrue(np.array_equal(state.block_paints[1]["mask"], second))
+        self.assertEqual(state.block_paints[0]["entry"].color_hex, replacement.color_hex)
+        self.assertEqual(state.block_paints[0]["entry"].key, replacement.key)
+
+    def test_the_last_edit_of_a_pixel_is_the_one_that_sticks(self):
+        # 两个遮罩叠在一起时，后面的那一步说了算：文件里一张图层，读回来也该是
+        # 「后来改的盖住先前改的」——不然撤销一次会看到颜色跳错地方。
+        library = _library()
+        base = _base_match(library)
+        wide = np.zeros(base.indices.shape, dtype=bool)
+        wide[0:4, 1:3] = True
+        narrow = np.zeros(base.indices.shape, dtype=bool)
+        narrow[0:2, 1:2] = True
+        replacement = _palette(library)[3]
+        written = save_project(
+            self._dir / "overlap",
+            image=_picture(),
+            image_name="重叠",
+            base=base,
+            library=library,
+            block_paints=[(wide, replacement), (narrow, None)],
+        )
+        state = load_project(written, library=None)
+        self.assertEqual(len(state.block_paints), 2)
+        self.assertTrue(np.array_equal(state.block_paints[1]["mask"], narrow))
+        self.assertTrue(
+            np.array_equal(state.block_paints[0]["mask"], wide & ~narrow),
+            "先前那一步的遮罩至少该让出后来被改过的像素",
+        )
+        overlap = wide & narrow
+        self.assertFalse(np.any(state.block_paints[0]["mask"] & overlap))
+
+    def test_a_block_colour_joins_the_live_palette(self):
+        # 色块级编辑可以带进来一个原本不在色表里的颜色；打开工程时它要排在后面，
+        # 和页面的 _compose 一个顺序，不然 base_hex 会指错色。
+        library = _library()
+        base = _base_match(library)
+        first, _second = self._masks(base)
+        replacement = _palette(library)[3]
+        self.assertNotIn(replacement.key, [entry.key for entry in base.palette])
+        written = save_project(
+            self._dir / "newcolour",
+            image=_picture(),
+            image_name="新颜色",
+            base=base,
+            library=library,
+            block_paints=[(first, replacement)],
+        )
+        state = load_project(written, library=None)
+        rebuilt = _live_palette(state.base, {"deleted": [], "merged": {}}, {}, state.block_paints)
+        self.assertEqual(
+            [entry.color_hex for entry in rebuilt],
+            [entry.color_hex for entry in base.palette] + [replacement.color_hex],
+        )
+
+    def test_a_project_without_block_edits_still_opens(self):
+        # 1.6.16 及更早的工程没有这个键、也没有图层成员：读成「没有色块改动」。
+        library = _library()
+        base = _base_match(library)
+        written = save_project(
+            self._dir / "plain",
+            image=_picture(),
+            image_name="旧工程",
+            base=base,
+            library=library,
+        )
+        with zipfile.ZipFile(written) as archive:
+            self.assertNotIn("色块图层.npy", archive.namelist())
+        self.assertEqual(load_project(written, library=library).block_paints, [])
+
+    def test_a_project_whose_block_layer_is_missing_is_refused(self):
+        # 文档说有改动、图层却不在：宁可说清楚，也不能装作没改过——那是用户一下午的活。
+        library = _library()
+        base = _base_match(library)
+        first, _second = self._masks(base)
+        written = save_project(
+            self._dir / "lost",
+            image=_picture(),
+            image_name="缺图层",
+            base=base,
+            library=library,
+            block_paints=[(first, _palette(library)[3])],
+        )
+        stripped = self._dir / "lost2.bpproj"
+        with zipfile.ZipFile(written) as source, zipfile.ZipFile(
+            stripped, "w", zipfile.ZIP_DEFLATED
+        ) as target:
+            for name in source.namelist():
+                if name != "色块图层.npy":
+                    target.writestr(name, source.read(name))
+        with self.assertRaises(ProjectError) as caught:
+            load_project(stripped)
+        self.assertIn("色块级改动", str(caught.exception))
+
+    def test_a_block_layer_of_the_wrong_size_is_refused(self):
+        library = _library()
+        base = _base_match(library)
+        first, _second = self._masks(base)
+        written = save_project(
+            self._dir / "size",
+            image=_picture(),
+            image_name="尺寸不对",
+            base=base,
+            library=library,
+            block_paints=[(first, _palette(library)[3])],
+        )
+        broken = self._dir / "size2.bpproj"
+        import io
+
+        buffer = io.BytesIO()
+        np.save(buffer, np.zeros((3, 3), dtype=np.int32))
+        with zipfile.ZipFile(written) as source, zipfile.ZipFile(
+            broken, "w", zipfile.ZIP_DEFLATED
+        ) as target:
+            for name in source.namelist():
+                payload = buffer.getvalue() if name == "色块图层.npy" else source.read(name)
+                target.writestr(name, payload)
+        with self.assertRaises(ProjectError) as caught:
+            load_project(broken)
+        self.assertIn("尺寸不符", str(caught.exception))
+
+    def test_a_colour_painted_nowhere_keeps_its_step(self):
+        # 换颜色换成了跟原来一样的颜色：图层上那一步什么都不盖。它仍然占一步，
+        # 这样撤销的次数和用户做过的操作对得上。
+        library = _library()
+        base = _base_match(library)
+        empty = np.zeros(base.indices.shape, dtype=bool)
+        replacement = _palette(library)[3]
+        written = save_project(
+            self._dir / "empty",
+            image=_picture(),
+            image_name="空改动",
+            base=base,
+            library=library,
+            block_paints=[(empty, replacement)],
+        )
+        state = load_project(written, library=None)
+        self.assertEqual(len(state.block_paints), 1)
+        self.assertFalse(np.any(state.block_paints[0]["mask"]))
+        self.assertEqual(state.block_paints[0]["entry"].color_hex, replacement.color_hex)
+
+    def test_absurdly_many_block_steps_are_refused(self):
+        # 图层是 int16：说清楚上限，比写出一张悄悄错位的图好。
+        from app.core.project import _paint_layer
+
+        library = _library()
+        base = _base_match(library)
+        paints = [(np.zeros(base.indices.shape, dtype=bool), None)] * 32001
+        with self.assertRaises(ProjectError) as caught:
+            _paint_layer(base.indices.shape, paints)
+        self.assertIn("32000", str(caught.exception))
+
+
 class ProjectErrorTests(unittest.TestCase):
     def setUp(self) -> None:
         self._dir = Path(self.enterContext(_temp_dir()))

@@ -115,6 +115,20 @@ def main() -> int:
     window.grab().save(str(OUT / "picture-page.png"))
     print("wrote", OUT / "picture-page.png")
 
+    # 1.6.17: the same page in 「按色块边缘选择」 — the list becomes one row per
+    # block and 多选 / 删除 / 合并 / 更换颜色 act on blocks instead of colours.
+    from app.ui.picture_page import PICK_EDGE  # noqa: E402
+
+    page._set_pick_mode(PICK_EDGE, save=False)
+    app.processEvents()
+    blocks = page._blocks
+    if blocks is not None and blocks.count:
+        page._on_region_clicked(blocks.order()[0])
+        app.processEvents()
+        print("blocks:", blocks.count, "biggest:", blocks.size(blocks.order()[0]), "px")
+    window.grab().save(str(OUT / "picture-blocks.png"))
+    print("wrote", OUT / "picture-blocks.png")
+
     page.buildPlate()
     print("plate:", page.plate.stats())
     print("notes:", page.plate.notes)

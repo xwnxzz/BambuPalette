@@ -55,6 +55,8 @@ _DOCUMENT = "工程.json"
 _SOURCE = "原图.png"
 _PREVIEW = "预览.png"
 _INDICES = "基线.npy"
+#: 色块级编辑（1.6.17）：每个像素最后被第几步改过，``-1`` = 没被块编辑碰过。
+_LAYER = "色块图层.npy"
 
 #: 工程里记的初始值，和 :class:`MatchSettings` 的字段一一对应。只写这几个：其余
 #: （alpha_threshold / merge_delta_e / smooth_radius）用户改不到，写进文件只会变成
@@ -90,6 +92,11 @@ class ProjectState:
     #: 一套的结果，这个 key 只是让「打开工程」能说出当初选的是哪一套；没有这个键的
     #: 旧文件读成空字符串，页面照旧按文件里的颜色表显示。
     plan: str = ""
+    #: 色块级编辑，按顺序一条一项：``{"mask": bool 数组（H×W）, "entry": PaletteEntry | None}``。
+    #: ``entry=None`` 是「这几块删掉、留空」；掩码在文件里不是逐条存 bool，而是合并成
+    #: 一张「每个像素最后被第几步改过」的图（见 :data:`_LAYER`），不然一个大图上几百条
+    #: 改动会把工程文件撑成几十兆。
+    block_paints: list[dict] = field(default_factory=list)
     #: 保存时那张「用到的耗材」清单，读回来只用于显示与核对（真正的耗材归属跟着
     #: 调色板走，耗材库里没有的那一卷会照实标出来）。
     spools: list[dict] = field(default_factory=list)
@@ -280,6 +287,41 @@ def _indices_from_bytes(payload: bytes) -> np.ndarray:
     return np.asarray(array, dtype=np.int32)
 
 
+def _paint_parts(item) -> tuple[np.ndarray | None, PaletteEntry | None]:
+    """One 色块级 edit as ``(mask, entry)``; both the tuple and the dict form."""
+    if isinstance(item, dict):
+        return item.get("mask"), item.get("entry")
+    mask, entry = item
+    return mask, entry
+
+
+def _paint_layer(
+    shape: tuple[int, int], paints: list
+) -> tuple[np.ndarray | None, list[PaletteEntry | None]]:
+    """Pile the masks into one 「最后被第几步改过」 map, plus the per-step colours.
+
+    A colour edit is one pixel mask per action; the file stores, for every pixel,
+    which action painted it last, and one JSON entry per action.  That is a single
+    int16 image of the picture however many edits there are.
+    """
+    entries: list[PaletteEntry | None] = []
+    if not paints:
+        return None, entries
+    if len(paints) > 32000:
+        raise ProjectError("色块级改动太多了，存不下（上限 32000 步）。")
+    layer = np.full(shape, -1, dtype=np.int16)
+    for step, item in enumerate(paints):
+        mask, entry = _paint_parts(item)
+        entries.append(entry)
+        if mask is None:
+            continue
+        mask = np.asarray(mask, dtype=bool)
+        if mask.shape != shape or not mask.any():
+            continue
+        layer[mask] = np.int16(step)
+    return layer, entries
+
+
 def save_project(
     path: str | Path,
     *,
@@ -296,12 +338,16 @@ def save_project(
     version: str = "",
     preview: Image.Image | None = None,
     plan: str = "",
+    block_paints=(),
 ) -> Path:
     """Write one ``.bpproj`` file.  Returns the path actually written."""
     target = Path(path)
     if target.suffix.lower() != PROJECT_SUFFIX:
         target = target.with_suffix(PROJECT_SUFFIX)
     shown = live if live is not None else base
+    layer, paint_entries = _paint_layer(
+        (int(base.indices.shape[0]), int(base.indices.shape[1])), list(block_paints or ())
+    )
     document = {
         "app": "BambuPalette",
         "format": PROJECT_FORMAT,
@@ -331,6 +377,10 @@ def save_project(
                 str(int(key)): entry_to_json(entry)
                 for key, entry in dict(replaced or {}).items()
             },
+            # 色块级编辑：一条一步，``null`` = 那一步把这几块删空（留空不打印）。
+            "block_paints": [
+                entry_to_json(entry) if entry is not None else None for entry in paint_entries
+            ],
         },
         "colours": colour_list(shown),
         "spools": spool_list(shown, library),
@@ -348,6 +398,8 @@ def save_project(
     with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr(_DOCUMENT, json.dumps(document, ensure_ascii=False, indent=2))
         archive.writestr(_INDICES, _indices_bytes(base.indices))
+        if layer is not None:
+            archive.writestr(_LAYER, _indices_bytes(layer))
         source_buffer = io.BytesIO()
         image.convert("RGBA").save(source_buffer, format="PNG")
         archive.writestr(_SOURCE, source_buffer.getvalue())
@@ -379,6 +431,10 @@ def load_project(
                 )
             source_bytes = archive.read(_SOURCE)
             indices = _indices_from_bytes(archive.read(_INDICES))
+            # 1.6.17 的色块图层是可选的：没有它的工程照旧能打开，只是没有块级改动。
+            layer = (
+                _indices_from_bytes(archive.read(_LAYER)) if _LAYER in names else None
+            )
     except zipfile.BadZipFile as error:
         raise ProjectError(f"{target.name} 不是有效的工程文件（{error}）。") from error
     except (OSError, ValueError, KeyError) as error:
@@ -432,6 +488,7 @@ def load_project(
         int(key): entry_from_json(value, library, engine)
         for key, value in dict(edits.get("replaced") or {}).items()
     }
+    block_paints = _paints_from_json(edits.get("block_paints"), layer, indices, library, engine)
     plate_data = document.get("plate") or {}
     plate = PlateSettings(
         **{
@@ -441,7 +498,7 @@ def load_project(
     )
     base_hex = str(plate_data.get("base_hex") or "")
     base_index = -1
-    live_palette = _live_palette(base, edits, replaced)
+    live_palette = _live_palette(base, edits, replaced, block_paints)
     for index, entry in enumerate(live_palette):
         if base_hex and entry.color_hex == base_hex:
             base_index = index
@@ -455,6 +512,7 @@ def load_project(
         deleted={int(value) for value in (edits.get("deleted") or ())},
         merged={int(key): int(value) for key, value in dict(edits.get("merged") or {}).items()},
         replaced=replaced,
+        block_paints=block_paints,
         plate=plate,
         engine=engine,
         plan=str(document.get("plan") or ""),
@@ -465,14 +523,47 @@ def load_project(
     )
 
 
-def _live_palette(base: MatchResult, edits: dict, replaced: dict) -> list[PaletteEntry]:
+def _paints_from_json(
+    steps,
+    layer: np.ndarray | None,
+    indices: np.ndarray,
+    library: FilamentLibrary | None,
+    engine: str,
+) -> list[dict]:
+    """Rebuild the 色块级 edits: one mask per step, cut out of the layer map.
+
+    ``layer`` holds, per pixel, the last step that painted it, so step ``n``'s mask
+    is ``layer == n``.  A file with steps but no layer (or a layer of the wrong
+    size) is inconsistent, and quietly dropping the user's edits would be worse
+    than saying so.
+    """
+    entries = list(steps or ())
+    if not entries:
+        return []
+    if layer is None or layer.shape != indices.shape:
+        raise ProjectError("工程里的色块级改动读不出来（图层缺失或尺寸不符）。")
+    paints = []
+    for step, item in enumerate(entries):
+        entry = entry_from_json(item, library, engine) if item else None
+        paints.append({"mask": layer == step, "entry": entry})
+    return paints
+
+
+def _live_palette(
+    base: MatchResult,
+    edits: dict,
+    replaced: dict,
+    block_paints=(),
+) -> list[PaletteEntry]:
     """The colour list the page will show for this project, in its order.
 
     Mirrors ``PicturePage._resolve``/``_compose`` exactly — merge chains are
     followed, a colour deleted takes everything merged into it with it, a merge
     *source* stops being a colour of its own, and the survivors keep the
-    original palette order.  It lives here (not only in the page) so the file's
-    ``base_hex`` can be turned back into a palette index while loading.
+    original palette order.  Colours that only exist because a 色块级 edit brought
+    them in (1.6.17) come after those, in the order they were first used — the
+    same order ``_compose`` builds.  It lives here (not only in the page) so the
+    file's ``base_hex`` can be turned back into a palette index while loading.
     """
     merged = {int(key): int(value) for key, value in dict(edits.get("merged") or {}).items()}
     for source in list(merged):
@@ -491,4 +582,12 @@ def _live_palette(base: MatchResult, edits: dict, replaced: dict) -> list[Palett
         for index in range(len(base.palette))
         if index not in gone and index not in merged
     ]
-    return [replaced.get(index, base.palette[index]) for index in alive]
+    palette = [replaced.get(index, base.palette[index]) for index in alive]
+    known = {entry.key for entry in palette}
+    for paint in block_paints or ():
+        entry = paint.get("entry") if isinstance(paint, dict) else paint[1]
+        if entry is None or entry.key in known:
+            continue
+        known.add(entry.key)
+        palette.append(entry)
+    return palette
