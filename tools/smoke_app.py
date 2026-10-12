@@ -1962,8 +1962,14 @@ def main() -> int:
                 if isinstance(edit_row.itemAt(position).widget(), _QPushButton)
             ]
             check(
-                labels == ["多选", "删除 (Del)", "合并", "更换颜色", "撤销", "恢复"],
+                labels == ["多选", "删除", "合并", "更换颜色", "撤销", "恢复"],
                 f"the edit row reads 多选 删除 合并 更换颜色 撤销 恢复, got {labels}",
+            )
+            # m02316 item 3: Del still deletes, it just is not part of the button's name
+            # any more — 帮助 is where the key is written down now.
+            check(
+                "Del" in _picture_page.PAGE_HELP,
+                "「删除」不再叫 (Del)，但帮助里还写着 Del 就是删除",
             )
 
             page._on_delete_colours()
@@ -2320,8 +2326,13 @@ def main() -> int:
             from PySide6.QtTest import QTest as _QTest  # noqa: PLC0415
 
             check(
-                "Del" in page._delete_button.text(),
-                f"the 删除 button names the shortcut, got {page._delete_button.text()!r}",
+                page._delete_button.text() == "删除",
+                f"the 删除 button is just 删除 again (m02316 item 3), got "
+                f"{page._delete_button.text()!r}",
+            )
+            check(
+                "Del" in _picture_page.PAGE_HELP,
+                "… and 帮助 still says Del means 删除",
             )
             page._set_pick_mode(_picture_page.PICK_EDGE, save=False)
             app.processEvents()
@@ -2411,20 +2422,25 @@ def main() -> int:
                 app.processEvents()
             page._set_pick_mode(_picture_page.PICK_COLOUR, save=False)
             app.processEvents()
-            # m02039: 原图 only follows 色块, never 颜色 — a colour-level delete leaves
-            # the picture itself untouched.
+            # m02316 item 2: a colour-level delete edits 原图 too — the pixels become
+            # transparent, exactly like a block-level delete.  原图 and 预览 must never
+            # tell two different stories about the same picture.
             page._list.select([0])
             colour_image = page._image.tobytes()
             page._on_delete_colours()
             app.processEvents()
             check(
-                page._image.tobytes() == colour_image
-                and not page._original_edited
-                and not page._original_badge.isVisible(),
-                "deleting a colour leaves 原图 alone",
+                page._image.tobytes() != colour_image
+                and page._original_edited
+                and page._original_badge.isVisible(),
+                "deleting a colour edits 原图 too, badge and all",
             )
             page._undo()
             app.processEvents()
+            check(
+                page._image.tobytes() == colour_image and not page._original_edited,
+                "Ctrl+Z puts a colour-level delete back as well",
+            )
             page._list.select([0])
             wanted = next(
                 (
@@ -2578,6 +2594,44 @@ def main() -> int:
                 and page._base is page._plans[0].result,
                 "clicking the first plan brings the first answer back",
             )
+            # m02316 item 7: a project file only remembers the plan it was saved under,
+            # so 「打开工程」 used to leave 耗材方案 with that single row and no way to see
+            # the other 搭法 short of pressing 「按当前色块重新匹配」——但没人觉得「打开一个
+            # 工程」要先按它。打开时顺手把同一批色块的其它搭法补齐，勾还在文件里那一套上。
+            plans_project = TEMP / "saved-plans.bpproj"
+            real_dialog = _picture_page.QFileDialog
+            real_box = _picture_page.QMessageBox
+            _picture_page.QFileDialog = _StubChooser(plans_project)
+            _picture_page.QMessageBox = _StubMessageBox
+            offered = len(page._plans)
+            check(offered >= 2, f"先让这张图有几套搭配，才看得出补齐（{offered} 套）")
+            page._on_save_project()
+            app.processEvents()
+            check(page._dirty is False and plans_project.is_file(), "把这一版存成工程")
+            _StubMessageBox.answer = "不保存"
+            page._on_open_project()
+            app.processEvents()
+            check(
+                len(page._plans) == offered,
+                f"打开工程之后方案表把别的搭法补齐了（{len(page._plans)} 行 / 存档时 {offered} 套）",
+            )
+            check(
+                page._plan_key == page._plans[0].key and page._base is page._plans[0].result,
+                "勾还在文件里那一套上",
+            )
+            check(
+                len(page._plan_group.buttons()) == len(page._plans),
+                "补出来的每一套都有自己的单选钮",
+            )
+            check(
+                all(option.spools for option in page._plans),
+                "补出来的方案都说着自己要用哪几卷",
+            )
+            _StubMessageBox.answer = "清空"
+            page._project_path = None
+            page._dirty = False
+            _picture_page.QFileDialog = real_dialog
+            _picture_page.QMessageBox = real_box
             page._spool_cap.setValue(remembered_cap)
             page._on_rematch()
             app.processEvents()
@@ -2697,11 +2751,20 @@ def main() -> int:
             page._update_filter_hint()
             page._on_rematch()
             app.processEvents()
-            # m02039: 按颜色删除 leaves 原图 alone, so a plain 重新匹配 starts from the
-            # untouched picture and the deleted colour is back.
+            # m02316 item 2: the colour-level delete already took those pixels out of
+            # 原图, so a plain 重新匹配 starts from that picture and the colour does NOT
+            # come back.  This is what the reporter asked for in 图三: the two views must
+            # agree, and a deleted colour must stay deleted.
+            opaque = float(
+                (_np.asarray(page._image.convert("RGBA"))[..., 3] > 0).mean()
+            )
+            printed = page._result.printed_pixels / max(1, page._result.total_pixels)
             check(
-                len(page._result.palette) == keep and not page._deleted,
-                "「重新匹配」从图片重来，删掉的颜色回来了",
+                not page._deleted
+                and len(page._result.palette) < keep
+                and abs(printed - opaque) < 0.01,
+                "「重新匹配」从改过的原图出发，删掉的颜色没有回来"
+                f"（不透明 {opaque:.1%}、打印 {printed:.1%}、{len(page._result.palette)} 种 < {keep}）",
             )
 
             # --- one project file per picture (m08102 item 5) -------------------
@@ -2712,6 +2775,10 @@ def main() -> int:
             _picture_page.QFileDialog = _StubChooser(project)
             _picture_page.QMessageBox = _StubMessageBox
             check(page._project_path is None, "the picture tab starts with no project file")
+            # The rolls are read off the match that is on screen right now: the picture
+            # has been edited since `uses` was measured (a colour delete edits 原图, so
+            # 重新匹配 no longer brings that colour back).
+            saving_uses = _spool_usage(page.result, library)
             page._on_save_project()
             app.processEvents()
             check(project.is_file(), "保存工程 wrote the project file")
@@ -2725,7 +2792,7 @@ def main() -> int:
                 document = json.loads(package.read("工程.json").decode("utf-8"))
             check(document["app"] == "BambuPalette", "the document names the program")
             check(
-                len(document["spools"]) == len(uses),
+                len(document["spools"]) == len(saving_uses),
                 "the document lists the spools this picture needs",
             )
             check(

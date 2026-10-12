@@ -143,6 +143,12 @@ PICK_MODE_LABELS = {PICK_COLOUR: "按颜色选择", PICK_EDGE: "按色块边缘�
 PLAN_HINT_TEXT = "匹配一张图片后，这里会列出几套耗材搭配，自己挑一套。"
 USAGE_HINT_TEXT = "匹配完成后，这里列出这一版用到了哪几卷耗材，以及各卷占的色料比例。"
 
+#: 颜色列表面板的标题（m02316 item 5）。这一栏在两种「点图片时」下装的不是同一种东西：
+#: 「按颜色选择」里一行是一种颜色（图里要印的色），「按色块边缘选择」里一行是一块（第 N
+#: 块）。所以标题也跟着换，不然块模式下写着「打印图片需要的颜色」、列出来却是「第 1 块…」。
+LIST_TITLE_COLOUR = "打印图片需要的颜色"
+LIST_TITLE_BLOCK = "图片上色块的颜色"
+
 PAGE_HELP = (
     "图像转换这一步：\n"
     f"· {ZOOM_HINT}\n"
@@ -158,18 +164,29 @@ PAGE_HELP = (
     "· 在「按色块边缘选择」下删除或合并，会同时改「原图」本身——删掉的那块在原图里变透明、"
     "并掉的那几块在原图里刷成选中的颜色，所以「重新匹配」和「按当前色块重新匹配」都从改过的"
     "原图出发，删掉的地方不会又被匹配回来。原图被改过之后，它上方的标题旁边会出现「原图已修"
-    "改」。按颜色删除或合并只决定「这些颜色不打印／都用同一种颜色打印」，原图不动；「更换颜"
-    "色」也从来不动原图。Ctrl+Z 会把原图一起退回去。\n"
+    "改」。按颜色删除或合并也一样改原图（1.6.20 起）：删掉一种颜色 = 这些像素在源图里变透明，"
+    "合并两种颜色 = 这些像素在源图里刷成留下的那一种——改的是同一张图的同一批像素，就该是同"
+    "一件事。只有「更换颜色」不动原图，它说的是「这块地方这一次用哪一卷来印」，换一套搭配还"
+    "能再改。Ctrl+Z 会把原图一起退回去。\n"
+    "· 「耗材方案」里一行是一套卷组（哪几卷料），同一批卷的另一种配方算同一行。颜色越多，"
+    "能凑出不同卷组的余地越大；一张图只剩两三种颜色时，往往只有一套卷组能凑出来，那几行就会"
+    "变少——想看别的搭配，得先让图里有更多颜色（颜色数量调大、重新匹配）。\n"
     "· 匹配时状态栏右边有一条进度条，跟着「正在匹配：…」一路走到 100%。它要等匹配超过"
     f" {BUSY_DELAY_MS} 毫秒才出现，几毫秒就完成的匹配不会闪一下。\n"
     f"· 点图片时默认「{PICK_MODE_LABELS[PICK_COLOUR]}」：点在哪一块就选哪一块。描边这类细线"
     f"一条只有一两个像素宽，不好点，换成「{PICK_MODE_LABELS[PICK_EDGE]}」后会选离你点的位置"
     "最近的那一块，点歪一点也能选中。\n"
     f"· 选了「{PICK_MODE_LABELS[PICK_EDGE]}」，右边的清单就变成一行一块（第 N 块、它印出来的"
-    "颜色、配方和占比）：点图选中的是整块，下面那排按钮也跟着按块来——「删除」删掉选中的"
-    "那几块（留空、不打印），「合并」在你选的这些块里挑一种颜色、把选中的块全变成它，"
-    "「更换颜色」把选中的块一起换掉。切回「按颜色选择」清单和按钮立刻回到一种颜色一行；"
-    "换选择方式本身也进撤销历史（Ctrl+Z 能退回去）。"
+    "颜色、配方和占比），标题也跟着从「打印图片需要的颜色」改成「图片上色块的颜色」：点图选中"
+    "的是整块，下面那排按钮也跟着按块来——「删除」删掉选中的那几块（留空、不打印），「合并」"
+    "在你选的这些块里挑一种颜色、把选中的块全变成它，「更换颜色」把选中的块一起换掉。切回"
+    "「按颜色选择」清单和按钮立刻回到一种颜色一行；换选择方式本身也进撤销历史（Ctrl+Z 能退回"
+    "去）。\n"
+    "· 单选时再点一下已经选中的那一行／那一块，就取消选中（预览里的高亮一起收掉），不用先点到"
+    "别处去。\n"
+    "· 「打开工程」之后，「耗材方案」除了文件里存着的那一套，还会把同一批色块的其它卷组搭配"
+    "列在下面（1.6.20 起）：文件里只记得住挑中的那一套，别的搭法本来要按「按当前色块重新匹配」"
+    "才看得到。当前这一套仍然是文件里那一套，勾还在它上面。"
 )
 
 
@@ -1456,7 +1473,7 @@ class PicturePage(QWidget):
         # The key is written on the button because it is the only place that can
         # say it: a tooltip would cover the picture (see above), and a keyboard
         # shortcut nobody can see is a shortcut nobody uses (m01566 item 1).
-        self._delete_button = QPushButton("删除 (Del)")
+        self._delete_button = QPushButton("删除")
         self._delete_button.clicked.connect(self._on_delete_colours)
 
         self._merge_button = QPushButton("合并")
@@ -1597,7 +1614,8 @@ class PicturePage(QWidget):
         # 耗材方案 comes first: it decides what the panel under it says, and it now
         # answers the printer's question (which rolls to load) as well.
         right.addWidget(self._wrap(self._plan_scroll, "耗材方案"))
-        right.addWidget(self._wrap(list_box, "打印图片需要的颜色"))
+        self._list_panel = self._wrap(list_box, LIST_TITLE_COLOUR)
+        right.addWidget(self._list_panel)
         right.setStretchFactor(0, 2)
         right.setStretchFactor(1, 3)
         # 耗材方案 may be collapsed away entirely so the colour list gets the whole
@@ -1690,6 +1708,8 @@ class PicturePage(QWidget):
         box.setSpacing(8)
         box.addLayout(head)
         box.addWidget(widget, 1)
+        # 标题要能换字（m02316 item 5）：颜色列的标题随「点图片时」在两种说法之间切。
+        frame.title_label = header  # type: ignore[attr-defined]
         return frame
 
     def _set_controls_enabled(self, enabled: bool) -> None:
@@ -1804,12 +1824,16 @@ class PicturePage(QWidget):
             self._original_badge.setVisible(self._original_edited)
 
     def _paint_original(self, mask: np.ndarray, entry: PaletteEntry | None) -> None:
-        """Write a 色块级 edit into the picture itself (1.6.19, m01566 item 2).
+        """Write a 删除/合并 edit into the picture itself (1.6.19, m01566 item 2).
 
         ``entry is None`` means 删除: those pixels become transparent, so they are
         blank in 原图 as well and the next match leaves them unprinted.
         Otherwise 合并: the pixels take that colour, so 原图 really shows one block
         of one colour and matching the modified picture finds that colour again.
+
+        1.6.19 只给色块级的删除／合并用；1.6.20 起按颜色的删除／合并也走这里（m02316
+        item 2）——两者都是「这几片地方以后按这个来印」，改的既然是同一张图、同一批
+        像素，就应该是同一件事，区别只在于掩码是「选中的块」还是「选中的那几种颜色」。
 
         This is deliberately separate from ``_block_edits``: that overlay is what
         预览 shows right now, this is what 匹配 starts from later.
@@ -1897,16 +1921,16 @@ class PicturePage(QWidget):
         # The 方案 list belongs to a match, and 「打开工程」 deliberately does not run
         # one: the colour table in the file is what the user saved, edits and all,
         # and re-matching could answer something slightly different.  So the panel
-        # shows the single row this file came with — named for the 方案 it was
-        # saved under — and 「重新匹配」 is what fills in the other choices.
-        self._plans = [
-            BudgetOption(
-                key=state.plan,
-                title=plan_caption(state.plan)[0],
-                note=plan_caption(state.plan)[1],
-                result=state.base,
-            )
-        ]
+        # starts with the single row this file came with — named for the 方案 it was
+        # saved under — and 1.6.20 fills the other 搭法 in behind it below
+        # (``_fill_open_plans``, m02316 item 7).
+        saved = BudgetOption(
+            key=state.plan,
+            title=plan_caption(state.plan)[0],
+            note=plan_caption(state.plan)[1],
+            result=state.base,
+        )
+        self._plans = [saved]
         self._plan_key = state.plan
         # 色块级的改动（哪几块被删掉 / 合并 / 换成了什么）跟删除、合并、更换一起存，
         # 打开工程要把它们摆回同样的顺序，预览才是保存时的那张 (m02366 item 3).
@@ -1930,13 +1954,23 @@ class PicturePage(QWidget):
         if self._block_edits:
             edits.append(f"色块改动 {len(self._block_edits)} 处")
         tail = f"；里面记着{'、'.join(edits)}" if edits else ""
-        self._status.setText(
+        message = (
             f"已打开工程 {path.name}"
             + (f"（保存于 {state.saved_at}）" if state.saved_at else "")
             + f"：{self._image_name} {state.image.width}×{state.image.height} 像素，"
             f"现在打 {len(self._result.palette) if self._result else 0} 种颜色{tail}。"
             "接着改就行，Ctrl+S 保存。"
         )
+        # 文件里只存了一套方案，别的搭法在这里补上（m02316 item 7）：用的就是「按当前
+        # 色块重新匹配」那条路，所以列出来的和按那个按钮得到的一样。
+        self._fill_open_plans(saved)
+        if len(self._plans) > 1:
+            self._status.setText(
+                message + f"顺便把另外 {len(self._plans) - 1} 套耗材搭配也列出来了。"
+            )
+        else:
+            # 补方案会一路改状态栏（正在匹配…），所以这句话最后再说一次。
+            self._status.setText(message)
         self._dirty = False
 
     def _on_save_project(self, ask: bool = False) -> None:
@@ -2162,6 +2196,73 @@ class PicturePage(QWidget):
             return None
         return _pixel_means(pixels, labels, len(result.palette))
 
+    def _rematch_source(self) -> tuple[MatchResult, dict[int, PaletteEntry]]:
+        """（拿着当前色块去重新挑卷的输入, 用户手改过、不许换掉的那几种颜色）。
+
+        「按当前色块重新匹配」和「打开工程之后补全方案表」用的是同一份东西，所以抽出来
+        (m02316 item 7)：手改过的颜色是用户定下来的，重新挑卷不能悄悄换回去；删除/合并
+        改的是原图本身，所以「这一块本来是什么颜色」要从改过的原图上重新量。
+        """
+        # `pinned` 按当前色块的下标给出它们；编辑簿记用的是基准下标，`_live_map` 翻过来。
+        pinned = {
+            index: self._replaced[source]
+            for index, source in enumerate(self._live_map)
+            if source in self._replaced
+        }
+        source = self._result
+        if source is not None and self._original_edited:
+            means = self._original_means(source)
+            if means is not None:
+                source = replace(
+                    source, means=means, source_values=None, source_counts=None
+                )
+        return source, pinned
+
+    def _fill_open_plans(self, saved: BudgetOption) -> None:
+        """List the other 耗材方案 right after 「打开工程」 (m02316 item 7).
+
+        工程文件只记着保存时挑中的那一套方案，所以打开之后面板里就一行，用户想换一套
+        得先按「按当前色块重新匹配」——但那个按钮的说明是「拿现在这些色块重新挑卷」，没人
+        觉得「打开一个工程」要先按它。这里在打开工程时顺手把同一批色块的其它搭法算出来
+        摆在下面：走的就是「按当前色块重新匹配」那条路（``_rematch_source`` +
+        ``rematch_options``），所以挑中哪一套都和按那个按钮得到的一样，而当前这一套仍然
+        是文件里那一套（``_plan_key`` 不动，勾还在它上面）。
+
+        算不出来（没耗材、筛选太紧、匹配报错）就保持原样：打开工程的成功与否不该被
+        这件事拖累，用户还有「重新匹配」和「按当前色块重新匹配」两个按钮。
+        """
+        if self._result is None or self._library is None:
+            return
+        palette = self._match_palette()
+        if not palette:
+            return
+        source, pinned = self._rematch_source()
+        if source is None:
+            return
+        self._begin_match()
+        try:
+            options = rematch_options(
+                source,
+                palette,
+                self._settings(),
+                pinned=pinned,
+                require=self._require,
+                avoid=self._avoid,
+                progress=self._report_match,
+            )
+        except Exception:  # pragma: no cover - 打开工程不该因为补方案失败而失败
+            return
+        finally:
+            self._end_match()
+            # _end_match 只管把进度条收起来；控件是 _begin_match 关掉的，得还回来。
+            self._set_controls_enabled(True)
+        extra = [option for option in options if option.key != saved.key]
+        if not extra:
+            return
+        self._plans = [saved, *extra]
+        self._plan_key = saved.key
+        self._refresh_plans()
+
     def _on_rematch_blocks(self) -> None:
         """「按当前色块重新匹配」: keep the colours on screen, re-choose the rolls.
 
@@ -2177,22 +2278,7 @@ class PicturePage(QWidget):
         if not palette:
             self._status.setText("调色板是空的，请先添加耗材。")
             return
-        # 手改过的颜色是用户定下来的，重新匹配不能悄悄换回去。`pinned` 按当前色块
-        # 的下标给出它们；编辑簿记用的是基准下标，`_live_map` 负责翻过来。
-        pinned = {
-            index: self._replaced[source]
-            for index, source in enumerate(self._live_map)
-            if source in self._replaced
-        }
-        # 删除/合并 改的是原图本身（m01566 的答复），所以「这一块本来是什么颜色」要
-        # 从改过的原图上重新量；沿用匹配时的旧 means 会把用户刚删掉的颜色找回来。
-        source = self._result
-        if self._original_edited:
-            means = self._original_means(source)
-            if means is not None:
-                source = replace(
-                    source, means=means, source_values=None, source_counts=None
-                )
+        source, pinned = self._rematch_source()
         self._begin_match()
         try:
             options = rematch_options(
@@ -2491,10 +2577,11 @@ class PicturePage(QWidget):
         """Show one colour everywhere it appears: picture, list and detail.
 
         The colour that was on screen goes on ``_preview_history`` first, which
-        is what 「再点一下取消选中」 steps back through.
+        is what 「再点一下取消选中」 steps back through.  块模式下不记这笔账：那里的
+        编号是块，不是颜色，翻回上一块等于换了一块选中（m02316 item 6）。
         """
         index = int(index)
-        if index != self._shown and self._shown >= 0:
+        if self._blocks is None and index != self._shown and self._shown >= 0:
             self._preview_history.append(self._shown)
         self._show_colour(index)
 
@@ -2562,8 +2649,16 @@ class PicturePage(QWidget):
         The preview steps back to whatever it showed before that colour, which
         is the whole point of keeping the history: the user got here to compare,
         and losing the comparison would be worse than losing the colour.
+
+        块模式下不退回：那里的编号是块，翻出来的旧编号在新一组块里照样合法，
+        于是「取消选中」看起来像「选中了另一块」，这正是用户报的 m02316 item 6。
+        取消选中就是什么都不选，预览也收起高亮。
         """
         if self._shown < 0 or int(index) != self._shown:
+            return
+        if self._blocks is not None:
+            self._preview_history.clear()
+            self._show_colour(-1)
             return
         previous = self._preview_history.pop() if self._preview_history else -1
         self._show_colour(previous)
@@ -2828,7 +2923,10 @@ class PicturePage(QWidget):
         )
 
     def _apply_edits(
-        self, keep: int | None = None, *, reselect: np.ndarray | None = None
+        self,
+        keep: int | None = None,
+        *,
+        reselect: Sequence[np.ndarray] | np.ndarray | None = None,
     ) -> None:
         """Recompose the live result and show it everywhere.
 
@@ -2837,10 +2935,12 @@ class PicturePage(QWidget):
         shows what the edit produced.  If that colour is gone — the user deleted the very
         colour they had picked — nothing is selected instead.
 
-        ``reselect`` is the pixels a 色块级 edit just touched: the block ids from
-        before it are meaningless afterwards, so the blocks covering those pixels
-        are found again and stay selected, which is what lets the user act twice
-        in a row without hunting for the same block again (m02366 item 3).
+        ``reselect`` is the pixels a 色块级 edit just touched, one mask per block it
+        acted on: the block ids from before it are meaningless afterwards, so each
+        of those blocks is found again by its own pixels and stays selected, which
+        is what lets the user act twice in a row without hunting for the same block
+        again (m02366 item 3).  一个一个地找而不是拿并集找，是为了「只改了一块就只选中
+        那一块」(m02316 item 4).
 
         What must never happen is 预览 drawing a block while the list claims nothing is
         selected: that dim wash and outline over an unclaimed colour is 「没有选择颜色的时候
@@ -2905,30 +3005,45 @@ class PicturePage(QWidget):
             return None
         return label_blocks(result.indices, min_pixels=min_block_pixels(result.printed_pixels))
 
-    def _blocks_after(self, mask: np.ndarray | None) -> list[int]:
-        """Which blocks to select after an edit: the ones covering ``mask``.
+    def _blocks_after(
+        self, masks: Sequence[np.ndarray] | np.ndarray | None
+    ) -> list[int]:
+        """Which blocks to select after an edit: one block per block that was edited.
 
-        A block counts as「还是刚才那一块」 when at least half of it lies inside the
-        pixels the edit touched — a merge of three blocks into one gives back that
-        one block, a 更换颜色 on one block gives back that block, and a block that
-        merely shares a border with the edit is not dragged in.
+        ``masks`` 是刚被改动的那几块**各自**的像素（单个掩码也收）。一块一块地找：
+        那块像素在新的一组块里落在哪个块上最多，就认哪一个 —— 合并三块得到的是一块，
+        更换颜色得到的还是那一块，只是挨着边界的块不会被顺手拖进来。
+
+        以前把它们的并集当成一个掩码、按「这个块有一半以上落在掩码里」来收，于是
+        改一块的时候，相邻那块只要有一半压在掩码上就一起被选中（m02316 item 4：
+        用户只换了一块，列表里却高亮了两块）。逐块取最大重叠既不会多收，也不会因为
+        掩码被别的块分走一半而漏收。
         """
         blocks = self._blocks
-        if blocks is None or mask is None or not mask.any():
+        if blocks is None or masks is None:
             return []
+        boxes = masks if isinstance(masks, (list, tuple)) else [masks]
         labels = blocks.labels
-        if labels.shape != mask.shape:
-            return []
-        touched = labels[mask]
-        wanted = []
-        for label in np.unique(touched):
-            label = int(label)
-            if label < 0:
+        picked: list[int] = []
+        for mask in boxes:
+            if mask is None:
                 continue
-            shared = int(np.count_nonzero(touched == label))
-            if shared * 2 >= blocks.size(label):
-                wanted.append(label)
-        return wanted
+            box = np.asarray(mask, dtype=bool)
+            if not box.any() or box.shape != labels.shape:
+                continue
+            touched = labels[box]
+            touched = touched[touched >= 0]
+            if not touched.size:
+                continue
+            counts = np.bincount(touched.astype(np.int64))
+            label = int(np.argmax(counts))
+            if label not in picked:
+                picked.append(label)
+        if not picked:
+            return []
+        # 按块表自己的顺序返回（`order()` 是答案的顺序），列表选择集和详情面板才稳定。
+        wanted = set(picked)
+        return [int(label) for label in blocks.order() if int(label) in wanted]
 
     def _sync_block_highlight(self) -> None:
         """Draw the union of the selected blocks in 预览 (m02366 item 2/3).
@@ -2990,6 +3105,9 @@ class PicturePage(QWidget):
             self._pick_combo.blockSignals(False)
         if save:
             save_settings({"pick_mode": mode})
+        # 标题跟着模式走（m02316 item 5）：块模式下这一栏装的是「第 N 块」，标题不能
+        # 还写着「打印图片需要的颜色」。切换模式时才需要改，所以放在这里而不是每次刷新。
+        self._sync_list_title()
         # ``_build_ui`` sets the saved mode before the list exists yet; there is
         # nothing to re-list at that point, only the view to point at the mode.
         if switched and getattr(self, "_list", None) is not None:
@@ -3004,6 +3122,20 @@ class PicturePage(QWidget):
                     else "点一下选中一种颜色，多选可以攒成一组颜色。",
                 )
             )
+
+    def _sync_list_title(self) -> None:
+        """Name the colour/block column after what it is currently listing.
+
+        两种「点图片时」装的不是同一种东西，所以标题也不一样 (m02316 item 5)：
+        「按颜色选择」里一行是一种颜色，「按色块边缘选择」里一行是一块。
+        """
+        panel = getattr(self, "_list_panel", None)
+        if panel is None:
+            return
+        title = LIST_TITLE_BLOCK if self._mode == PICK_EDGE else LIST_TITLE_COLOUR
+        label = getattr(panel, "title_label", None)
+        if label is not None and label.text() != title:
+            label.setText(title)
 
     def _on_multi_toggled(self, on: bool) -> None:
         """「多选」：click to add a colour, click again to drop it — no Ctrl."""
@@ -3143,7 +3275,8 @@ class PicturePage(QWidget):
         # 匹配」都从改过的原图出发，删掉的地方就真的不会再被匹配回来 (m01566 答复).
         self._paint_original(mask, None)
         self._block_edits.append(BlockPaint(mask=mask, entry=None, labels=tuple(sorted(labels))))
-        self._apply_edits(reselect=mask)
+        # 逐块交回去，删除之后选中的就是「删掉的那几块留下的那几块」(m02316 item 4).
+        self._apply_edits(reselect=masks)
         self._status.setText(
             f"已删除 {len(masks)} 块：这些地方留空、变成透明，不打印也没有底板；"
             "「原图」同样改掉了，所以重新匹配也不会再填回来。Ctrl+Z 可以撤销。"
@@ -3183,16 +3316,18 @@ class PicturePage(QWidget):
             self._delete_blocks(picked)
             return
         originals = [self._live_map[i] for i in picked if 0 <= i < len(self._live_map)]
-        if not originals:
+        if not originals or self._result is None:
             return
         self._push()
-        # 原图 不动：删掉一种颜色只是「这种颜色不打印」，图还是原来那张
-        # (m02039：原图只改色块，不改颜色) —— 所以重新匹配它还会回来。
+        # 原图 一起改（m02316 item 2，用户选的就是「颜色也改图」）：删掉一种颜色 = 这些像素
+        # 在源图里变透明，和按块删除做的是同一件事，所以「重新匹配」也不会再把它填回来。
+        mask = np.isin(np.asarray(self._result.indices), np.asarray(picked, dtype=np.int32))
+        self._paint_original(mask, None)
         self._deleted.update(originals)
         self._apply_edits()
         self._status.setText(
             f"已删除 {len(originals)} 种颜色：这些地方留空、变成透明，"
-            "不打印也没有底板； Ctrl+Z 可以撤销。"
+            "不打印也没有底板；「原图」同样改掉了。Ctrl+Z 可以撤销。"
         )
 
     def _merge_blocks(self, labels: list[int]) -> None:
@@ -3242,7 +3377,8 @@ class PicturePage(QWidget):
                 self._block_edits.append(
                     BlockPaint(mask=blocks.mask(label), entry=target, labels=(int(label),))
                 )
-        self._apply_edits(reselect=mask)
+        # 逐块交回去：并掉的那几块现在是一块，选中的就是它 (m02316 item 4).
+        self._apply_edits(reselect=masks)
         self._status.setText(
             f"已把选中的 {len(masks)} 块都换成 {target.color_hex}，"
             "这些地方整块都用它打印；「原图」也一起改成了这个颜色。Ctrl+Z 可以撤销。"
@@ -3265,8 +3401,10 @@ class PicturePage(QWidget):
         target = self._live_map[picked[choice]]
         originals = [self._live_map[index] for index in picked]
         self._push()
-        # 原图 不动：合并两种颜色只是「这两块地方都按同一种颜色打印」，源图还是原来
-        # 那张 (m02039：原图只改色块，不改颜色)。
+        # 原图 一起改（m02316 item 2）：合并几种颜色 = 这些像素在源图里刷成选中的颜色，
+        # 和按块合并做的是同一件事，换成别的方案之后它们还是同一种颜色。
+        mask = np.isin(np.asarray(self._result.indices), np.asarray(picked, dtype=np.int32))
+        self._paint_original(mask, entries[choice])
         for original in originals:
             if original != target:
                 self._merged[original] = target
@@ -3331,12 +3469,16 @@ class PicturePage(QWidget):
         if chosen is None:
             return
         self._push()
+        masks = []
         for label in labels:
             if 0 <= label < self._blocks.count:
+                one = self._blocks.mask(label)
+                masks.append(one)
                 self._block_edits.append(
-                    BlockPaint(mask=self._blocks.mask(label), entry=chosen, labels=(int(label),))
+                    BlockPaint(mask=one, entry=chosen, labels=(int(label),))
                 )
-        self._apply_edits(reselect=mask)
+        # 逐块交回去：换了一块就只该选中那一块 (m02316 item 4).
+        self._apply_edits(reselect=masks or mask)
         self._status.setText(
             f"已把选中的 {len(labels)} 块换成 {chosen.color_hex}。Ctrl+Z 可以撤销。"
         )

@@ -1588,28 +1588,110 @@ def run_selftest(*, report_path: Path | None = None) -> int:
                 == 255,
                 "Ctrl+Z 把原图也退回去：像素重新不透明、标记消失",
             )
+        # m02316 item 3：「删除」两个字就是全部，键位由 Esc 那条快捷方式负责（Del 仍然
+        # 好使，见上）——按钮上挂着「(Del)」反而像按钮名字的一部分。
+        check(
+            page._delete_button.text() == "删除",
+            f"「删除」按钮不再写着 (Del)（现在是 {page._delete_button.text()!r}）",
+        )
+        # m02316 item 5：这一栏装什么，标题就写什么。
+        check(
+            page._list_panel.title_label.text() == _pp.LIST_TITLE_BLOCK,
+            f"块模式下这一栏叫「{_pp.LIST_TITLE_BLOCK}」（现在是 "
+            f"{page._list_panel.title_label.text()!r}）",
+        )
+        # m02316 item 4：只改一块就只选中那一块。
+        if page._blocks is not None and page._blocks.count:
+            solo = page._blocks.order()[0]
+            page._list.clear_selection()
+            page._on_region_clicked(solo)
+            app.processEvents()
+            wanted_entry = next(
+                (
+                    entry
+                    for entry in page._candidate_palette()
+                    if entry.key != page.result.palette[page._blocks.value(solo)].key
+                ),
+                None,
+            )
+            if wanted_entry is not None:
+                real_picker = _pp.ColourPickerDialog
+                _pp.ColourPickerDialog = lambda *args, **kwargs: _StubDialog(0, wanted_entry)
+                try:
+                    page._on_replace()
+                    app.processEvents()
+                finally:
+                    _pp.ColourPickerDialog = real_picker
+                picked_rows = page._list.selected_indices()
+                current = page._list.current()
+                check(
+                    len(picked_rows) == 1 and current == picked_rows[0],
+                    f"只改一块就只选中那一块（选中 {picked_rows}，当前 {current}）",
+                )
+                # 块模式下预览画的是「选中的这几块」的并集（掩码），不是调色板下标：
+                # 画的必须是这一块自己的像素，而不是相邻那块、也不是整片同色区域。
+                highlight = page._view._selected_mask
+                check(
+                    highlight is not None
+                    and int((highlight & page._blocks.mask(current)).sum())
+                    == int(highlight.sum()),
+                    "预览画的正是那一块的像素",
+                )
+                page._undo()
+                app.processEvents()
+            # m02316 item 6：单选时再点一下已经选中的那一块 = 取消选中，不是跳到别的一块。
+            page._list.clear_selection()
+            page._on_region_clicked(solo)
+            app.processEvents()
+            shown = page._shown
+            rows = page._list._list
+            row = page._list._row_of(shown)
+            item = rows.item(row)
+            rect = rows.visualItemRect(item)
+            if not rect.isEmpty():
+                _QTest.mouseClick(rows.viewport(), _Qt.MouseButton.LeftButton, pos=rect.center())
+                app.processEvents()
+                check(
+                    page._shown == -1
+                    and page._list.current() == -1
+                    and not page._list.selected_indices()
+                    and page._view._selected_mask is None,
+                    "块模式下再点一次取消选中，而不是选中另一块"
+                    f"（_shown={page._shown}，当前 {page._list.current()}）",
+                )
         page._set_pick_mode(_pp.PICK_COLOUR, save=False)
         app.processEvents()
+        check(
+            page._list_panel.title_label.text() == _pp.LIST_TITLE_COLOUR,
+            f"颜色模式下这一栏叫「{_pp.LIST_TITLE_COLOUR}」（现在是 "
+            f"{page._list_panel.title_label.text()!r}）",
+        )
 
-        # m02039：原图只因为「色块」变，不因为「颜色」变 —— 按颜色删除／合并只决定
-        # 这些颜色打不打印，图还是原来那张。
+        # m02316 item 2：按颜色删除也改「原图」——用户在图三里报的就是「原图没跟着预览改」。
+        # 一层一层都改图：删掉一种颜色 = 这些像素在源图里变透明，和按块删除是同一件事
+        # （m02039 的「原图只改色块」从此作废，用户后来选了「颜色也改图」）。
         if len(page.result.palette) >= 1:
             page._list.select([0])
             before_colour_image = page._image.tobytes()
             page._on_delete_colours()
             app.processEvents()
             check(
-                page._image.tobytes() == before_colour_image
-                and not page._original_edited
-                and not page._original_badge.isVisible(),
-                "按颜色删除不改原图，也不挂「原图已修改」",
+                page._image.tobytes() != before_colour_image
+                and page._original_edited
+                and page._original_badge.isVisible(),
+                "按颜色删除也改原图，并挂出「原图已修改」",
             )
             check(
                 page._original_means(page.result) is not None,
-                "没改过的原图照样能量出每块自己的颜色",
+                "改过的原图照样能量出每块自己的颜色",
             )
             page._undo()
             app.processEvents()
+            check(
+                page._image.tobytes() == before_colour_image
+                and not page._original_edited,
+                "Ctrl+Z 把按颜色删除改过的原图也退回去",
+            )
 
         # 1.6.19：「更换颜色」只决定这块地方打印成什么颜色，原图一个像素都不动。
         if len(page.result.palette) >= 1:
@@ -1728,10 +1810,17 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         app.processEvents()
         page._on_rematch()
         app.processEvents()
-        # m02039：按颜色删除不改原图，所以「重新匹配」从图片重来一遍，颜色当然回来。
+        # m02316 item 2：按颜色删除现在连原图一起改，所以「重新匹配」从改过的图出发——
+        # 删掉的那些像素已经透明了，不会再被匹配回来（这正是用户要的：图里没有它，方案里
+        # 也不该有它）。m02039 的「按颜色不动原图、删了还会回来」到此结束。
+        opaque = float((_np.asarray(page._image.convert("RGBA"))[..., 3] > 0).mean())
+        printed = page.result.printed_pixels / max(1, page.result.total_pixels)
         check(
-            len(page.result.palette) == keep_count and not page._deleted,
-            "「重新匹配」从图片重来一遍，删掉的颜色回来了",
+            not page._deleted
+            and page.result.printed_pixels < before_pixels
+            and abs(printed - opaque) < 0.01,
+            f"「重新匹配」从改过的原图出发，删掉的颜色没有回来"
+            f"（不透明 {opaque:.1%}、打印 {printed:.1%}）",
         )
 
         three_mf = write_3mf(
