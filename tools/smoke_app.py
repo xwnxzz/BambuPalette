@@ -689,22 +689,38 @@ def main() -> int:
         "找最接近的颜色 has no tooltip any more",
     )
 
-    # The version has to be readable without opening 关于: it is the same string
+    # The version has to be readable without opening 帮助: it is the same string
     # the exe's file properties carry (build/BambuPalette.spec parses app/__init__.py).
     from app import __version__ as _version
 
     about = triple_window._about_text()
     check(
         _version in about,
-        f"关于 names the running version {_version!r}",
+        f"帮助 names the running version {_version!r}",
     )
     check(
         about.startswith("BambuPalette"),
-        "关于 still opens with the product name",
+        "帮助 still opens with the product name",
     )
     check(
         "BambuPalette.exe 的文件属性里也写着同一个版本号。" in about,
-        "关于 points at the exe's file properties",
+        "帮助 points at the exe's file properties",
+    )
+    # m01885 #5/#6/#8: 「关于」改叫「帮助」，点开是一个装着整本说明的窗口。
+    from app.core.image_matching import plan_help as _plan_help
+
+    check(
+        triple_window._help_button.text() == "帮助",
+        f"右上角是「帮助」按钮，got {triple_window._help_button.text()!r}",
+    )
+    manual = triple_window._help_text()
+    check(
+        triple_window._picture_page.help_text() in manual and _plan_help() in manual and about in manual,
+        "帮助窗口 = 图像转换说明 + 方案说明 + 版本与算法出处",
+    )
+    check(
+        not hasattr(triple_window._picture_page, "_page_hint"),
+        "图像转换页面上不再压着那段说明（1.6.14 #6）",
     )
     # m10238 item 1: and it must be visible without opening any dialog at all.
     check(
@@ -1505,6 +1521,10 @@ def main() -> int:
     app.processEvents()
     result = page.result
     check(result is not None, "the sample picture matched a palette")
+    check(
+        page._list.current() == -1 and not page._list.selected_indices(),
+        f"刚匹配完不默认选中第一个颜色（m01885 #7），got {page._list.current()}",
+    )
     if result is not None:
         from app.core.image_matching import build_palette
 
@@ -1627,7 +1647,7 @@ def main() -> int:
             from app.ui.colour_picker import ColourDetail, ColourPickerDialog, LIST_CHUNK
 
             # 1.6.13 #2: the detail is asked for with a double click and opens in a
-            # window of its own; the column keeps 耗材方案 + 这个模型需要的颜色 only.
+            # window of its own; the column keeps 耗材方案 + 打印图片需要的颜色 only.
             check(isinstance(page._detail, ColourDetail), "the colour detail widget is still there")
             check(
                 page._detail_window().isAncestorOf(page._detail)
@@ -2225,8 +2245,25 @@ def main() -> int:
                 "「用到的耗材」 names every roll of the selected plan",
             )
             check(
-                page._plan_hint.text() == page._plans[0].note,
-                f"the hint is that plan's own note, got {page._plan_hint.text()!r}",
+                page._plan_hint.text() == "" and not page._plan_hint.isVisibleTo(page),
+                f"有方案时面板上不打印解释文本（m01885 #8），got {page._plan_hint.text()!r}",
+            )
+            # m01885 #1: 每一行自己带着这一套要装的那几卷的颜色方块。
+            rows = [
+                page._plan_rows_layout.itemAt(index).widget()
+                for index in range(page._plan_rows_layout.count())
+            ]
+            swatches = [
+                [label for label in row.findChildren(_QLabel) if label.width() == 14]
+                for row in rows
+            ]
+            check(
+                [len(row) for row in swatches] == [len(option.spools) for option in page._plans],
+                f"行里的颜色方块数 = 这一套用几卷，got {[len(row) for row in swatches]}",
+            )
+            check(
+                all("备选" not in option.title for option in page._plans),
+                f"方案名里没有「（备选 N）」，got {[option.title for option in page._plans]}",
             )
             second = page._plans[1]
             check(
@@ -2447,19 +2484,39 @@ def main() -> int:
             _picture_page.QFileDialog = original_dialog
             _picture_page.QMessageBox = original_box
 
-            # --- no menu bar left, and 关于 is a button (m08102 item 6) ---------
+            # --- no menu bar left, and 帮助 is a button (m08102 item 6, renamed
+            # by m01885 item 5; m01885 items 6/8 moved the explanations into it) ---
             from PySide6.QtWidgets import QMenuBar as _QMenuBar  # noqa: PLC0415
 
             check(
                 not window.findChildren(_QMenuBar),
                 "文件 / 视图 / 帮助 are gone — there is no menu bar left",
             )
-            check(window._about_button.text() == "关于", "关于 is a plain button now")
-            check(window._about_button.isVisible(), "关于 sits where the menus used to be")
+            check(window._help_button.text() == "帮助", "「帮助」 is a plain button now")
+            check(window._help_button.isVisible(), "「帮助」 sits where the menus used to be")
             check(
                 "BambuPalette" in window._about_text(),
-                "关于 still says what the program is, and where the algorithms come from",
+                "帮助 still says what the program is, and where the algorithms come from",
             )
+            window._on_help()
+            app.processEvents()
+            manual = window._help_window
+            check(
+                manual is not None and manual.isVisible() and manual.windowTitle() == "帮助",
+                "点「帮助」打开一个标题为「帮助」的窗口",
+            )
+            if manual is not None:
+                check(
+                    manual.text() == window._help_text()
+                    and window._picture_page.help_text() in manual.text(),
+                    "窗口正文就是整本说明，图像转换那一段也在里面",
+                )
+                check(
+                    manual._scroll.widget() is manual._body and manual._body.wordWrap(),
+                    "正文放在可滚动区域里且自动换行",
+                )
+                manual.close()
+            app.processEvents()
 
             # A spool can be deleted while its mixture is still in the detail
             # panel — that panel then holds a recipe whose parent is gone, which

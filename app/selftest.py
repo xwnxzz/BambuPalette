@@ -479,6 +479,16 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     page.loadImage(picture)
     app.processEvents()
     check(page.result is not None, "the picture page matched the picture")
+    # m01885 #7: 刚匹配完不选中任何颜色。以前这里会退回第一行，于是高亮落在用户没点过
+    # 的颜色上，「取消选中」也就到不了。
+    check(
+        page._list.current() == -1 and not page._list.selected_indices(),
+        f"匹配完不默认选中第一个颜色，got 第 {page._list.current()} 行",
+    )
+    check(
+        not page._delete_button.isEnabled() and not page._replace_button.isEnabled(),
+        "没有选中颜色时 删除 / 更换颜色 是灰的",
+    )
 
     # m00519 #2: 「原图 / 预览」用滚轮缩放、按住左键拖动平移、双击还原成整张。
     from PySide6.QtCore import QEvent as _QEvent
@@ -486,6 +496,7 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     from PySide6.QtCore import Qt as _Qt
     from PySide6.QtGui import QMouseEvent as _QMouse
 
+    from .core.image_matching import plan_help as _plan_help
     from .ui import picture_page as _pp
 
     def _mouse(kind, pos, *, buttons=_Qt.MouseButtons.NoButton):
@@ -539,12 +550,17 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         abs(probe._pan.x()) <= limit_x + 0.5,
         "panning is clamped so the picture never leaves the panel",
     )
-    # The 滚轮缩放 / 拖动平移 instructions used to be a tooltip on both panels.
-    # m01647 item 4 deleted the hover pop-ups, so the same sentence is now the
-    # always-visible hint line at the top of the page — one line, both panels.
+    # The 滚轮缩放 / 拖动平移 instructions used to be a tooltip on both panels, then
+    # an always-visible line at the top of the page.  m01647 item 4 deleted the hover
+    # pop-ups; 1.6.14 #6 moved the whole paragraph into the 帮助 window, so the page
+    # now carries no explanation text at all.
     check(
-        _pp.ZOOM_HINT in page._page_hint.text(),
-        f"the page hint explains 滚轮缩放 / 拖动平移, got {page._page_hint.text()!r}",
+        _pp.ZOOM_HINT in page.help_text(),
+        f"the help explains 滚轮缩放 / 拖动平移, got {page.help_text()!r}",
+    )
+    check(
+        not hasattr(page, "_page_hint"),
+        "图像转换页面上不再挂那段常驻说明（1.6.14 #6）",
     )
     check(
         page._original_view.toolTip() == "" and probe.toolTip() == "",
@@ -592,8 +608,8 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     app.processEvents()
     check(page._dither.isEnabled(), "a transparent picture keeps 抖动 selectable too")
     check(
-        "不能用抖动" not in page._page_hint.text(),
-        "and the always-visible hint no longer claims it cannot",
+        "不能用抖动" not in page.help_text(),
+        "and the help no longer claims it cannot",
     )
     plain_indices = np.array(page.result.indices, dtype=np.int64, copy=True)
     page._dither.setChecked(True)
@@ -680,15 +696,15 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         page._colour_count.value() == _MAX_PAINTED,
         f"颜色数量 starts at the ceiling ({_MAX_PAINTED})",
     )
-    page_hint = page._page_hint.text()
+    page_help = page.help_text()
     check(
-        "Bambu Studio" in page_hint and str(_MAX_PAINTED) in page_hint,
-        "the always-visible hint names Bambu Studio as the reason for the ceiling",
+        "Bambu Studio" in page_help and str(_MAX_PAINTED) in page_help,
+        "「帮助」里写明 32 这个上限是 Bambu Studio 自己的",
     )
-    check("工单" in page_hint, "and says the ceiling is reported to Bambu, not invented by us")
+    check("工单" in page_help, "and says the ceiling is reported to Bambu, not invented by us")
     check(
-        page._page_hint.isVisibleTo(page),
-        "that hint is on screen, not hidden behind a hover pop-up",
+        page_help in window._help_text(),
+        "那段说明整段搬进了「帮助」窗口，页面上不再单独显示（1.6.14 #6）",
     )
 
     # 耗材上限 (m00780/m00840 #4): 0 = 不限制, otherwise the plan may spend only
@@ -746,8 +762,7 @@ def run_selftest(*, report_path: Path | None = None) -> int:
 
     def _panel_titles() -> list[str]:
         """The titles of the right-hand column, top to bottom."""
-        frame = page._plan_box.parentWidget()
-        column = frame.parentWidget()
+        column = page._right_splitter
         titles = []
         for position in range(column.count()):
             title = column.widget(position).findChild(_QLabel)
@@ -813,10 +828,11 @@ def run_selftest(*, report_path: Path | None = None) -> int:
 
     # 「用到的耗材」 and 「选中的颜色」 are not panels any more (1.6.13 #1/#2): the rolls
     # belong to the 方案 that spends them, and one colour's recipe is asked for by
-    # double-clicking its row instead of taking a third of the column.
+    # double-clicking its row instead of taking a third of the column.  The lower
+    # panel is called 「打印图片需要的颜色」 since 1.6.14 #2.
     check(
-        _panel_titles() == ["耗材方案", "这个模型需要的颜色"],
-        f"右栏只剩两块：耗材方案 / 这个模型需要的颜色，got {_panel_titles()}",
+        _panel_titles() == ["耗材方案", "打印图片需要的颜色"],
+        f"右栏两块：耗材方案 / 打印图片需要的颜色，got {_panel_titles()}",
     )
     check(
         page._plan_box.isAncestorOf(page._usage),
@@ -833,10 +849,67 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         ),
         "「用到的耗材」点名列出了这套的每一卷",
     )
+    # m01885 #1: 每一行自己带着这一套要装的那几卷的颜色，所以行与下面「共 N 卷」的列表
+    # 说的是同一批卷，也不再需要给搭法起「（备选 N）」这种名字。
+    rows = [
+        page._plan_rows_layout.itemAt(index).widget()
+        for index in range(page._plan_rows_layout.count())
+    ]
+    check(len(rows) == len(page._plans), f"每套方案占一行（{len(rows)} 行 / {len(page._plans)} 套）")
+    chips = [
+        [label for label in row.findChildren(_QLabel) if label.width() == 14]
+        for row in rows
+    ]
     check(
-        page._plan_hint.text() == page._plans[0].note,
-        f"面板上的说明就是这套自己的说明（卷名不重复一遍），got {page._plan_hint.text()[:40]!r}",
+        [len(row) for row in chips] == [len(option.spools) for option in page._plans],
+        f"行里的颜色方块数 = 这一套用几卷，got {[len(row) for row in chips]}",
     )
+    colours = [
+        [
+            chip.styleSheet().split("background-color: ", 1)[1].split(";", 1)[0]
+            for chip in row
+        ]
+        for row in chips
+    ]
+    wanted_colours = [
+        [
+            filament.color_hex if (filament := page._library.get(fid)) is not None else "#000000"
+            for fid in option.spools
+        ]
+        for option in page._plans
+    ]
+    check(colours == wanted_colours, f"方块画的是这一套每一卷自己的颜色，got {colours}")
+    check(
+        all("备选" not in option.title for option in page._plans),
+        f"方案名里不再有「（备选 N）」，got {[option.title for option in page._plans]}",
+    )
+    # m01885 #8: 面板上不再打印任何一句解释，解释在「帮助」里。
+    check(
+        page._plan_hint.text() == "" and not page._plan_hint.isVisibleTo(page._plan_box),
+        f"有方案时面板上不写解释文本，got {page._plan_hint.text()!r}",
+    )
+    check(
+        _plan_help() in window._help_text(),
+        "三种口径的说明都在「帮助」窗口里",
+    )
+    # m01885 #3: 分隔条能一路往上拖，把「耗材方案」压到几乎没有。以前用量表的
+    # QScrollArea 撑住了面板的最小高度，拖到一半就被顶回来。
+    right = page._right_splitter
+    room = max(200, right.height())
+    right.setSizes([40, room])
+    app.processEvents()
+    check(
+        right.sizes()[0] <= 100,
+        f"分隔条能把「耗材方案」压到 {right.sizes()[0]} px（只剩标题 + 一小条），不再被内容顶住",
+    )
+    check(right.isCollapsible(0), "而且它还能被整块收起来")
+    check(not right.isCollapsible(1), "下面的颜色列表不会被收掉")
+    check(
+        page._plan_scroll.minimumSizeHint().height() <= 80,
+        f"面板的最小高度很小（{page._plan_scroll.minimumSizeHint().height()} px），所以拖得动",
+    )
+    right.setSizes([430, 350])
+    app.processEvents()
 
     # 筛选 (1.6.13 #3): 「必须包含」/「不要用」, per spool, and every 方案 obeys it.
     from .ui.plan_filter import SpoolFilterDialog as _FilterDialog  # noqa: PLC0415
@@ -1154,6 +1227,7 @@ def run_selftest(*, report_path: Path | None = None) -> int:
             "clicking a colour never reorders the list",
         )
         check(page._list._row_of(1) == 1, "the clicked colour stays in its own row")
+        page._list.clear_selection()
         page._list.select([doomed])
         page._on_delete_colours()
         app.processEvents()
@@ -1167,6 +1241,10 @@ def run_selftest(*, report_path: Path | None = None) -> int:
             "the deleted pixels are the ones that stop being printed",
         )
         check(bool((page.result.indices < 0).any()), "the deleted region is transparent")
+        check(
+            page._list.current() == -1 and not page._list.selected_indices(),
+            f"删完之后列表不自动跳到第一行（m01885 第 7 条），got {page._list.current()}",
+        )
         check(page._undo_button.isEnabled(), "删除 can be undone")
         page._undo()
         app.processEvents()
@@ -1324,17 +1402,50 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         "the target colour and 找最接近的颜色 carry no tooltip",
     )
 
-    # The version must be readable without opening 关于, and it is the same string
+    # The version must be readable without opening 帮助, and it is the same string
     # build/BambuPalette.spec parses out of app/__init__.py for the exe resource.
     from . import __version__ as _version
 
     about = window._about_text()
-    check(_version in about, f"关于 names the running version {_version!r}")
-    check(about.startswith("BambuPalette"), "关于 still opens with the product name")
+    check(_version in about, f"帮助 names the running version {_version!r}")
+    check(about.startswith("BambuPalette"), "帮助 still opens with the product name")
     check(
         "BambuPalette.exe 的文件属性里也写着同一个版本号。" in about,
-        "关于 points at the exe's file properties",
+        "帮助 points at the exe's file properties",
     )
+    # m01885 #5/#6/#8: 右上角那颗按钮叫「帮助」，点开是一个窗口，里面装着图像转换那
+    # 一整段说明、三种方案口径的说明，最后才是版本与算法出处。
+    check(
+        window._help_button.text() == "帮助",
+        f"右上角是「帮助」按钮，got {window._help_button.text()!r}",
+    )
+    check(
+        not hasattr(window, "_about_button"),
+        "旧的「关于」按钮已经不在了（1.6.14 #5）",
+    )
+    check(
+        all(
+            part in window._help_text()
+            for part in (window._picture_page.help_text(), _plan_help(), about)
+        ),
+        "帮助窗口 = 图像转换说明 + 方案说明 + 版本与算法出处",
+    )
+    window._on_help()
+    app.processEvents()
+    manual = window._help_window
+    check(manual is not None and manual.isVisible(), "点「帮助」会弹出窗口")
+    if manual is not None:
+        check(
+            manual.windowTitle() == "帮助" and manual.text() == window._help_text(),
+            f"窗口标题与正文对得上，got {manual.windowTitle()!r}",
+        )
+        check(manual.parent() is window, "帮助窗口挂在主窗口上，不是独立的一份")
+        check(
+            manual._scroll.widget() is not None and manual._scroll.widget() is manual._body,
+            "正文放在可滚动的区域里，长文本能翻",
+        )
+        manual.close()
+    app.processEvents()
     check(window._find_button.isEnabled(), "找最接近的颜色 is clickable before a target is picked")
     check(
         _version in window.windowTitle(),

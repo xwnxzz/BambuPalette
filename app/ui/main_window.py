@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
 from .. import __version__
 from ..core import paths, settings
 from ..core.engines import DEFAULT_ENGINE, ENGINE_CHOICES, get_engine
+from ..core.image_matching import plan_help
 from ..core.library import (
     COMMON_BRANDS,
     COMMON_MATERIAL_TYPES,
@@ -70,6 +71,7 @@ from ..core.triples import (
 )
 from . import theme
 from .filament_dialog import FilamentDialog
+from .help import HelpDialog
 from .mix_detail import MixDetail
 from .mix_grid import MixGrid
 from .picture_page import PicturePage
@@ -166,8 +168,11 @@ class MainWindow(QMainWindow):
         # 显示全部颜色 above the grid), so the only thing the menus still owned was
         # 关于与算法来源 — the algorithm credits, the version and the path of the
         # spool archive.  That one moved here instead of disappearing with them.
-        self._about_button = QPushButton("关于")
-        self._about_button.clicked.connect(self._on_about)
+        # 1.6.14 (m01885 item 5) renamed it 帮助 and gave it the manual: the text
+        # that used to sit under the picture toolbar and the 「耗材方案」 notes.
+        self._help_button = QPushButton("帮助")
+        self._help_button.clicked.connect(self._on_help)
+        self._help_window: HelpDialog | None = None
 
         # Lumina Studio's topbar: the brand block on the left, the primary action
         # on the right, on a white bar closed by a hairline.
@@ -177,7 +182,7 @@ class MainWindow(QMainWindow):
         head_row.setContentsMargins(16, 10, 16, 10)
         head_row.setSpacing(10)
         head_row.addLayout(head, 1)
-        head_row.addWidget(self._about_button, 0, Qt.AlignmentFlag.AlignVCenter)
+        head_row.addWidget(self._help_button, 0, Qt.AlignmentFlag.AlignVCenter)
         head_row.addWidget(self._add_button, 0, Qt.AlignmentFlag.AlignVCenter)
 
         # engine / sort / search controls
@@ -1350,11 +1355,10 @@ class MainWindow(QMainWindow):
         )
 
     def _about_text(self) -> str:
-        """The 关于 text, version line included.
+        """版本与算法出处，「帮助」窗口的最后一节。
 
-        Split out of ``_on_about`` so the automatic checks can read it without
-        a modal dialog: the version shown here and the one in the exe's file
-        properties both come from ``app.__version__``.
+        从 ``_on_help`` 里拆出来，自动检查才能不弹窗读到它：这里显示的版本号和
+        exe 文件属性里的那个都取自 ``app.__version__``。
         """
         try:
             location = paths.library_path()
@@ -1382,5 +1386,25 @@ class MainWindow(QMainWindow):
             "耗材档案保存在：" + str(location)
         )
 
-    def _on_about(self) -> None:
-        QMessageBox.information(self, "关于与算法来源", self._about_text())
+    def _help_text(self) -> str:
+        """「帮助」窗口里的全部文字。
+
+        三节：图片这一步怎么用（原来压在图片上的那行，m01885 第 6 条）、
+        「耗材方案」每一行按什么标准挑的（原来是行下面那句，第 8 条）、
+        以及本来就在这个窗口里的版本与算法出处。
+        """
+        return (
+            f"{self._picture_page.help_text()}\n\n"
+            f"{plan_help()}\n\n"
+            "算法与版本：\n"
+            f"{self._about_text()}"
+        )
+
+    def _on_help(self) -> None:
+        if self._help_window is None:
+            self._help_window = HelpDialog(self._help_text(), self)
+        else:
+            self._help_window.set_text(self._help_text())
+        self._help_window.show()
+        self._help_window.raise_()
+        self._help_window.activateWindow()

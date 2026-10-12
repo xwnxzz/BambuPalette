@@ -25,6 +25,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from app.core.engines import ENGINE_BAMBU, ENGINE_MIXER  # noqa: E402
 from app.core.image_matching import (  # noqa: E402
+    _BAD_BLOCK_DELTA_E,
     _PLAN_SPECS,
     MatchSettings,
     TriplePalette,
@@ -32,12 +33,18 @@ from app.core.image_matching import (  # noqa: E402
     _fold_clusters,
     _merge_indistinguishable,
     _merge_similar_colours,
+    _objective_closest,
+    _objective_distinct,
+    _objective_worst,
+    _plans,
+    _prepare,
     build_palette,
     match_fidelity,
     match_fidelity_report,
     match_image,
     match_options,
     plan_caption,
+    plan_help,
     reduce_colours,
     rematch_options,
     sort_palette,
@@ -1000,7 +1007,10 @@ class BudgetOptionTests(unittest.TestCase):
 
     def test_more_than_one_group_is_offered_for_the_same_objective(self):
         # 「耗材方案太少了，多推荐几组」: inside one objective the runner-up roll
-        # sets are listed too, each a different 方案 rather than a repeat.
+        # sets are listed too, each a different 方案 rather than a repeat.  The
+        # rows are told apart by the colours they print (m01885 item 1), so a
+        # runner-up keeps the criterion's name and carries a `#` in its key
+        # instead of a 「（备选 N）」 suffix.
         options = match_options(
             _quadrant_image(), self.palette, MatchSettings(max_colours=4, max_spools=2)
         )
@@ -1008,10 +1018,45 @@ class BudgetOptionTests(unittest.TestCase):
         alternates = [option for option in options if "#" in option.key]
         self.assertTrue(alternates, [option.key for option in options])
         for option in alternates:
-            self.assertIn("备选", option.title)
-            self.assertIn("另一种搭法", option.note)
+            self.assertNotIn("备选", option.title)
+            self.assertNotIn("另一种搭法", option.note)
         rolls = [frozenset(option.spools) for option in options]
         self.assertEqual(len(rolls), len(set(rolls)))
+
+    def test_each_criterion_wins_the_number_it_is_named_after(self):
+        # 「小色块优先并没有优先」: the row printed numbers measured one way while
+        # the search ranked another, so a row could promise the fewest 差块 and
+        # show more of them than the row above it.  Every criterion now scores the
+        # very pixels the report measures, so the winner of a criterion really is
+        # the best of the plans the program looked at for that number.
+        settings = MatchSettings(max_colours=4, max_spools=2)
+        prepared = _prepare(_quadrant_image(), self.palette, settings, None)
+        named = {
+            "defects": _objective_distinct,
+            "worst": _objective_worst,
+            "average": _objective_closest,
+        }
+        winners = {
+            key: match_fidelity_report(_plans(prepared, settings.max_spools, objective, limit=1)[0])
+            for key, objective in named.items()
+        }
+        for objective in named.values():
+            for result in _plans(prepared, settings.max_spools, objective, limit=6):
+                average, worst, defects = match_fidelity_report(result)
+                self.assertGreaterEqual(defects, winners["defects"][2])
+                self.assertGreaterEqual(worst, winners["worst"][1] - 1e-6)
+                self.assertGreaterEqual(average, winners["average"][0] - 1e-6)
+
+    def test_the_help_explains_every_criterion_and_the_defect_count(self):
+        # m01885 items 6 and 8: the sentences that used to sit under the rows moved
+        # into the help window, so they are written once, next to the criteria.
+        text = plan_help()
+        self.assertIn("差块", text)
+        self.assertIn(f"{_BAD_BLOCK_DELTA_E:g}", text)
+        for _key, title, note, _objective, _variants in _PLAN_SPECS:
+            self.assertIn(title, text)
+            self.assertIn(note, text)
+        self.assertNotIn("…", text)
 
     def test_a_demanded_roll_is_spent_by_every_option(self):
         # 「必须包含」: the user has this roll loaded, so every 方案 prints with it.

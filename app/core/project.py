@@ -15,7 +15,7 @@
 一个工程 = 一个 zip：
 
 * ``工程.json`` —— 设置、基线调色板、编辑，以及两张给人看的清单
-  （这个模型需要的颜色 / 用到的耗材）；
+  （打印图片需要的颜色 / 用到的耗材）；
 * ``原图.png`` —— 导入的那张图，原样存；
 * ``预览.png`` —— 保存时的预览图；
 * ``基线.npy`` —— 基线的每像素颜色下标（H×W int32）。
@@ -225,7 +225,7 @@ def render_preview(result: MatchResult | None) -> Image.Image:
 
 
 def colour_list(result: MatchResult | None) -> list[dict]:
-    """「这个模型需要的颜色」：每种颜色占的像素比例和它的配料。"""
+    """「打印图片需要的颜色」：每种颜色占的像素比例和它的配料。"""
     if result is None or not result.palette:
         return []
     shares = result.shares()

@@ -1264,6 +1264,8 @@ def _budget_fits(
     counts: Sequence[int] | np.ndarray | None = None,
     objective: BudgetObjective = _objective_closest,
     *,
+    region_rgb: np.ndarray | None = None,
+    blend_regions: bool = True,
     limit: int = 1,
     require: frozenset[str] = frozenset(),
     avoid: frozenset[str] = frozenset(),
@@ -1286,6 +1288,15 @@ def _budget_fits(
     that spends a forbidden one, is not a plan and is left out — the cap and the
     filter are instructions about this machine, not preferences to trade against
     picture quality.
+
+    ``region_rgb`` is the picture colour behind each colour of ``kept``.  It is
+    what makes the ranking agree with the numbers the page prints: a colour the
+    cap refuses is printed with the closest colour it can afford, and the block
+    that results is the average of everything folded into it, so a plan has to be
+    scored on those averages.  Scoring the refused colour against its substitute
+    instead — the obvious shortcut — offered 「最不像的色块优先」 a plan whose worst
+    block was ΔE00 22 where 「总体最接近」 had 9.65, and made 「小色块优先」 lose on
+    the very count it is named after.
 
     Returns ``[]`` when nothing has to be dropped, so the caller keeps the
     untouched result — which is also why the untouched rolls are checked against
@@ -1341,14 +1352,44 @@ def _budget_fits(
         printable = [position for position, need in enumerate(needs) if need <= subset]
         if not printable:
             return (float("inf"),), []
-        if len(printable) == len(pool):
-            return (0.0, 0.0), printable
-        worst = np.zeros(len(pool), dtype=np.float64)
-        surplus = np.ones(len(pool), dtype=bool)
-        surplus[printable] = False
-        columns = _table()[:, printable]
-        worst[surplus] = columns[surplus].min(axis=1)
-        return objective(worst, weights), printable
+        if region_rgb is None:
+            # No picture colour per colour of ``kept`` (the legacy caller): score
+            # every refused colour against the substitute that will print it.
+            worst = np.zeros(len(pool), dtype=np.float64)
+            surplus = np.ones(len(pool), dtype=bool)
+            surplus[printable] = False
+            columns = _table()[:, printable]
+            worst[surplus] = columns[surplus].min(axis=1)
+            return objective(worst, weights), printable
+        ranks = {position: rank for rank, position in enumerate(printable)}
+        nearest = _table()[:, printable].argmin(axis=1)
+        pixels = np.zeros(len(printable), dtype=np.float64)
+        blend = np.zeros((len(printable), 3), dtype=np.float64)
+        for position in range(len(pool)):
+            rank = ranks.get(position)
+            if rank is None:
+                rank = int(nearest[position])
+            pixels[rank] += weights[position]
+            blend[rank] += weights[position] * region_rgb[position]
+        # The block a plan ends up with is the average of everything folded into
+        # it, printed in the surviving colour — exactly what
+        # :func:`match_fidelity_report` measures, so the ranking and the numbers
+        # on screen cannot disagree.  「按当前色块重新匹配」 is the exception: there the
+        # block that survived keeps its own picture colour and the region is
+        # judged on that, which is the rule 合并 follows.
+        if blend_regions:
+            means = np.rint(blend / np.maximum(pixels, 1.0)[:, None]).astype(np.uint8)
+        else:
+            means = np.asarray(
+                [region_rgb[position] for position in printable], dtype=np.uint8
+            )
+        values = np.atleast_1d(
+            _color.delta_e_2000(
+                _color.lab_from_rgb(means),
+                np.asarray([labs[position] for position in printable], dtype=np.float64),
+            )
+        ).astype(np.float64)
+        return objective(values, pixels / pixels.sum()), printable
 
     def _walk(
         available: Sequence[str], width: int
@@ -1629,6 +1670,28 @@ def _region_means(prepared: _Prepared, fit: _Fit) -> np.ndarray | None:
     return np.rint(totals).astype(np.uint8)
 
 
+def _pool_region_means(prepared: _Prepared) -> np.ndarray | None:
+    """The picture colour behind each colour of ``kept``, before the cap is spent.
+
+    :func:`_region_means` averages the pixels of every block a *plan* ends up
+    with; scoring a plan before it is built needs the same average one level
+    down, for the colours the cap starts from.  These are kept as floats rather
+    than rounded to bytes, because a plan's block is the weighted blend of the
+    colours folded into it and the result has to equal the average of everything
+    in that block.
+    """
+    if prepared.pictures is not None:
+        return np.asarray(prepared.pictures, dtype=np.float64)
+    if prepared.image is None:
+        return None
+    pixels = np.asarray(prepared.image.convert("RGB"), dtype=np.float64).reshape(-1, 3)
+    flat = prepared.indices.reshape(-1)
+    totals = np.zeros((len(prepared.kept), 3), dtype=np.float64)
+    valid = flat >= 0
+    np.add.at(totals, flat[valid], pixels[valid])
+    return totals / np.maximum(prepared.counts, 1)[:, None]
+
+
 def _identity_fit(prepared: _Prepared) -> _Fit:
     """The plan that changes nothing: print every surviving colour as it is."""
     return _Fit(
@@ -1668,6 +1731,8 @@ def _plans(
         prepared.palette,
         prepared.counts,
         objective,
+        region_rgb=_pool_region_means(prepared),
+        blend_regions=prepared.pictures is None,
         limit=limit,
         require=require,
         avoid=avoid,
@@ -1953,10 +2018,17 @@ _PLAN_SPECS: tuple[tuple[str, str, str, BudgetObjective, int], ...] = (
 
 
 def _option_title(key: str, title: str, rank: int) -> tuple[str, str]:
-    """（key，名称）for the ``rank``-th best rolls of one objective."""
+    """（key，名称）for the ``rank``-th best rolls of one objective.
+
+    The name carries no 「备选 N」.  Two rows of the same objective are told apart by
+    the roll colours printed on them, which is the fact the user needs when
+    choosing; 「备选 1」 named a difference nobody could see without counting rows.
+    The ``#N`` stays in the *key*: a project file remembers which row it was saved
+    with, so the row has to be identifiable even when it is not named.
+    """
     if rank <= 0:
         return key, title
-    return f"{key}#{rank}", f"{title}（备选 {rank}）"
+    return f"{key}#{rank}", title
 
 
 def plan_caption(key: str) -> tuple[str, str]:
@@ -1965,17 +2037,41 @@ def plan_caption(key: str) -> tuple[str, str]:
     「打开工程」 hands the page the plan the file was saved with, and that key can
     name a 方案 this build no longer offers (an older file, a hand-edited one).
     The row still has to say something true, so it says where it came from.  A
-    key ending in ``#N`` is the Nth alternative of the same objective, so it is
-    described by its base spec plus 「备选」.
+    key ending in ``#N`` is the Nth alternative of the same objective and is named
+    after that objective: the alternatives differ in which rolls they buy, and the
+    row prints those.
     """
-    base, _, rank = key.partition("#")
+    base, _, _rank = key.partition("#")
     for spec_key, title, note, _objective, _count in _PLAN_SPECS:
         if spec_key != base:
             continue
-        if rank.isdigit() and int(rank) > 0:
-            return f"{title}（备选 {rank}）", f"{note}同一目标下的另一种搭法。"
         return title, note
     return "工程里存的那一套", "保存工程时用的搭配；点「重新匹配」可以再挑一套。"
+
+
+def plan_help() -> str:
+    """What the 耗材方案 panel offers, for the 帮助 window.
+
+    The panel used to print one of these sentences under the rows and 「（备选 N）」
+    in them; the user asked for the explanations to move into 帮助 so the panel
+    stays about this picture.  The text lives beside the specs on purpose — a new
+    方案 cannot be added without its explanation following it.
+    """
+    lines = [
+        "「耗材方案」这几行：",
+        "· 同一个「耗材上限」里有好几种搭法，每一行是一种。行里写着这一套的平均色差、最差色差、"
+        "差块个数和用几卷，后面那几个小方块就是这一套要装哪几卷料。",
+        f"· 「差块」是色差 ΔE00 超过 {_BAD_BLOCK_DELTA_E:g} 的颜色个数。平均色差看不出是哪一块画坏了，"
+        "差块个数看得出——越少，越不容易一眼看出偏差。",
+    ]
+    lines.extend(
+        f"· {title}：{note}" for _key, title, note, _objective, _count in _PLAN_SPECS
+    )
+    lines.append(
+        "· 同一种口径下的第二、第三套不再另起名字：按行里那几卷的颜色认就行，"
+        "名称只说明它是按什么标准挑出来的。"
+    )
+    return "\n".join(lines)
 
 
 def _offer_options(
@@ -2019,7 +2115,7 @@ def _offer_options(
                 BudgetOption(
                     key=option_key,
                     title=option_title,
-                    note=note if rank <= 0 else f"{note}同一目标下的另一种搭法。",
+                    note=note,
                     result=result,
                 )
             )

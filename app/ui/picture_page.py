@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QSplitter,
     QVBoxLayout,
@@ -116,20 +117,19 @@ BUSY_DELAY_MS = 200
 #: 「0% 卡住」, and a plain 0–100 range is too coarse while the search walks.
 PROGRESS_STEPS = 1000
 
-#: The one always-visible line under the toolbar.  It replaces the hover
-#: tooltips this page used to carry: a black pop-up that covered the picture was
-#: worse than no explanation at all, so the two facts a user cannot guess (the
-#: 32-colour ceiling and what 0 means) and the two gestures live here instead.
-PAGE_HINT = (
-    f"{ZOOM_HINT}\n"
-    f"颜色数量最多 {MAX_PAINTED_FILAMENTS} 是 Bambu Studio 自己的限制：一个工程里只认 "
+#: 图片页面原来那行常驻说明。1.6.14 把它整段搬进「帮助」窗口（m01885 第 6 条）：
+#: 页面上只留随图片变化的东西，要读的使用说明去帮助里读，不再压着图片。
+PAGE_HELP = (
+    "图像转换这一步：\n"
+    f"· {ZOOM_HINT}\n"
+    f"· 颜色数量最多 {MAX_PAINTED_FILAMENTS} 是 Bambu Studio 自己的限制：一个工程里只认 "
     f"{MAX_PAINTED_FILAMENTS} 个耗材位，第 {MAX_PAINTED_FILAMENTS + 1} 种颜色在切片时会被"
     "丢掉（我们已经就这条限制向拓竹提了工单）。耗材上限 0 表示不限制。\n"
-    "改到一半可以存成工程接着改：Ctrl+S 保存（第一次会问存哪儿），Ctrl+Shift+S 换一个文件名；"
+    "· 改到一半可以存成工程接着改：Ctrl+S 保存（第一次会问存哪儿），Ctrl+Shift+S 换一个文件名；"
     "工程里装着原图、这张预览、用到的颜色和耗材，下次「打开工程」就回到现在这一步。\n"
-    "双击颜色列表里的一行，看这个颜色的详情（图片里的颜色、匹配到的颜色和它的配方）；"
-    "「筛选耗材」先说好哪几卷必须用、哪几卷不要用，之后每套搭配都照这个来；"
-    "「按当前色块重新匹配」拿现在这些色块重新挑卷，删除、合并和手改过的颜色都留着。"
+    "· 双击颜色列表里的一行，看这个颜色的详情（图片里的颜色、匹配到的颜色和它的配方）。\n"
+    "· 「筛选耗材」先说好哪几卷必须用、哪几卷不要用，之后每套搭配都照这个来。\n"
+    "· 「按当前色块重新匹配」拿现在这些色块重新挑卷，删除、合并和手改过的颜色都留着。"
 )
 
 
@@ -1153,31 +1153,39 @@ class PicturePage(QWidget):
 
         # 「用到了哪些耗材」 is not a panel of its own any more: it answers the same
         # question the 方案 rows disagree about — 用哪几卷 — so it sits under them,
-        # for the 方案 that is picked.  A 41-spool library can put a dozen rolls
-        # here, and three of them are the common case, so it scrolls rather than
-        # clips and the roll that is missing from the AMS stays reachable.
+        # for the 方案 that is picked.  It no longer scrolls on its own: the whole
+        # 耗材方案 panel does (see below), because seven 方案 plus their rolls do
+        # not fit in the panel anyway.
         self._usage = QLabel("")
         self._usage.setProperty("role", "hint")
         self._usage.setTextFormat(Qt.TextFormat.RichText)
         self._usage.setWordWrap(True)
-        self._usage.setMinimumHeight(58)
-        usage_scroll = QScrollArea()
-        usage_scroll.setWidgetResizable(True)
-        usage_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        usage_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        usage_scroll.setWidget(self._usage)
-        self._usage_scroll = usage_scroll
-        self._plan_layout.addWidget(usage_scroll, 1)
+        self._plan_layout.addWidget(self._usage)
         self._refresh_plans()
 
+        # m01885 item 3: 「打印图片需要的颜色的窗口要能自由向上拖拽上滑」.  A panel
+        # whose height is its content cannot be shrunk — with seven 方案 rows its
+        # minimum was most of the column, so the splitter handle would not move —
+        # so the whole panel scrolls and its vertical size policy ignores the
+        # content's minimum.  That is what lets the handle go all the way up (and
+        # 耗材方案 all the way away) while both panels stay usable.
+        self._plan_scroll = _scrollable(self._plan_box)
+        self._plan_scroll.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Ignored
+        )
+        self._plan_scroll.setMinimumHeight(48)
+
         right = QSplitter(Qt.Orientation.Vertical)
+        self._right_splitter = right
         # 耗材方案 comes first: it decides what the panel under it says, and it now
         # answers the printer's question (which rolls to load) as well.
-        right.addWidget(self._wrap(self._plan_box, "耗材方案"))
-        right.addWidget(self._wrap(list_box, "这个模型需要的颜色"))
+        right.addWidget(self._wrap(self._plan_scroll, "耗材方案"))
+        right.addWidget(self._wrap(list_box, "打印图片需要的颜色"))
         right.setStretchFactor(0, 2)
         right.setStretchFactor(1, 3)
-        right.setCollapsible(0, False)
+        # 耗材方案 may be collapsed away entirely so the colour list gets the whole
+        # column; the colour list never collapses, so it cannot be lost.
+        right.setCollapsible(0, True)
         right.setCollapsible(1, False)
         right.setSizes([430, 350])
 
@@ -1219,21 +1227,22 @@ class PicturePage(QWidget):
         self._busy_timer.setInterval(BUSY_DELAY_MS)
         self._busy_timer.timeout.connect(self._show_progress)
 
-        # The always-visible explanation line.  It never changes, so it is a
-        # plain label rather than something the code rewrites.
-        self._page_hint = QLabel(PAGE_HINT)
-        self._page_hint.setProperty("role", "hint")
-        self._page_hint.setWordWrap(True)
+        # 使用说明不在页面上：1.6.14 把它搬进「帮助」窗口（m01885 第 6 条），
+        # 从这里读一份给帮助窗口和自动检查用。
+        self._help = PAGE_HELP
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
         layout.addLayout(top)
-        layout.addWidget(self._page_hint)
         layout.addWidget(splitter, 1)
         layout.addWidget(self._progress)
         layout.addWidget(self._status)
         layout.addLayout(bottom)
+
+    def help_text(self) -> str:
+        """这一页怎么用，「帮助」窗口里的头一节（m01885 第 6 条）。"""
+        return self._help
 
     def _wrap(self, widget: QWidget, title: str) -> QWidget:
         frame = QFrame()
@@ -1697,6 +1706,10 @@ class PicturePage(QWidget):
         self._plate = None
         self._list.setLibrary(self._library)
         self._refresh_plans()
+        # m01885 item 7: 新的一次匹配从「什么都没选」开始。上一次的高亮指的是上一份
+        # 结果里的色块，留着它等于替用户选了一种颜色；编辑（删除 / 合并 / 更换颜色 /
+        # 撤销）才继续跟着用户点过的那一块走。
+        self._list.clear_selection()
         self._apply_edits()
         self._set_controls_enabled(True)
         self._announce_edits()
@@ -1721,6 +1734,7 @@ class PicturePage(QWidget):
             self._plan_hint.setText(
                 placeholder or "匹配一张图片后，这里会列出几套耗材搭配，自己挑一套。"
             )
+            self._plan_hint.setVisible(True)
             return
         for index, option in enumerate(self._plans):
             average, worst = option.fidelity
@@ -1742,9 +1756,43 @@ class PicturePage(QWidget):
             )
             line.addWidget(button)
             line.addWidget(numbers)
+            line.addWidget(self._plan_swatches(option))
             line.addStretch(1)
             self._plan_rows_layout.addWidget(row)
-        self._update_plan_hint()
+        # 每一行按什么标准挑的、差块是什么，都在帮助窗口里（m01885 第 8 条）：
+        # 面板上留着的那一句只讲现在是什么状态。
+        self._plan_hint.clear()
+        self._plan_hint.setVisible(False)
+
+    def _plan_swatches(self, option: BudgetOption) -> QWidget:
+        """One 方案 的卷，按它们自己的颜色画出来（m01885 第 1 条）。
+
+        The rows used to be told apart by「（备选 N）」, which names a position
+        instead of the thing the user is choosing.  Showing the colours means a
+        方案 is named by what it prints, and the row and the 用到的耗材 list under
+        it agree on which rolls they are talking about.
+        """
+        box = QWidget()
+        line = QHBoxLayout(box)
+        line.setContentsMargins(0, 0, 0, 0)
+        line.setSpacing(3)
+        shares = {
+            use.filament.id: use for use in spool_usage(option.result, self._library)
+        }
+        for filament_id in option.spools:
+            filament = self._library.get(filament_id) if self._library is not None else None
+            chip = QLabel()
+            chip.setFixedSize(14, 14)
+            colour = filament.color_hex if filament is not None else "#000000"
+            chip.setStyleSheet(
+                f"background-color: {colour};"
+                f" border: 1px solid {theme.BORDER}; border-radius: 3px;"
+            )
+            use = shares.get(filament_id)
+            name = filament.display_name if filament is not None else filament_id
+            chip.setToolTip(f"{name} {use.share:.1%}" if use is not None else name)
+            line.addWidget(chip)
+        return box
 
     # -- 筛选：哪几卷必须用、哪几卷不要用 ---------------------------------
     def _ordered_ids(self, ids: frozenset[str]) -> list[str]:
@@ -1814,11 +1862,6 @@ class PicturePage(QWidget):
         return ask.clickedButton() is change
 
 
-    def _update_plan_hint(self) -> None:
-        """The note only — 「用到的耗材」 right below this line names the rolls."""
-        option = self._selected_plan()
-        self._plan_hint.setText(option.note if option is not None else "")
-
     def _selected_plan(self) -> BudgetOption | None:
         for option in self._plans:
             if option.key == self._plan_key:
@@ -1859,7 +1902,6 @@ class PicturePage(QWidget):
         self._list.setLibrary(self._library)
         self._apply_edits()
         self._set_controls_enabled(True)
-        self._update_plan_hint()
         self._announce_edits()
 
     def _confirm_plan_switch(self, option: BudgetOption) -> bool:
@@ -2151,12 +2193,13 @@ class PicturePage(QWidget):
         self._list.setResult(result)
         self._refresh_base_combo()
         target = self._live_map.index(anchor) if anchor in self._live_map else -1
-        if target < 0 and len(result.palette):
-            target = 0
+        # m01885 item 7: a fresh match selects nothing.  The old code fell back to
+        # row 0 here, which drew a highlight on a colour the user never picked and
+        # made 「取消选中」 impossible to reach from a clean match.
         if 0 <= target < len(result.palette):
             self._select(target)
         else:
-            self._detail.clear()
+            self._show_colour(-1)
         self._update_actions()
         self._announce_edits()
 
@@ -2227,7 +2270,7 @@ class PicturePage(QWidget):
         uses = spool_usage(self._result, self._library)
         # Back to the top: after an edit the biggest roll is the answer the user
         # came for, and it must not stay scrolled out of sight.
-        bar = self._usage_scroll.verticalScrollBar()
+        bar = self._plan_scroll.verticalScrollBar()
         bar.setValue(bar.minimum())
         if not uses:
             self._usage.setText(
