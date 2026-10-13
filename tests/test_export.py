@@ -27,8 +27,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from app.core.engines import ENGINE_BAMBU  # noqa: E402
 from app.core.image_matching import MatchSettings, build_palette, match_image  # noqa: E402
 from app.core.library import Filament, FilamentLibrary  # noqa: E402
+from app.core.mixes import MixCatalog  # noqa: E402
 from app.mesh.objfile import write_obj  # noqa: E402
 from app.mesh.plate import (  # noqa: E402
     PlateSettings,
@@ -38,7 +40,15 @@ from app.mesh.plate import (  # noqa: E402
     plate_mesh,
     signed_volume,
 )
-from app.mesh.threemf import write_3mf  # noqa: E402
+from app.mesh.threemf import (  # noqa: E402
+    FilamentComponent,
+    FilamentSlot,
+    _project_settings,
+    paint_code,
+    project_filaments,
+    slots_from_palette,
+    write_3mf,
+)
 
 SPOOLS = (
     ("耗材白", "#F2F0EB"),
@@ -512,6 +522,284 @@ class GeometrySanityTests(ExportTestCase):
             total += float(np.einsum("ij,ij->i", a, np.cross(b, c)).sum() / 6.0)
         self.assertAlmostEqual(total, self.plate.volume_mm3, places=3)
         self.assertGreater(cell, 0.0)
+
+
+class _RecipeEntry:
+    """Just enough of a ``PaletteEntry`` for the export path.
+
+    ``slots_from_palette`` reads entries through ``getattr`` on purpose (this
+    module must not import ``app.core``), so a mix can be described here by the
+    two fields the recipe lives in and nothing else.
+    """
+
+    def __init__(self, color_hex: str, parts: tuple = (), recipe=None) -> None:
+        self.color_hex = color_hex
+        self.kind = "mix"
+        self.label = "混色"
+        self.parts = parts
+        self.recipe = recipe
+        self.filament_ids = tuple(parent for parent, _percent in parts)
+
+
+class MixedFilamentTests(ExportTestCase):
+    """The exported project carries the recipes behind the mixed colours.
+
+    Bambu Studio keeps a mixed colour as one row of its project filament list
+    plus one row per spool it mixes, tied together by ``filament_is_mixed`` /
+    ``filament_mixed_components`` / ``filament_mixed_sublayer_ratios``.  The
+    shapes asserted here come from a project Bambu Studio exported itself
+    (「猪包」, 2026-10-11): parents 1-based in recipe order, ratios four decimals
+    summing to 1.
+    """
+
+    def _mix(self):
+        catalog = MixCatalog(self.library.filaments, engine=ENGINE_BAMBU).build()
+        palette = build_palette(self.library, catalog)
+        return next(entry for entry in palette if entry.is_mix)
+
+    def test_a_mix_becomes_a_mixed_row_with_its_two_spools(self):
+        entry = self._mix()
+        slots = slots_from_palette([entry], self.library)
+        self.assertTrue(slots[0].is_mixed, "a two-spool mix keeps its recipe")
+        project = project_filaments(slots)
+        self.assertEqual(project.count, 3, "the mix and its two spools")
+        self.assertEqual(project.added, 2)
+        self.assertEqual(project.mixed_count, 1)
+        # The two spools take rows 1 and 2 and the mixed row closes the list.
+        self.assertEqual(project.order, {1: 3})
+        parents, ratios = project.mixed[2]
+        self.assertEqual(parents, (1, 2))
+        self.assertEqual(len(ratios), 2)
+        self.assertAlmostEqual(sum(ratios), 1.0, places=6)
+
+    def test_a_three_spool_recipe_lists_three_parents(self):
+        ids = [filament.id for filament in self.library.filaments[:3]]
+        entry = _RecipeEntry(
+            "#808080", parts=((ids[0], 50), (ids[1], 30), (ids[2], 20))
+        )
+        slots = slots_from_palette([entry], self.library)
+        self.assertEqual(len(slots[0].components), 3)
+        project = project_filaments(slots)
+        parents, ratios = project.mixed[project.count - 1]
+        self.assertEqual(len(parents), 3)
+        self.assertEqual(len(set(parents)), 3)
+        self.assertEqual([round(ratio, 4) for ratio in ratios], [0.5, 0.3, 0.2])
+
+    def test_spools_already_in_the_list_are_reused_not_duplicated(self):
+        entry = self._mix()
+        parents = [self.library.get(filament_id) for filament_id in entry.filament_ids]
+        painted = [
+            FilamentSlot(
+                color_hex=parent.color_hex,
+                material_type=parent.material_type,
+                vendor=parent.brand,
+            )
+            for parent in parents
+        ]
+        project = project_filaments(painted + slots_from_palette([entry], self.library))
+        self.assertEqual(project.added, 0)
+        self.assertEqual(project.count, 3)
+        self.assertEqual(project.mixed[2][0], (1, 2))
+
+    def test_a_mix_whose_spools_are_gone_is_exported_flat(self):
+        """A project opened on a machine without the spools still paints right.
+
+        The plate is painted with the mix's own colour, so a 混色耗材 that named
+        a spool the reader does not have would be worse than the flat colour the
+        user picked.
+        """
+        entry = self._mix()
+        slots = slots_from_palette([entry], None)
+        self.assertFalse(slots[0].is_mixed)
+        self.assertEqual(project_filaments(slots).added, 0)
+
+    def test_the_settings_carry_the_mix_the_way_bambu_studio_writes_it(self):
+        entry = self._mix()
+        project = project_filaments(slots_from_palette([entry], self.library))
+        settings = json.loads(_project_settings(project.slots, project.mixed))
+        parents, ratios = project.mixed[2]
+        self.assertEqual(settings["filament_is_mixed"], ["0", "0", "1"])
+        self.assertEqual(settings["filament_mixed_components"], ["", "", "1,2"])
+        self.assertEqual(
+            settings["filament_mixed_sublayer_ratios"],
+            ["", "", ",".join(f"{ratio:.4f}" for ratio in ratios)],
+        )
+        self.assertEqual(settings["filament_colour"], settings["filament_multi_colour"])
+        self.assertEqual(settings["enable_mixed_color_sublayer"], "1")
+        # 渐变混色耗材 is a ratio that changes with height; a plate prints one
+        # colour per block, so every gradient key stays off.
+        for key in (
+            "filament_mixed_gradient",
+            "filament_mixed_gradient_per_part",
+        ):
+            self.assertEqual(settings[key], ["0", "0", "0"])
+        for key in ("filament_mixed_gradient_curve", "filament_mixed_gradient_range"):
+            self.assertEqual(settings[key], ["", "", ""])
+
+    def test_a_project_without_mixes_writes_no_mixed_rows(self):
+        colours = ["#F2F0EB", "#17181C"]
+        settings = json.loads(_project_settings(colours))
+        self.assertEqual(settings["filament_is_mixed"], ["0", "0"])
+        self.assertEqual(settings["filament_mixed_components"], ["", ""])
+        self.assertNotIn("enable_mixed_color_sublayer", settings)
+
+    def test_the_written_project_lists_the_mix_and_the_spools_it_needs(self):
+        entry = self._mix()
+        painted = slots_from_palette(
+            build_palette(self.library, None, include_mixes=False), self.library
+        )
+        painted[0] = slots_from_palette([entry], self.library)[0]
+        path = write_3mf(self.plate, self.tmp / "mixed", filaments=painted)
+        with zipfile.ZipFile(path) as archive:
+            settings = json.loads(
+                archive.read("Metadata/project_settings.config").decode("utf-8")
+            )
+            model = archive.read("Metadata/model_settings.config").decode("utf-8")
+        count = len(settings["filament_colour"])
+        # Every spool this plate paints with here happens to be one of the
+        # recipe's parents, so the list stays at the painted rows — with the mix
+        # moved from the front to the end, which is where Bambu Studio reads it.
+        self.assertEqual(count, len(painted))
+        self.assertEqual(settings["filament_is_mixed"][-1], "1")
+        self.assertEqual(settings["filament_is_mixed"][:-1], ["0"] * (count - 1))
+        parents = settings["filament_mixed_components"][-1].split(",")
+        self.assertEqual(len(parents), 2)
+        expected = [
+            self.library.get(filament_id).color_hex.upper()
+            for filament_id in entry.filament_ids
+        ]
+        for parent, colour in zip(parents, expected):
+            index = int(parent) - 1
+            self.assertLess(index, count - 1, "a parent is a row before the mix")
+            self.assertEqual(settings["filament_is_mixed"][index], "0")
+            self.assertEqual(settings["filament_colour"][index], colour)
+        ratios = [
+            float(text)
+            for text in settings["filament_mixed_sublayer_ratios"][-1].split(",")
+        ]
+        self.assertAlmostEqual(sum(ratios), 1.0, places=4)
+        self.assertIn(f'key="filament_maps" value="{" ".join(["1"] * count)}"', model)
+        self.assertIn(
+            f'key="filament_volume_maps" value="{" ".join(["0"] * count)}"', model
+        )
+
+    def test_a_spool_only_the_recipe_uses_becomes_a_row_of_its_own(self):
+        """The case 「猪包」 showed: a mix whose parent nothing paints.
+
+        ``filament_mixed_components`` points at 1-based rows of the same list, so
+        the spool has to be there even though no triangle is painted with it —
+        Bambu Studio creates that row itself when its own 拆色 makes a mix.
+        """
+        spare = Filament(name="耗材蓝", brand="测试", material_type="PETG HF", color_hex="#1B4F9C")
+        library = FilamentLibrary(list(self.library.filaments) + [spare])
+        palette = build_palette(library, None, include_mixes=False)
+        result = match_image(_quadrant_image(), palette, MatchSettings(max_colours=4))
+        plate = build_plate(result, PlateSettings(target_width_mm=100.0))
+        painted = slots_from_palette(palette, library)[: plate.extruder_count]
+        self.assertNotIn(
+            spare.color_hex.upper(),
+            [slot.color_hex.upper() for slot in painted],
+            "the spare spool is not painted anywhere",
+        )
+        mix_only = FilamentSlot(
+            color_hex="#6E4A28",
+            material_type="PETG HF",
+            vendor="测试",
+            components=(
+                FilamentComponent(
+                    color_hex=self.library.filaments[1].color_hex,
+                    material_type="PETG HF",
+                    vendor="测试",
+                    percent=57.0,
+                ),
+                FilamentComponent(
+                    color_hex=spare.color_hex,
+                    material_type="PETG HF",
+                    vendor="测试",
+                    percent=43.0,
+                ),
+            ),
+        )
+        painted[0] = mix_only
+        project = project_filaments(painted)
+        self.assertEqual(
+            project.order[1], project.count, "the painted mix closes the list"
+        )
+        self.assertEqual(project.count, len(painted) + project.added)
+        self.assertGreaterEqual(project.added, 1, "the spool nothing paints is still a row")
+        parents, ratios = project.mixed[project.count - 1]
+        self.assertEqual(len(parents), 2)
+        self.assertEqual([round(ratio, 4) for ratio in ratios], [0.57, 0.43])
+        self.assertTrue(
+            all(parent < project.count for parent in parents),
+            "every parent is a row before the mix",
+        )
+        appended = project.slots[parents[1] - 1]
+        self.assertEqual(appended.color_hex, spare.color_hex)
+        self.assertFalse(appended.is_mixed)
+
+        settings = json.loads(_project_settings(project.slots, project.mixed))
+        self.assertEqual(settings["filament_is_mixed"][project.count - 1], "1")
+        self.assertEqual(
+            settings["filament_mixed_components"][project.count - 1],
+            ",".join(str(parent) for parent in parents),
+        )
+        self.assertEqual(
+            settings["filament_mixed_sublayer_ratios"][project.count - 1],
+            "0.5700,0.4300",
+        )
+
+        path = write_3mf(plate, self.tmp / "spare", filaments=painted)
+        with zipfile.ZipFile(path) as archive:
+            written = json.loads(
+                archive.read("Metadata/project_settings.config").decode("utf-8")
+            )
+            model = archive.read("Metadata/model_settings.config").decode("utf-8")
+        count = len(written["filament_colour"])
+        self.assertEqual(count, plate.extruder_count + project.added)
+        self.assertEqual(written["filament_is_mixed"][-1], "1")
+        self.assertEqual(
+            written["filament_colour"][parents[1] - 1], spare.color_hex.upper()
+        )
+        self.assertIn(f'key="filament_maps" value="{" ".join(["1"] * count)}"', model)
+
+    def test_the_mixed_rows_are_written_after_every_other_row(self):
+        """The reader refuses a project whose mixed rows are interleaved.
+
+        Measured against the installed Bambu Studio (``02.08.02.61``): a project
+        that lists a mixed row before rows it does not need exports as
+        「Invalid parameter value(s) included in the 3mf file」 and writes nothing
+        (``return_code`` -18), while the same package with every mixed row moved
+        to the end exports fine.  A mixed row may itself be painted — the codes
+        just have to move with it, or the plate would print a different spool.
+        """
+        entry = self._mix()
+        painted = slots_from_palette(
+            build_palette(self.library, None, include_mixes=False), self.library
+        )
+        painted[0] = slots_from_palette([entry], self.library)[0]
+        project = project_filaments(painted)
+        path = write_3mf(self.plate, self.tmp / "order", filaments=painted)
+        with zipfile.ZipFile(path) as archive:
+            settings = json.loads(
+                archive.read("Metadata/project_settings.config").decode("utf-8")
+            )
+            model = archive.read("3D/3dmodel.model").decode("utf-8")
+
+        flags = settings["filament_is_mixed"]
+        self.assertEqual(flags[-1], "1")
+        self.assertNotIn("1", flags[:-1], "no mixed row survives in the middle")
+        for index, components in enumerate(settings["filament_mixed_components"]):
+            if components:
+                self.assertEqual(flags[index], "1")
+                self.assertTrue(
+                    all(int(parent) < index + 1 for parent in components.split(",")),
+                    "a parent is always a row before the mix that names it",
+                )
+        # The plate is painted with the mix, so its triangles carry the code of
+        # the row the mix ended up in — the last row, which is a mixed one.
+        last = paint_code(len(flags))
+        self.assertIn(f'paint_color="{last}"', model)
 
 
 if __name__ == "__main__":

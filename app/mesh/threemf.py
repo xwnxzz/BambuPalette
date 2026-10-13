@@ -53,9 +53,9 @@ from __future__ import annotations
 
 import json
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 from xml.sax.saxutils import escape
 
 from .. import __version__
@@ -63,7 +63,10 @@ from .plate import PlateModel
 
 __all__ = [
     "write_3mf",
+    "FilamentComponent",
     "FilamentSlot",
+    "ProjectFilaments",
+    "project_filaments",
     "slots_from_palette",
     "THREEMF_APPLICATION",
     "THREEMF_APP_VERSION",
@@ -145,17 +148,42 @@ def paint_code(extruder: int) -> str:
 
 
 @dataclass(frozen=True)
-class FilamentSlot:
-    """One entry of the project's filament list.
+class FilamentComponent:
+    """One physical spool a mixed colour is made of.
 
-    ``color_hex`` is the colour the plate is painted with; the rest is what
-    Bambu Studio shows in its 项目耗材列表 so the user recognises the spool.
+    ``percent`` is the share of that spool in the mix, 0-100, in the same order
+    as the recipe.  Bambu Studio records it as ``filament_mixed_sublayer_ratios``
+    (``0.3800,0.6200`` for 38% + 62%), so it is carried here as the number the
+    rest of the program speaks in and formatted on the way out.
     """
 
     color_hex: str
     material_type: str = "PLA"
     vendor: str = ""
     name: str = ""
+    percent: float = 0.0
+
+
+@dataclass(frozen=True)
+class FilamentSlot:
+    """One entry of the project's filament list.
+
+    ``color_hex`` is the colour the plate is painted with; the rest is what
+    Bambu Studio shows in its 项目耗材列表 so the user recognises the spool.
+
+    ``components`` is what turns the slot into a 混色耗材: the spools whose
+    sublayers make this colour, in recipe order.  A plain spool leaves it empty.
+    """
+
+    color_hex: str
+    material_type: str = "PLA"
+    vendor: str = ""
+    name: str = ""
+    components: tuple[FilamentComponent, ...] = ()
+
+    @property
+    def is_mixed(self) -> bool:
+        return bool(self.components)
 
 
 CONTENT_TYPES = """<?xml version="1.0" encoding="UTF-8"?>
@@ -298,16 +326,20 @@ def _model_document(
     )
 
 
-def _model_settings(plate: PlateModel, object_name: str) -> str:
+def _model_settings(
+    plate: PlateModel, object_name: str, filament_count: int | None = None
+) -> str:
     """``Metadata/model_settings.config`` for a single painted object.
 
     Modelled on a real Bambu Studio export: the object carries one
     ``<part subtype="normal_part">``, the object-level ``extruder`` is the
     fallback for triangles without a ``paint_color``, and the ``<plate>`` block
-    records the filament map for the plate.
+    records the filament map for the plate — which is one entry per row of the
+    project's filament list, so it counts ``filament_count`` (the mixed colours'
+    parents included) and not just the painted extruders.
     """
     triangles = plate.triangle_count
-    slots = plate.extruder_count or 1
+    slots = int(filament_count) if filament_count else (plate.extruder_count or 1)
     base_extruder = plate.parts[0].extruder if plate.parts else 1
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -344,23 +376,71 @@ def _model_settings(plate: PlateModel, object_name: str) -> str:
 # ---------------------------------------------------------------------------
 # The project's filament list
 # ---------------------------------------------------------------------------
+def _mix_pairs(entry: object) -> tuple[tuple[str, int], ...]:
+    """The recipe of a mix as ``((filament_id, percent), …)``.
+
+    Read exactly the way 「更换颜色」 reads it: a two-spool mix carries a
+    ``recipe`` (``percent_a``/``percent_b``), a three-spool one only ``parts``,
+    and an entry restored from a project file carries whichever of the two it was
+    saved with.  A plain spool — or a mix whose recipe is not recorded — answers
+    with an empty tuple and is exported as the flat colour it is painted with.
+    """
+    parts = tuple(getattr(entry, "parts", ()) or ())
+    if parts:
+        return tuple((str(parent), int(percent)) for parent, percent in parts)
+    recipe = getattr(entry, "recipe", None)
+    if recipe is None:
+        recipes = tuple(getattr(entry, "recipes", ()) or ())
+        recipe = recipes[0] if recipes else None
+    if recipe is None:
+        return ()
+    return (
+        (str(recipe.a_id), int(recipe.percent_a)),
+        (str(recipe.b_id), int(recipe.percent_b)),
+    )
+
+
 def slots_from_palette(palette: Sequence[object], library: object | None = None) -> list[FilamentSlot]:
     """Build the project's filament list from a match palette.
 
-    ``library`` is only consulted to answer "which spool is this?" for a mix —
-    a mix is two spools of the same 耗材种类, so its type and vendor are the
-    parents'.  Everything is read through ``getattr`` so this module stays free
-    of an import back into ``app.core``.
+    ``library`` answers two questions: "which spool is this?" for a mix — a mix
+    is two spools of the same 耗材种类, so its type and vendor are the parents'
+    — and "what does each parent look like?" for the recipe itself.  Everything
+    is read through ``getattr`` so this module stays free of an import back into
+    ``app.core``.
+
+    A mix the library can no longer resolve is exported as its flat colour
+    rather than as a mix: a 混色耗材 that names a spool the reader does not have
+    is worse than a plate painted the colour the user picked.
     """
+    getter = getattr(library, "get", None)
+    lookup = getter if callable(getter) else (lambda _filament_id: None)
+
     slots: list[FilamentSlot] = []
     for entry in palette:
         filament = getattr(entry, "filament", None)
         material_type = getattr(filament, "material_type", "") or ""
         vendor = getattr(filament, "brand", "") or ""
+        components: list[FilamentComponent] = []
+        for parent_id, percent in _mix_pairs(entry):
+            parent = lookup(parent_id)
+            if parent is None:
+                components = []
+                break
+            components.append(
+                FilamentComponent(
+                    color_hex=str(getattr(parent, "color_hex", "") or ""),
+                    material_type=str(getattr(parent, "material_type", "") or "") or "PLA",
+                    vendor=str(getattr(parent, "brand", "") or ""),
+                    name=str(getattr(parent, "display_name", "") or ""),
+                    percent=float(percent),
+                )
+            )
+        if len(components) < 2:
+            components = []
         if not material_type and library is not None:
-            getter = getattr(library, "get", None)
             for filament_id in getattr(entry, "filament_ids", ()) or ():
-                parent = getter(filament_id) if callable(getter) else None
+                parent = lookup(filament_id)
                 if parent is not None:
                     material_type = parent.material_type or ""
                     vendor = vendor or (parent.brand or "")
@@ -371,6 +451,7 @@ def slots_from_palette(palette: Sequence[object], library: object | None = None)
                 material_type=material_type or "PLA",
                 vendor=vendor,
                 name=getattr(entry, "label", "") or "",
+                components=tuple(components),
             )
         )
     return slots
@@ -400,8 +481,129 @@ def _project_filaments(
                 material_type=given.material_type or "PLA",
                 vendor=given.vendor,
                 name=given.name,
+                components=given.components,
             )
     return [slot or FilamentSlot(color_hex="#FFFFFF") for slot in slots]
+
+
+# ---------------------------------------------------------------------------
+# The mixed filaments' parents
+# ---------------------------------------------------------------------------
+def _spool_key(color_hex: str, material_type: str, vendor: str) -> tuple[str, str, str]:
+    """What makes two rows of the project list the same spool.
+
+    The material falls back to ``PLA`` because that is what an appended row is
+    written as, and two rows that share a colour have to agree on the spool.
+    """
+    return (color_hex.upper(), material_type or "PLA", vendor)
+
+
+@dataclass(frozen=True)
+class ProjectFilaments:
+    """The project's filament list, with the mixed slots' parents resolved.
+
+    ``mixed`` maps a 0-based slot index to ``(parent slots, ratios)``, both in
+    recipe order — exactly what Bambu Studio's ``filament_mixed_components``
+    (1-based) and ``filament_mixed_sublayer_ratios`` hold.  ``added`` is how many
+    extra rows the recipes needed, which is what the export dialog reports, and
+    ``order`` maps each painted extruder (1-based) to the 1-based row it now
+    occupies, because the mixed rows moved to the end.
+    """
+
+    slots: list[FilamentSlot]
+    mixed: dict[int, tuple[tuple[int, ...], tuple[float, ...]]]
+    added: int
+    order: dict[int, int]
+
+    @property
+    def count(self) -> int:
+        return len(self.slots)
+
+    @property
+    def mixed_count(self) -> int:
+        return len(self.mixed)
+
+
+def project_filaments(slots: Sequence[FilamentSlot]) -> ProjectFilaments:
+    """Add the spools the recipes need and put the mixed rows last.
+
+    Bambu Studio keeps a mixed colour and the spools it mixes as separate rows of
+    one project list, and ``filament_mixed_components`` points at the physical
+    rows by 1-based index.  A recipe whose parent is not painted anywhere (a mix
+    can be chosen for a block nothing else prints) therefore needs a row of its
+    own — 「拆色完成后将自动创建混色耗材所需的项目耗材。」 is Bambu Studio doing
+    the same thing.  Parents already in the list are reused, never duplicated.
+
+    **Every mixed row comes after every other row.**  Bambu Studio 2.8.2.61 reads
+    a project whose mixed rows are interleaved as 「Invalid parameter value(s)
+    included in the 3mf file」 and exports nothing at all (``return_code`` -18) —
+    measured, not guessed: the same package with the mixed rows moved to the end
+    exports fine, and the files Bambu Studio writes itself list the spools first
+    and append the mixes.  So the painted rows keep their relative order, the
+    spools only a recipe needs follow them, and the mixes come last; ``order``
+    carries where each painted extruder went, and :func:`write_3mf` hands it to
+    :func:`_remapped_extruders` so the ``paint_color`` codes follow along.
+    """
+    final: list[FilamentSlot] = []
+    order: dict[int, int] = {}
+    recipes: list[tuple[int, list[int], list[float]]] = []
+    index_of: dict[tuple[str, str, str], int] = {}
+
+    def spool_row(component: FilamentComponent) -> int:
+        """Return the 1-based row of ``component``, adding a row if it has none."""
+        material = component.material_type or "PLA"
+        key = _spool_key(component.color_hex, material, component.vendor)
+        position = index_of.get(key)
+        if position is None:
+            final.append(
+                FilamentSlot(
+                    color_hex=component.color_hex,
+                    material_type=material,
+                    vendor=component.vendor,
+                    name=component.name,
+                )
+            )
+            position = len(final) - 1
+            index_of[key] = position
+        return position + 1
+
+    # The painted spools keep their relative order at the front of the list.
+    for index, slot in enumerate(slots, start=1):
+        if sum(max(0.0, component.percent) for component in slot.components) <= 0.0:
+            order[index] = len(final) + 1
+            index_of.setdefault(
+                _spool_key(slot.color_hex, slot.material_type, slot.vendor), len(final)
+            )
+            final.append(slot)
+
+    # A recipe resolves against every painted spool, not only the ones above it in
+    # the list, so a parent painted further down is reused instead of duplicated.
+    # Spools that only a recipe uses join the spool block, ahead of the mixes.
+    for index, slot in enumerate(slots, start=1):
+        total = sum(max(0.0, component.percent) for component in slot.components)
+        if total <= 0.0:
+            continue
+        parents = [spool_row(component) for component in slot.components]
+        ratios = [max(0.0, component.percent) / total for component in slot.components]
+        recipes.append((index, parents, ratios))
+
+    mixed: dict[int, tuple[tuple[int, ...], tuple[float, ...]]] = {}
+    for index, parents, ratios in recipes:
+        order[index] = len(final) + 1
+        mixed[len(final)] = (tuple(parents), tuple(ratios))
+        final.append(slots[index - 1])
+    return ProjectFilaments(final, mixed, len(final) - len(slots), order)
+
+
+def _remapped_extruders(plate: PlateModel, order: Mapping[int, int]) -> PlateModel:
+    """Give every part the slot the project list ended up using for it."""
+    moved = [
+        replace(part, extruder=int(order.get(part.extruder, part.extruder)))
+        for part in plate.parts
+    ]
+    if all(after.extruder == before.extruder for after, before in zip(moved, plate.parts)):
+        return plate
+    return replace(plate, parts=moved)
 
 
 # ---------------------------------------------------------------------------
@@ -460,20 +662,84 @@ _VALUE_ALIASES = {
 }
 
 
-def _project_settings(colours: Sequence[str]) -> str:
+def _mixed_keys(
+    palette: Sequence[str],
+    mixed: Mapping[int, tuple[tuple[int, ...], tuple[float, ...]]],
+) -> dict[str, object]:
+    """The 混色耗材 half of ``project_settings.config``.
+
+    Every mixed colour is one slot of the project filament list *plus* one row
+    per spool it mixes (see :func:`project_filaments`), so the keys are arrays
+    with one entry per slot: ``""``/``"0"`` for the plain ones, and for a mix the
+    parents and their ratios.
+
+    The shape is taken from a project Bambu Studio exported itself (「猪包」,
+    2026-10-11) — parents 1-based into the same list and in recipe order, ratios
+    four decimals summing to 1.  The ``filament_mixed_gradient*`` keys belong to
+    the *gradient* mix (a ratio that changes with height); our plates print one
+    colour per block, so they stay off.
+
+    ``enable_mixed_color_sublayer`` is switched on whenever there is a mix: with
+    it off Bambu Studio alternates the parents layer by layer, and a plate is
+    only ``(0.8 + 0.6) / 0.2`` = 7 layers tall, so the two colours would show as
+    stripes instead of one blended colour.  Turning it on splits each layer into
+    sublayers, which is the 混色 the user picked.  It is a setting inside the
+    exported project, so the user can turn it off in Bambu Studio like any other.
+    """
+    count = len(palette)
+    components: list[str] = []
+    ratios: list[str] = []
+    for index in range(count):
+        parents, shares = mixed.get(index, ((), ()))
+        components.append(",".join(str(parent) for parent in parents))
+        ratios.append(",".join(f"{share:.4f}" for share in shares))
+
+    keys: dict[str, object] = {
+        "filament_multi_colour": list(palette),
+        "filament_is_mixed": ["1" if index in mixed else "0" for index in range(count)],
+        "filament_mixed_components": components,
+        "filament_mixed_sublayer_ratios": ratios,
+        "filament_mixed_gradient": ["0"] * count,
+        "filament_mixed_gradient_curve": [""] * count,
+        "filament_mixed_gradient_range": [""] * count,
+        "filament_mixed_gradient_per_part": ["0"] * count,
+    }
+    if mixed:
+        keys["enable_mixed_color_sublayer"] = "1"
+    return keys
+
+
+def _as_slot(value: FilamentSlot | str) -> FilamentSlot:
+    """A slot from either a :class:`FilamentSlot` or a bare colour string.
+
+    The colour-only form is what the selftest's template check passes in; a
+    plate always goes through :func:`_project_filaments` and brings real slots.
+    """
+    if isinstance(value, FilamentSlot):
+        return value
+    return FilamentSlot(color_hex=str(value))
+
+
+def _project_settings(
+    slots: Sequence[FilamentSlot | str],
+    mixed: Mapping[int, tuple[tuple[int, ...], tuple[float, ...]]] | None = None,
+) -> str:
     """``Metadata/project_settings.config`` carrying our plate's colours.
 
     Starts from the stock Orca/Bambu project template and rewrites only what
-    describes the filaments: ``filament_colour`` becomes the palette, and every
-    array that holds one entry per filament is padded (repeating its last entry)
-    or truncated to match.  Everything else — printer, process, the g-code
-    blocks — is left exactly as the stock preset wrote it, which is what keeps
-    Bambu Studio from treating the file as carrying custom presets.
+    describes the filaments: ``filament_colour`` becomes the palette, every array
+    that holds one entry per filament is padded (repeating its last entry) or
+    truncated to match, and the mixed colours — the ones the recipes made — are
+    written the way Bambu Studio writes them itself (see
+    :func:`_mixed_keys`).  Everything else — printer, process, the g-code blocks
+    — is left exactly as the stock preset wrote it, which is what keeps Bambu
+    Studio from treating the file as carrying custom presets.
     """
     settings = json.loads(_PROJECT_TEMPLATE_PATH.read_text(encoding="utf-8"))
-    palette = [colour.upper() for colour in colours]
+    palette = [_as_slot(slot).color_hex.upper() for slot in slots]
     count = len(palette)
     settings["filament_colour"] = palette
+    settings.update(_mixed_keys(palette, mixed or {}))
     for key in list(settings):
         value = settings[key]
         if not isinstance(value, list) or not value:
@@ -525,19 +791,33 @@ def write_3mf(
 
     name = object_name or target.stem
     slots = _project_filaments(plate, filaments)
+    project = project_filaments(slots)
+    # The mixed rows sit at the end of the project list (Bambu Studio refuses
+    # anything else), so the plate is repainted with the slots the list ended up
+    # using before either document is written.
+    painted = _remapped_extruders(plate, project.order)
+    if painted.extruder_count > MAX_PAINTED_FILAMENTS:
+        raise ValueError(
+            f"这个模型的混色配方把耗材列表排到第 {painted.extruder_count} 行，"
+            f"超过 Bambu Studio 能识别的 {MAX_PAINTED_FILAMENTS} 种。"
+        )
 
     with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("[Content_Types].xml", CONTENT_TYPES)
         archive.writestr("_rels/.rels", RELS)
-        archive.writestr("3D/3dmodel.model", _model_document(plate, translate, slots))
         archive.writestr(
-            "Metadata/model_settings.config", _model_settings(plate, name)
+            "3D/3dmodel.model", _model_document(painted, translate, project.slots)
         )
-        # The project config is what carries the colours into Bambu Studio's own
-        # filament list.  See the comment above for what it has to contain.
+        archive.writestr(
+            "Metadata/model_settings.config",
+            _model_settings(painted, name, project.count),
+        )
+        # The project config is what carries the colours — and the recipes behind
+        # the mixed ones — into Bambu Studio's own filament list.  See the
+        # comment above for what it has to contain.
         archive.writestr(
             "Metadata/project_settings.config",
-            _project_settings([slot.color_hex for slot in slots]),
+            _project_settings(project.slots, project.mixed),
         )
         archive.writestr(
             "Metadata/filament_sequence.json",

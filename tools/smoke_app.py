@@ -2234,9 +2234,132 @@ def main() -> int:
                     app.overrideCursor() is None,
                     "the wait cursor is popped again after exporting",
                 )
+
+                # --- the 3MF carries the mixes' own recipes (m04136 item 2) -------
+                # Bambu Studio reads a mixed filament from `filament_is_mixed`
+                # plus `filament_mixed_components` and `_sublayer_ratios`, so the
+                # exported plate has to name every component spool — including
+                # the ones only the recipe uses, which become rows of their own.
+                import json
+
+                from app.mesh import threemf as _threemf
+
+                with zipfile.ZipFile(TEMP / "plate.3mf") as archive:
+                    written = json.loads(
+                        archive.read("Metadata/project_settings.config").decode("utf-8")
+                    )
+                slots = _threemf.slots_from_palette(page.result.palette, page.library)
+                project = _threemf.project_filaments(slots)
+                check(
+                    written["filament_colour"] == [slot.color_hex for slot in project.slots],
+                    f"the 3MF lists all {project.count} filaments the recipes need",
+                )
+                check(
+                    written["filament_is_mixed"]
+                    == ["1" if index in project.mixed else "0" for index in range(project.count)],
+                    f"the 3MF says which of them are mixed ({project.mixed_count} of {project.count})",
+                )
+                check(
+                    all(
+                        written["filament_mixed_components"][index]
+                        == ",".join(str(parent) for parent in parents)
+                        and written["filament_mixed_sublayer_ratios"][index]
+                        == ",".join(f"{ratio:.4f}" for ratio in ratios)
+                        for index, (parents, ratios) in project.mixed.items()
+                    ),
+                    "every mixed filament carries its components and their ratios",
+                )
+                if project.mixed_count:
+                    check(
+                        written["enable_mixed_color_sublayer"] == "1",
+                        "mixed layers are split into sublayers (7 layers would band)",
+                    )
+                check(
+                    written["filament_is_mixed"] == sorted(written["filament_is_mixed"])
+                    and all(
+                        index + 1 > max(parents)
+                        for index, (parents, _ratios) in project.mixed.items()
+                    ),
+                    "every mixed row is written after the rows it mixes (Bambu Studio 2.8.2.61 "
+                    "answers -18 'Invalid parameter value(s)' to anything else)",
+                )
+                plain = json.loads(
+                    _threemf._project_settings(slots, {})
+                )
+                check(
+                    "enable_mixed_color_sublayer" not in plain
+                    and "0" * project.count == "".join(plain["filament_is_mixed"]),
+                    "with no mixes at all the key is left out",
+                )
+
+                planted = (
+                    _threemf.FilamentSlot(color_hex="#F5D2B8", material_type="PETG HF", vendor="大简"),
+                    _threemf.FilamentSlot(
+                        color_hex="#EA818A",
+                        components=(
+                            _threemf.FilamentComponent(
+                                "#C52A36", material_type="PETG HF", vendor="大简", percent=38.0
+                            ),
+                            _threemf.FilamentComponent(
+                                "#F5D2B8", material_type="PETG HF", vendor="大简", percent=62.0
+                            ),
+                        ),
+                    ),
+                )
+                planted_project = _threemf.project_filaments(planted)
+                planted_settings = json.loads(
+                    _threemf._project_settings(planted_project.slots, planted_project.mixed)
+                )
+                check(
+                    planted_settings["filament_colour"] == ["#F5D2B8", "#C52A36", "#EA818A"]
+                    and planted_settings["filament_is_mixed"] == ["0", "0", "1"]
+                    and planted_settings["filament_mixed_components"] == ["", "", "2,1"]
+                    and planted_settings["filament_mixed_sublayer_ratios"]
+                    == ["", "", "0.3800,0.6200"]
+                    and planted_settings["enable_mixed_color_sublayer"] == "1",
+                    "a planted recipe exports its components, ratios and sublayer switch",
+                )
             finally:
                 _picture_page.QFileDialog = original_dialog
                 _picture_page.QMessageBox = original_box
+
+            # --- 1.6.25 (m04136 item 1): the colour budget is spent -----------
+            # The quantiser used to oversample six-fold and fold the result back
+            # down, and the fold ate a ramp's evenly spaced clusters: 32 colours
+            # asked for, 20 delivered.  The clustering now runs at the budget, so
+            # the count the user typed is the count they get — and the merge that
+            # folds near-identical colours compares against leaders only, so it
+            # cannot chain a ramp into one colour.
+            import numpy as _np
+            from PIL import Image as _PILImage
+
+            from app.core.image_matching import (
+                MatchSettings as _KernelSettings,
+                _merge_similar_colours as _merge_fold,
+                reduce_colours as _reduce_colours,
+            )
+
+            gradient = _np.zeros((96, 128, 3), dtype=_np.uint8)
+            gradient[..., 0] = _np.linspace(0, 255, 128, dtype=_np.uint8).reshape(1, 128)
+            gradient[..., 1] = _np.linspace(0, 255, 96, dtype=_np.uint8).reshape(96, 1)
+            gradient[..., 2] = _np.linspace(255, 0, 96, dtype=_np.uint8).reshape(96, 1)
+            ramp = _PILImage.fromarray(gradient, "RGB").convert("RGBA")
+            delivered = [
+                len(_reduce_colours(ramp, _KernelSettings(max_colours=budget))[0])
+                for budget in (8, 16, 32)
+            ]
+            check(
+                delivered == [8, 16, 32],
+                f"a gradient gets the colours it asked for ({delivered})",
+            )
+            greys = _np.array([(120 + 3 * index,) * 3 for index in range(6)], dtype=_np.uint8)
+            folded, _ = _merge_fold(
+                greys, _np.tile(_np.arange(6, dtype=_np.int64), (4, 6)), 2.0
+            )
+            check(
+                len(folded) == 3,
+                f"the merge keeps a ramp apart ({len(folded)} of 6 greys survive)",
+            )
 
             # --- a match says what it is doing (m08102 item 2) ------------------
             # The exact-colour pass is a Python loop of CIEDE2000 calls: 41 spools

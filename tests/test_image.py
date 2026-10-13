@@ -26,16 +26,20 @@ if str(PROJECT_ROOT) not in sys.path:
 from app.core.engines import ENGINE_BAMBU, ENGINE_MIXER  # noqa: E402
 from app.core.image_matching import (  # noqa: E402
     _BAD_BLOCK_DELTA_E,
+    _KMEANS_ITERATIONS,
     _PLAN_SPECS,
     MatchSettings,
     TriplePalette,
     _fit_spool_budget,
     _fold_clusters,
+    _kmeans_labels,
+    _median_cut_seeds,
     _merge_indistinguishable,
     _merge_similar_colours,
     _objective_closest,
     _objective_distinct,
     _objective_worst,
+    _pack,
     _plans,
     _prepare,
     build_palette,
@@ -160,6 +164,69 @@ class ColourReductionTests(unittest.TestCase):
         # A dithered picture spreads over the palette instead of using one flat
         # class per band, which is the whole point of the switch.
         self.assertGreater(len(np.unique(dithered[mask])), 1)
+
+    def _gradient(self) -> Image.Image:
+        ramp = np.zeros((96, 128, 3), dtype=np.uint8)
+        ramp[..., 0] = np.linspace(0, 255, 128, dtype=np.uint8).reshape(1, 128)
+        ramp[..., 1] = np.linspace(0, 255, 96, dtype=np.uint8).reshape(96, 1)
+        ramp[..., 2] = np.linspace(255, 0, 96, dtype=np.uint8).reshape(96, 1)
+        return Image.fromarray(ramp, "RGB").convert("RGBA")
+
+    def test_the_budget_is_spent_on_a_gradient(self):
+        # The quantiser used to run at ``max_colours × 6`` and fold the result
+        # back down, and the fold collapsed a ramp's evenly spaced clusters as
+        # they reached the threshold: 32 colours asked for, 20 delivered.  The
+        # clustering now runs at the budget, so the count is the count.
+        image = self._gradient()
+        unique = len(np.unique(np.asarray(image.convert("RGB")).reshape(-1, 3), axis=0))
+        self.assertGreater(unique, 4096)
+        for budget in (4, 8, 16, 32, 48):
+            with self.subTest(budget=budget):
+                colours, classes = reduce_colours(image, MatchSettings(max_colours=budget))
+                self.assertEqual(len(colours), budget)
+                self.assertEqual(sorted(set(int(v) for v in np.unique(classes))), list(range(budget)))
+
+    def test_a_flat_picture_still_comes_out_exactly(self):
+        # Two source colours with a budget of 48: the fast path has to hand back
+        # the two colours themselves, not two shades that merely sit near them.
+        flat = np.zeros((32, 32, 3), dtype=np.uint8)
+        flat[:, :16] = (200, 40, 60)
+        flat[:, 16:] = (30, 90, 200)
+        image = Image.fromarray(flat, "RGB").convert("RGBA")
+        colours, _ = reduce_colours(image, MatchSettings(max_colours=48))
+        self.assertEqual(
+            sorted(tuple(int(value) for value in row) for row in colours),
+            [(30, 90, 200), (200, 40, 60)],
+        )
+
+    def test_the_reduction_is_deterministic(self):
+        image = self._gradient()
+        first = reduce_colours(image, MatchSettings(max_colours=12))
+        second = reduce_colours(image, MatchSettings(max_colours=12))
+        self.assertTrue(np.array_equal(first[0], second[0]))
+        self.assertTrue(np.array_equal(first[1], second[1]))
+
+    def test_the_clustering_spends_every_seed(self):
+        # Two seeds on top of each other: an empty cluster is handed the colour
+        # farthest from every centre, so the budget is never quietly cut.
+        points = np.array([(0.0, 0.0, 0.0), (50.0, 40.0, 30.0), (100.0, 0.0, 0.0)])
+        counts = np.array([4, 4, 4], dtype=np.int64)
+        seeds = np.array([(0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (10.0, 0.0, 0.0)])
+        labels = _kmeans_labels(points, counts, seeds)
+        self.assertEqual(len(np.unique(labels)), 3)
+        self.assertGreaterEqual(_KMEANS_ITERATIONS, 1)
+
+    def test_the_seeds_are_drawn_from_the_picture(self):
+        pixels = np.array(
+            [(10, 20, 30), (10, 20, 32), (200, 20, 30), (250, 240, 230)], dtype=np.uint8
+        )
+        keys, counts = np.unique(_pack(pixels), return_counts=True)
+        seeds = _median_cut_seeds(keys, counts, 2)
+        self.assertEqual(len(seeds), 2)
+        low = pixels.min(axis=0).astype(np.int64)
+        high = pixels.max(axis=0).astype(np.int64)
+        for seed in seeds:
+            self.assertTrue(((seed >= low) & (seed <= high)).all(), tuple(int(v) for v in seed))
 
 
 class PaletteTests(unittest.TestCase):
@@ -496,6 +563,25 @@ class IndistinguishableColourTests(unittest.TestCase):
         self.assertEqual(MatchSettings(merge_delta_e=-5.0).clamped().merge_delta_e, 0.0)
         self.assertEqual(MatchSettings(merge_delta_e=99.0).clamped().merge_delta_e, 10.0)
         self.assertEqual(MatchSettings(merge_delta_e=1.5).clamped().merge_delta_e, 1.5)
+
+    def test_the_merge_does_not_chain_a_ramp_into_one_colour(self):
+        # Six greys 1.1–1.2 ΔE00 apart, 5.7 end to end: every neighbouring pair
+        # is inside the 2.0 threshold, so a union-find would collapse the whole
+        # ramp into one colour — measured, and it is why the merge compares
+        # against the leaders only.  Three representatives survive.
+        ramp = np.array([(120 + 3 * index,) * 3 for index in range(6)], dtype=np.uint8)
+        labs = np.array([_color.lab_from_rgb(row) for row in ramp])
+        steps = [float(_color.delta_e_2000(labs[i], labs[i + 1])) for i in range(len(ramp) - 1)]
+        self.assertTrue(all(step < 2.0 for step in steps), steps)
+        self.assertGreater(float(_color.delta_e_2000(labs[0], labs[-1])), 2.0)
+        classes = np.tile(np.arange(len(ramp), dtype=np.int64), (4, 6))
+        merged, remapped = _merge_similar_colours(ramp, classes, 2.0)
+        self.assertEqual(
+            [tuple(int(value) for value in row) for row in merged],
+            [(120, 120, 120), (126, 126, 126), (132, 132, 132)],
+        )
+        self.assertTrue((remapped >= 0).all())
+        self.assertLess(int(remapped.max()), len(merged))
 
 
 class RecipeTextTests(unittest.TestCase):

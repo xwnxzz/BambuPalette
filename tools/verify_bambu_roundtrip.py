@@ -110,6 +110,7 @@ def count_geometry(path: Path) -> dict:
         "paints": {},  # paint_color string -> triangle count
         "unpainted": 0,
         "filaments": [],
+        "mixed": {},
     }
     with zipfile.ZipFile(path) as archive:
         names = archive.namelist()
@@ -148,7 +149,27 @@ def count_geometry(path: Path) -> dict:
             colours = settings.get("filament_colour")
             if isinstance(colours, list):
                 report["filaments"] = [str(item) for item in colours]
+            for key in MIXED_KEYS:
+                if key in settings:
+                    report["mixed"][key] = settings[key]
     return report
+
+
+#: The keys that turn a filament row into a mixed one (m04136 item 2).
+MIXED_KEYS = (
+    "filament_is_mixed",
+    "filament_mixed_components",
+    "filament_mixed_sublayer_ratios",
+    "enable_mixed_color_sublayer",
+)
+
+
+def _mixed_rows(report: dict) -> int:
+    """How many filament rows the file declares as mixed."""
+    flags = report["mixed"].get("filament_is_mixed")
+    if isinstance(flags, list):
+        return sum(1 for flag in flags if str(flag) == "1")
+    return 0
 
 
 def mesh_health(path: Path) -> tuple[int, int]:
@@ -235,6 +256,11 @@ def main() -> int:
         "              paints: "
         + "  ".join(f"{code}×{count:,}" for code, count in sorted(source_report["paints"].items()))
     )
+    source_mixed = _mixed_rows(source_report)
+    print(f"              mixed filaments: {source_mixed}")
+    if source_mixed:
+        for key in MIXED_KEYS:
+            print(f"                {key} = {json.dumps(source_report['mixed'].get(key), ensure_ascii=False)}")
     source_open, source_non_manifold = mesh_health(source)
     print(
         f"              mesh: {source_open:,} open edges  "
@@ -272,6 +298,11 @@ def main() -> int:
         "              paints: "
         + "  ".join(f"{code}×{count:,}" for code, count in sorted(returned["paints"].items()))
     )
+    returned_mixed = _mixed_rows(returned)
+    print(f"              mixed filaments: {returned_mixed}")
+    if returned_mixed:
+        for key in MIXED_KEYS:
+            print(f"                {key} = {json.dumps(returned['mixed'].get(key), ensure_ascii=False)}")
 
     failures: list[str] = []
     warnings: list[str] = []
@@ -303,6 +334,25 @@ def main() -> int:
             f"the exported plate has {source_non_manifold:,} non-manifold edges — Bambu Studio "
             f"shows these as 错误: N 非流形边"
         )
+    if returned_mixed < source_mixed:
+        # A mixed filament only exists if Bambu Studio read the recipe out of
+        # the project config, so losing one means the recipe did not travel:
+        # the plate would come back with a flat colour where the mix was.
+        failures.append(
+            f"{source_mixed - returned_mixed} of {source_mixed} mixed filaments lost their "
+            f"recipe: {json.dumps(source_report['mixed'], ensure_ascii=False)} -> "
+            f"{json.dumps(returned['mixed'], ensure_ascii=False)}"
+        )
+    elif source_mixed:
+        lost = [
+            key
+            for key in MIXED_KEYS
+            if source_report["mixed"].get(key) != returned["mixed"].get(key)
+        ]
+        if lost:
+            warnings.append(
+                f"the round trip rewrote {sorted(lost)} — the mixes survived, the arrays differ"
+            )
     if source_report["filaments"] and returned["filaments"] != source_report["filaments"]:
         # NOT a failure, and for our own exports it no longer even applies: the
         # writer stopped emitting ``Metadata/project_settings.config``, because

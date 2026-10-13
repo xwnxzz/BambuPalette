@@ -2087,6 +2087,147 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         else:
             check(False, "the 3MF is a zip package")
 
+        # 1.6.25（m04136 第 2 条）：导出的 3MF 自带混色配方。
+        # Bambu Studio 从 `filament_is_mixed` 加 `filament_mixed_components` /
+        # `_sublayer_ratios` 读混色耗材，所以导出的底板得把每个成分耗材也列成槽
+        # ——包括只被配方用到的那些。
+        import json as _json
+
+        from .mesh.threemf import (
+            FilamentComponent as _Component,
+            FilamentSlot as _Slot,
+            _project_settings as _settings_from_slots,
+            project_filaments as _project_slots,
+        )
+
+        _slots = slots_from_palette(page.result.palette, page.library)
+        _project = _project_slots(_slots)
+        with zipfile.ZipFile(three_mf) as _archive:
+            _written = _json.loads(
+                _archive.read("Metadata/project_settings.config").decode("utf-8")
+            )
+        check(
+            _written["filament_colour"] == [slot.color_hex for slot in _project.slots],
+            f"3MF 列出配方需要的全部 {_project.count} 个耗材槽",
+        )
+        check(
+            _written["filament_is_mixed"]
+            == ["1" if index in _project.mixed else "0" for index in range(_project.count)],
+            f"逐槽写明是不是混色（这一页 {_project.mixed_count} 个混色）",
+        )
+        check(
+            all(
+                _written["filament_mixed_components"][index]
+                == ",".join(str(parent) for parent in parents)
+                and _written["filament_mixed_sublayer_ratios"][index]
+                == ",".join(f"{ratio:.4f}" for ratio in ratios)
+                for index, (parents, ratios) in _project.mixed.items()
+            ),
+            "每个混色槽都写明成分下标与四位小数的比例",
+        )
+        _planted = (
+            _Slot(color_hex="#F5D2B8", material_type="PETG HF", vendor="大简", name="肤色"),
+            _Slot(
+                color_hex="#EA818A",
+                material_type="PETG HF",
+                vendor="大简",
+                name="红色 38% + 肤色 62%",
+                components=(
+                    _Component("#C52A36", material_type="PETG HF", vendor="大简", percent=38.0),
+                    _Component("#F5D2B8", material_type="PETG HF", vendor="大简", percent=62.0),
+                ),
+            ),
+        )
+        _planted_project = _project_slots(_planted)
+        _planted_settings = _json.loads(
+            _settings_from_slots(_planted_project.slots, _planted_project.mixed)
+        )
+        check(
+            _planted_project.count == 3
+            and _planted_project.added == 1
+            and _planted_project.mixed[2][0] == (2, 1)
+            and _planted_project.order == {1: 1, 2: 3},
+            f"混色引用的料没被涂时补成槽（{_planted_project.count} 槽，补 {_planted_project.added}），混色自己排最后",
+        )
+        check(
+            _planted_settings["filament_colour"] == ["#F5D2B8", "#C52A36", "#EA818A"]
+            and _planted_settings["filament_is_mixed"] == ["0", "0", "1"]
+            and _planted_settings["filament_mixed_components"] == ["", "", "2,1"]
+            and _planted_settings["filament_mixed_sublayer_ratios"]
+            == ["", "", "0.3800,0.6200"],
+            "末位混色指向 (2,1)、比例 0.3800/0.6200，与 Bambu Studio 写的一致",
+        )
+        check(
+            _written["filament_is_mixed"] == sorted(_written["filament_is_mixed"])
+            and all(
+                index + 1 > max(parents)
+                for index, (parents, _ratios) in _project.mixed.items()
+            ),
+            "混色槽一律排在最后、成分都在它前面（Bambu Studio 2.8.2.61 只认这个顺序）",
+        )
+        check(
+            _planted_settings["enable_mixed_color_sublayer"] == "1",
+            "混色子层打开：1.4 mm 只有 7 层，逐层交替会出条纹",
+        )
+        _plain_settings = _json.loads(_settings_from_slots(_planted[:1], {}))
+        check(
+            "enable_mixed_color_sublayer" not in _plain_settings
+            and _plain_settings["filament_is_mixed"] == ["0"],
+            "没有混色时就不写这个键",
+        )
+
+        # 1.6.25（m04136 第 1 条）：颜色缩减换成「唯一色上的加权 k-means」，直接
+        # 按预算产色。以前是超采 6 倍再折叠，折叠会把渐变上等距的簇吃掉——要 32
+        # 色只给 20 色；现在要多少给多少，而且更快。
+        import numpy as _np  # noqa: PLC0415
+        from PIL import Image as _ReduceImage  # noqa: PLC0415
+
+        from .core.image_matching import (
+            _KMEANS_ITERATIONS as _kmeans_rounds,
+            _median_cut_seeds as _cut_seeds,
+            _merge_similar_colours as _merge_colours,
+            _pack as _pack_colours,
+            reduce_colours as _reduce,
+        )
+
+        _gradient = _np.zeros((96, 128, 3), dtype=_np.uint8)
+        _gradient[..., 0] = _np.linspace(0, 255, 128, dtype=_np.uint8).reshape(1, 128)
+        _gradient[..., 1] = _np.linspace(0, 255, 96, dtype=_np.uint8).reshape(96, 1)
+        _gradient[..., 2] = _np.linspace(255, 0, 96, dtype=_np.uint8).reshape(96, 1)
+        _ramp_image = _ReduceImage.fromarray(_gradient, "RGB").convert("RGBA")
+        _delivered = []
+        for _budget in (8, 16, 32):
+            _colours, _classes = _reduce(_ramp_image, MatchSettings(max_colours=_budget))
+            _delivered.append(len(_colours))
+        check(
+            _delivered == [8, 16, 32] and int(_classes.max()) + 1 == 32,
+            f"渐变图要多少色就产多少色（8/16/32 → {_delivered}，全用上了）",
+        )
+        _flat = _np.zeros((16, 16, 3), dtype=_np.uint8)
+        _flat[:, :8] = (200, 40, 60)
+        _flat[:, 8:] = (30, 90, 200)
+        _few, _ = _reduce(
+            _ReduceImage.fromarray(_flat, "RGB").convert("RGBA"), MatchSettings(max_colours=48)
+        )
+        check(
+            sorted(tuple(int(value) for value in row) for row in _few)
+            == [(30, 90, 200), (200, 40, 60)],
+            "本来只有两种颜色的图，原样给回这两种颜色",
+        )
+        _keys, _histogram = _np.unique(_pack_colours(_gradient.reshape(-1, 3)), return_counts=True)
+        check(
+            len(_cut_seeds(_keys, _histogram, 16)) == 16 and _kmeans_rounds >= 1,
+            f"种子由中位切分给出、数量与预算一致；聚类最多 {_kmeans_rounds} 轮（标签不再变就提前收）",
+        )
+        _greys = _np.array([(120 + 3 * index,) * 3 for index in range(6)], dtype=_np.uint8)
+        _folded, _ = _merge_colours(
+            _greys, _np.tile(_np.arange(6, dtype=_np.int64), (4, 6)), 2.0
+        )
+        check(
+            len(_folded) == 3,
+            f"六个相差 1.1 ΔE00 的灰阶不会连成一片（并查集会合成 1 色，领队法留下 {len(_folded)} 色）",
+        )
+
         # 1.6.24 (m03703)：三条外部评审。
         # ① 最近颜色搜索：短名单是近似，池子小的时候直接逐行量到底（精确通道）。
         from .core.image_matching import (
