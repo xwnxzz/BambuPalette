@@ -81,8 +81,9 @@ def main() -> int:
     print("wrote", OUT / "ui-main.png")
     print("wrote", OUT / "ui-pair.png")
 
-    # The 添加耗材 dialog is pictured in the README, so it is rendered here too
-    # rather than left to go stale every time a button moves.
+    # The 添加耗材 dialog is rendered here too, rather than left to go stale
+    # every time a button moves.  The screenshots land in samples/ for whoever
+    # wants to look at them; the README itself carries only the logo.
     from app.ui.filament_dialog import FilamentDialog  # noqa: E402
 
     dialog = FilamentDialog(
