@@ -238,6 +238,24 @@ class MatchTests(unittest.TestCase):
         self.assertEqual(int(result.counts.sum()), 1600 - 400)
         self.assertAlmostEqual(result.coverage, 0.75, places=9)
 
+    def test_a_picture_with_nothing_but_transparent_pixels_is_refused(self):
+        # convert("RGB") turns the whole picture black, and matching that gives a
+        # solid black plate.  Refusing it is the honest answer.
+        image = Image.new("RGBA", (24, 24), (0, 0, 0, 0))
+        with self.assertRaises(ValueError) as caught:
+            match_image(image, self.palette, MatchSettings(max_colours=8))
+        self.assertIn("透明", str(caught.exception))
+
+    def test_a_picture_below_the_alpha_threshold_still_matches(self):
+        # Not transparent, just stored with an absurdly low alpha: the RGB is
+        # still the drawing, so treating the whole picture as printable is right.
+        image = _quadrant_image(24)
+        image.putalpha(image.getchannel("A").point(lambda value: 1 if value else 0))
+        result = match_image(image, self.palette, MatchSettings(max_colours=8))
+        self.assertEqual(len(result.palette), 4)
+        self.assertEqual(int(result.counts.sum()), 24 * 24)
+        self.assertEqual(int(np.count_nonzero(result.indices < 0)), 0)
+
     def test_a_gradient_respects_the_colour_budget(self):
         # A gradient between the two tinted spools (金 → 红): the picture needs
         # more than one colour, but must still fit inside the budget.
@@ -404,10 +422,31 @@ class IndistinguishableColourTests(unittest.TestCase):
         self.assertGreater(transitions, 2)
 
     def test_smoothing_alone_already_calms_the_speckle(self):
-        settings = MatchSettings(max_colours=12, merge_delta_e=0.0, smooth_radius=2)
-        result = match_image(self._noisy_flat(), self.palette, settings)
-        transitions = int(np.count_nonzero(result.indices[32][1:] != result.indices[32][:-1]))
-        self.assertLessEqual(transitions, 2, f"the region is speckled: {transitions} changes")
+        # The merge is off, so this measures the mean filter on its own.
+        rough = match_image(
+            self._noisy_flat(), self.palette, MatchSettings(max_colours=12, merge_delta_e=0.0, smooth_radius=0)
+        )
+        rough_transitions = int(np.count_nonzero(rough.indices[32][1:] != rough.indices[32][:-1]))
+        result = match_image(
+            self._noisy_flat(), self.palette, MatchSettings(max_colours=12, merge_delta_e=0.0, smooth_radius=2)
+        )
+        row = result.indices[32]
+        transitions = int(np.count_nonzero(row[1:] != row[:-1]))
+        self.assertGreater(rough_transitions, 10)
+        self.assertLessEqual(transitions * 4, rough_transitions, f"the region is speckled: {transitions} changes")
+        # What is left is a tie rather than a defect, and the merge is not allowed
+        # to fix it: this four-spool palette holds nothing near the peach (its
+        # nearest mix sits 11.71 ΔE00 away), so the two nearest mixes are equally
+        # defensible and a pixel's own value decides between them.
+        region = _color.lab_from_rgb((250, 212, 181))
+        distances = [float(_color.delta_e_2000(region, entry.lab)) for entry in result.palette]
+        self.assertGreater(min(distances), 2.0, "nothing this palette owns is close enough to fold")
+        for x in np.flatnonzero(row[1:] != row[:-1]):
+            first, second = result.palette[int(row[x])], result.palette[int(row[x + 1])]
+            gap = abs(
+                float(_color.delta_e_2000(region, first.lab)) - float(_color.delta_e_2000(region, second.lab))
+            )
+            self.assertLess(gap, 1.0, f"the flip at x={x} is not a tie: {first.color_hex} vs {second.color_hex}")
 
     def test_smoothing_cannot_push_a_pixel_outside_the_picture(self):
         # The mean filter must not average the transparent surround in, and it
@@ -817,6 +856,78 @@ class TriplePalettePoolTests(unittest.TestCase):
             )
 
         self.assertLessEqual(worst(pool_result), worst(head_result) + 1e-9)
+
+
+class NearestColourSearchTests(unittest.TestCase):
+    """m03703 第 1 条: the search answers with the *nearest* colour.
+
+    A Euclidean shortlist is only a proxy, so both paths are held against a
+    brute-force CIEDE2000 argmin over the same table — that argmin *is* the
+    answer the search claims to give.
+    """
+
+    def setUp(self):
+        from app.core import image_matching as im
+
+        self.im = im
+        self.library = _library()
+        self.catalog = MixCatalog(self.library.filaments, engine=ENGINE_BAMBU).build()
+        self.palette = build_palette(self.library, self.catalog)
+        self.table = np.asarray([entry.lab for entry in self.palette], dtype=np.float64)
+        self.labs = np.asarray(
+            [
+                _color.lab_from_rgb((0, 0, 0)),
+                _color.lab_from_rgb((255, 255, 255)),
+                _color.lab_from_rgb((0, 0, 255)),
+                _color.lab_from_rgb((18, 143, 216)),
+                _color.lab_from_rgb((211, 22, 137)),
+                _color.lab_from_rgb((205, 176, 62)),
+            ],
+            dtype=np.float64,
+        )
+
+    def _brute_force(self, table: np.ndarray) -> np.ndarray:
+        out = []
+        for lab in self.labs:
+            values = [_color.delta_e_2000(lab, row) for row in table]
+            out.append(int(np.argmin(values)))
+        return np.asarray(out, dtype=np.int64)
+
+    def _pin(self, **knobs: int) -> None:
+        """Pin module knobs for one test and put them back afterwards."""
+        for name, value in knobs.items():
+            self.addCleanup(setattr, self.im, name, getattr(self.im, name))
+            setattr(self.im, name, value)
+
+    def test_a_small_pool_is_measured_colour_by_colour(self):
+        # A one-row shortlist would answer with a different colour, so this
+        # passing means the small-pool path never consults the shortlist.
+        self._pin(_SHORTLIST=1)
+        chosen = self.im._nearest_entries(self.labs, self.palette, self.table)
+        self.assertEqual(list(chosen), list(self._brute_force(self.table)))
+
+    def test_the_wide_pool_path_reaches_the_same_colour(self):
+        # The three-filament path, priced down onto this palette: given the whole
+        # table as its shortlist its answer must be the same one.
+        self._pin(_SHORTLIST=len(self.table), _EXACT_PAIRS=0)
+        chosen = self.im._nearest_entries(self.labs, self.palette, self.table)
+        self.assertEqual(list(chosen), list(self._brute_force(self.table)))
+
+    def test_the_shortlist_is_not_tiny(self):
+        # It was 24, and on the 41-spool library that missed the true nearest
+        # colour by up to 2.673 ΔE00 — a difference anyone can see.
+        self.assertGreaterEqual(self.im._SHORTLIST, 1024)
+        self.assertGreater(self.im._EXACT_PAIRS, 0)
+
+    def test_the_three_filament_tail_is_searched_too(self):
+        triples = TripleCatalog(self.library.filaments, engine=ENGINE_MIXER).build()
+        pool = TriplePalette(self.palette, triples, self.library)
+        table = np.asarray(pool.lab_table(), dtype=np.float64)
+        labs = self.labs[:3]
+        chosen = self.im._nearest_entries(labs, pool, table)
+        for index, lab in enumerate(labs):
+            values = [_color.delta_e_2000(lab, row) for row in table]
+            self.assertEqual(int(chosen[index]), int(np.argmin(values)))
 
 
 class SpoolBudgetTests(unittest.TestCase):

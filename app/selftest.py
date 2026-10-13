@@ -2087,6 +2087,78 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         else:
             check(False, "the 3MF is a zip package")
 
+        # 1.6.24 (m03703)：三条外部评审。
+        # ① 最近颜色搜索：短名单是近似，池子小的时候直接逐行量到底（精确通道）。
+        from .core.image_matching import (
+            _EXACT_PAIRS as _exact_pairs,
+            _SHORTLIST as _shortlist,
+            _nearest_entries as _nearest,
+            _palette_table as _palette_rows,
+        )
+        from .spectral import color as _match_colour
+
+        check(
+            1024 <= _shortlist and _exact_pairs > 0,
+            f"短名单放宽到 {_shortlist} 行，另留一条全表精确通道（{_exact_pairs} 对以内走它）",
+        )
+        live = page.result.palette
+        rows = _palette_rows(live)
+        targets = rows[:: max(1, len(rows) // 7)][:7]
+        picked = [int(index) for index in _nearest(targets, live, rows)]
+        brute = []
+        for lab in targets:
+            scored = [_match_colour.delta_e_2000(lab, entry.lab) for entry in live]
+            brute.append(int(min(range(len(live)), key=lambda index: scored[index])))
+        check(
+            picked == brute,
+            f"这个池子只有 {len(live)} 个颜色，走的是精确通道：逐个量到底，和暴力 argmin 完全一致",
+        )
+
+        # ② 全透明图片：以前会被当成整张黑图匹配，现在直接回绝并说清原因。
+        from PIL import Image as _SelftestImage
+
+        try:
+            match_image(
+                _SelftestImage.new("RGBA", (24, 24), (0, 0, 0, 0)),
+                live,
+                MatchSettings(max_colours=8),
+            )
+        except ValueError as error:
+            check("透明" in str(error), f"全透明的图片被回绝了，理由说得清（{error}）")
+        else:
+            check(False, "全透明图片该被回绝，而不是匹配出一整片黑")
+        faint = match_image(
+            _SelftestImage.new("RGBA", (8, 8), (200, 30, 30, 1)),
+            live,
+            MatchSettings(max_colours=4),
+        )
+        check(
+            len(faint.palette) >= 1 and faint.printed_pixels > 0,
+            f"不透明度全在阈值以下、但 RGB 还是画本身的图照旧匹配（{len(faint.palette)} 色）",
+        )
+
+        # ③ 不到三卷料时三色目录自己也得站得住（主界面会拦，目录类不能炸）。
+        from .core.library import Filament as _SelftestFilament
+        from .core.triples import TripleCatalog as _SelftestTriples
+
+        couple = [
+            _SelftestFilament(name="自检卷 1", color_hex="#E8E4DE", material_type="PLA"),
+            _SelftestFilament(name="自检卷 2", color_hex="#2A2A2E", material_type="PLA"),
+        ]
+        empty_triples = _SelftestTriples(couple, engine=ENGINE_MIXER).build()
+        check(
+            empty_triples.built
+            and empty_triples.triple_count == 0
+            and empty_triples.recipe_count == 0,
+            "两卷料：三色目录照样建得出来，只是空的",
+        )
+        check(
+            empty_triples.packed.shape == (0,)
+            and list(empty_triples.offsets) == [0]
+            and empty_triples.first_triple_index().shape == (0,),
+            "空目录的形状是对的（没有配方，偏移表只有一个起点）",
+        )
+
     # 「颜色配方」页面：长说明搬到状态栏，右边面板不再被那条文字钉死宽度。
     from PySide6.QtWidgets import QLabel as _QLabel
     from PySide6.QtWidgets import QSizePolicy as _QSizePolicy

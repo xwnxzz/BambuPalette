@@ -387,13 +387,21 @@ class TripleCatalog:
         mixed = self._mixed[: self._mixed_done]
         order = np.argsort(mixed, kind="stable")
         sorted_packed = mixed[order]
-        keep = np.empty(len(sorted_packed), dtype=bool)
-        keep[0] = True
-        np.not_equal(sorted_packed[1:], sorted_packed[:-1], out=keep[1:])
-        starts = np.flatnonzero(keep)
-        self.packed = sorted_packed[starts].astype(np.int32)
-        self._offsets = np.append(starts, len(sorted_packed)).astype(np.int64)
-        self._codes = order.astype(np.uint32)
+        if len(sorted_packed) == 0:
+            # 不到三卷料时一条配方都没有：空表也要收成合法的 CSR，不能拿 keep[0]
+            # 去碰空数组（那会 IndexError）。界面会提前拦住少于三卷的情况，但
+            # 目录类自己也得站得住。
+            self.packed = np.empty(0, dtype=np.int32)
+            self._offsets = np.zeros(1, dtype=np.int64)
+            self._codes = np.empty(0, dtype=np.uint32)
+        else:
+            keep = np.empty(len(sorted_packed), dtype=bool)
+            keep[0] = True
+            np.not_equal(sorted_packed[1:], sorted_packed[:-1], out=keep[1:])
+            starts = np.flatnonzero(keep)
+            self.packed = sorted_packed[starts].astype(np.int32)
+            self._offsets = np.append(starts, len(sorted_packed)).astype(np.int64)
+            self._codes = order.astype(np.uint32)
         self._labs = None
         self._built = True
         self._mixed = None

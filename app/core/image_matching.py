@@ -39,7 +39,21 @@ ProgressFn = Callable[[str, float], None]
 #: How many candidates the cheap Lab-distance pass keeps before the exact
 #: CIEDE2000 pass runs.  Pure Lab distance is a good but not perfect proxy, and
 #: CIEDE2000 is far too slow to evaluate against a palette of tens of thousands.
-_SHORTLIST = 24
+#: Twenty-four was too few: on the 41-spool library it missed the true nearest
+#: colour by up to 2.673 ΔE00 — a difference anyone can see — so the pass now
+#: keeps 4,096 rows, where the worst miss measured against an exact scan of the
+#: same pool is 0.010 ΔE00, for 1.35× the search time (m03703 第 1 条).
+_SHORTLIST = 4096
+
+#: ``rows × colours`` below which the search skips the shortlist altogether and
+#: measures every row with CIEDE2000, so its answer *is* the global optimum.  The
+#: two-filament pool is ~60k rows and lands here; the four-million-row
+#: three-filament pool cannot, because measuring all of it honestly takes 29 s
+#: for a nineteen-colour picture (m03703 第 1 条).
+_EXACT_PAIRS = 1 << 22
+
+#: Rows walked per chunk by that exact scan.
+_EXACT_BLOCK = 1 << 15
 
 #: Dtype of the per-pixel palette index.  It must be wide enough for the WHOLE
 #: palette, not just for the colours a picture happens to use: a 41-spool
@@ -442,7 +456,10 @@ def _shortlist_indices(
 
     Distances are Euclidean in Lab and computed in blocks: the three-filament
     pool is millions of rows, so the full ``(targets × rows)`` matrix would be
-    gigabytes.
+    gigabytes.  Only the running best ``shortlist`` rows per target are carried
+    between blocks, so the working set is ``(targets × shortlist)`` however long
+    the pool is — which is what makes a four-thousand-row shortlist affordable
+    at all (m03703 第 1 条).
 
     ``on_block`` is called with ``(rows_done, rows_total)`` after every block.
     It is what keeps the bar moving across a four-million-row pool: the scan is
@@ -451,23 +468,70 @@ def _shortlist_indices(
     """
     count = int(table.shape[0])
     take = min(shortlist, count)
+    if take <= 0:
+        return np.zeros((len(targets), 0), dtype=np.int64)
     target_sq = (targets**2).sum(axis=1)[:, None]
-    best_indices = np.zeros((len(targets), 0), dtype=np.int64)
-    best_scores = np.zeros((len(targets), 0), dtype=np.float32)
+    run_indices = np.zeros((len(targets), 0), dtype=np.int64)
+    run_scores = np.zeros((len(targets), 0), dtype=np.float32)
     for start in range(0, count, _SEARCH_BLOCK):
         block = table[start : start + _SEARCH_BLOCK]
         square = target_sq + (block**2).sum(axis=1)[None, :] - 2.0 * (targets @ block.T)
         np.maximum(square, 0.0, out=square)
-        picked = np.argpartition(square, take - 1, axis=1)[:, :take]
-        best_indices = np.concatenate([best_indices, picked + start], axis=1)
-        best_scores = np.concatenate(
-            [best_scores, np.take_along_axis(square, picked, axis=1)], axis=1
+        here = min(take, block.shape[0])
+        picked = np.argpartition(square, here - 1, axis=1)[:, :here]
+        run_indices = np.concatenate([run_indices, picked + start], axis=1)
+        run_scores = np.concatenate(
+            [run_scores, np.take_along_axis(square, picked, axis=1)], axis=1
         )
+        if run_scores.shape[1] > 2 * take:
+            keep = np.argpartition(run_scores, take - 1, axis=1)[:, :take]
+            run_indices = np.take_along_axis(run_indices, keep, axis=1)
+            run_scores = np.take_along_axis(run_scores, keep, axis=1)
         if on_block is not None:
             on_block(min(start + _SEARCH_BLOCK, count), count)
-    width = best_scores.shape[1]
-    keep = np.argpartition(best_scores, min(shortlist, width) - 1, axis=1)[:, :shortlist]
-    return np.take_along_axis(best_indices, keep, axis=1)
+    width = run_scores.shape[1]
+    keep = np.argpartition(run_scores, min(take, width) - 1, axis=1)[:, :take]
+    return np.take_along_axis(run_indices, keep, axis=1)
+
+
+def _scan_exact(
+    labs: np.ndarray,
+    table: np.ndarray,
+    on_block: Callable[[int, int], None] | None = None,
+) -> np.ndarray:
+    """Index of the closest row of ``table`` to each row of ``labs``, exactly.
+
+    Every row is measured with CIEDE2000 and the smallest one wins, so this is
+    the global optimum by construction — no Lab proxy anywhere in the answer.
+    It walks the colours one at a time so the working set stays a couple of
+    megabytes whatever the pool size, and ``on_block`` is called with
+    ``(pairs_done, pairs_total)`` as it goes, pairs being colour × row.
+    """
+    count = int(table.shape[0])
+    rows = len(labs)
+    out = np.zeros(rows, dtype=np.int64)
+    if count == 0 or rows == 0:
+        return out
+    width = min(_EXACT_BLOCK, count)
+    pairs_total = count * rows
+    pairs_done = 0
+    for row in range(rows):
+        lab = np.asarray(labs[row], dtype=np.float64)[None, :]
+        best = float("inf")
+        chosen = 0
+        for start in range(0, count, width):
+            chunk = table[start : start + width]
+            values = _color.delta_e_2000(lab, chunk)
+            local = int(np.argmin(values))
+            value = float(values[local])
+            if value < best:
+                best = value
+                chosen = start + local
+            pairs_done += len(chunk)
+            if on_block is not None:
+                on_block(pairs_done, pairs_total)
+        out[row] = chosen
+    return out
 
 
 def _nearest_entries(
@@ -479,22 +543,35 @@ def _nearest_entries(
 ) -> np.ndarray:
     """Index of the palette entry closest to each row of ``labs``.
 
-    A Euclidean pass in Lab narrows the field, then CIEDE2000 picks the winner so
-    the answer agrees with the ΔE the UI reports.
+    Two paths, and the pool size decides which one runs:
 
-    ``on_scan`` is called with ``(rows_done, rows_total)`` as the Euclidean pass
-    walks the palette, and ``on_row`` with the same shape as the exact pass walks
-    the colours.  Two callbacks rather than one because they are two very
-    different stretches of time: the scan is one vectorised call per 65,536
-    palette rows, the exact pass one CIEDE2000 per candidate colour.
+    * ``rows × colours`` within :data:`_EXACT_PAIRS` — every entry is measured
+      with CIEDE2000, so the answer is the true nearest colour.  The
+      two-filament pool (tens of thousands of colours) always lands here.
+    * the four-million-row three-filament pool — a Euclidean pass in Lab keeps
+      the :data:`_SHORTLIST` nearest rows per colour and CIEDE2000 picks among
+      those.  That is a proxy, not a proof: measured against a fully exact scan
+      of the same pool, nineteen picture colours came out at most 0.010 ΔE00
+      away from the true optimum (41-spool library, m03703 第 1 条).
+
+    ``on_scan`` gets ``(done, total)`` as the rows are walked — the Euclidean
+    pass in the second path, the whole colour × row sweep in the first — and
+    ``on_row`` the same shape as the colours are settled.  Two callbacks rather
+    than one because they are two very different stretches of time.
     """
     if not entries:
         return np.zeros(len(labs), dtype=np.int64)
     if table is None:
         table = _palette_table(entries)
     count = int(table.shape[0])
-    if count == 0:
-        return np.zeros(len(labs), dtype=np.int64)
+    rows = len(labs)
+    if count == 0 or rows == 0:
+        return np.zeros(rows, dtype=np.int64)
+    if count * rows <= _EXACT_PAIRS:
+        out = _scan_exact(labs, table, on_scan)
+        if on_row is not None:
+            on_row(rows, rows)
+        return out
 
     targets = np.asarray(labs, dtype=np.float32)
     best_indices = _shortlist_indices(table, targets, _SHORTLIST, on_scan)
@@ -509,18 +586,13 @@ def _nearest_entries(
         head_indices = _shortlist_indices(table[:head_size], targets, _SHORTLIST)
         best_indices = np.concatenate([best_indices, head_indices], axis=1)
 
-    rows = len(targets)
     out = np.zeros(rows, dtype=np.int64)
     for row in range(rows):
-        candidates = best_indices[row]
-        best_index = int(candidates[0])
-        best = float("inf")
-        for index in candidates:
-            value = _color.delta_e_2000(labs[row], table[index])
-            if value < best:
-                best = value
-                best_index = int(index)
-        out[row] = best_index
+        candidates = np.asarray(best_indices[row], dtype=np.int64)
+        values = _color.delta_e_2000(
+            np.asarray(labs[row], dtype=np.float64)[None, :], table[candidates]
+        )
+        out[row] = int(candidates[int(np.argmin(values))])
         if on_row is not None and (row % _PROGRESS_ROWS == _PROGRESS_ROWS - 1 or row == rows - 1):
             on_row(row + 1, rows)
     return out
@@ -1729,6 +1801,13 @@ def _prepare(
     alpha = np.asarray(image.getchannel("A"), dtype=np.uint8)
     mask = alpha > config.alpha_threshold
     if not mask.any():
+        if not alpha.any():
+            # 整张图都是透明的：``convert("RGB")`` 会把这些像素变成纯黑，照旧当成
+            # 有效像素匹配出去的就是一块纯黑底板 —— 用户拿到的东西和「一张全透明的
+            # 图」毫无关系。宁可把话说清楚。
+            raise ValueError("这张图整张都是透明的，没有可以打印的像素。")
+        # 不透明度全都低于阈值（例如 alpha 被存成 1）：这时 RGB 还是画本身，当成
+        # 整张图都有效比直接拒绝它合理。
         mask = np.ones(alpha.shape, dtype=bool)
 
     _report(progress, "减少图片颜色数量", 0.30)

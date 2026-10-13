@@ -163,6 +163,41 @@ class TripleCatalogTests(unittest.TestCase):
         self.assertTrue(np.array_equal(stepped._codes, fresh._codes))
 
 
+class EmptyTripleBuildTests(unittest.TestCase):
+    """不到三卷料时一条配方都没有：目录类自己也得站得住。"""
+
+    def test_building_below_three_filaments_gives_an_empty_catalog(self):
+        for count in (0, 1, 2):
+            with self.subTest(filaments=count):
+                library = _library(*SIX[:count])
+                catalog = TripleCatalog(library.filaments, engine=ENGINE_MIXER).build()
+                self.assertTrue(catalog.built)
+                self.assertEqual(catalog.triple_count, 0)
+                self.assertEqual(catalog.recipe_count, 0)
+                self.assertEqual(catalog.colour_count, 0)
+                self.assertEqual(catalog.packed.shape, (0,))
+                self.assertEqual(catalog.codes.shape, (0,))
+                self.assertEqual(list(catalog.offsets), [0])
+                self.assertEqual(catalog.first_triple_index().shape, (0,))
+
+    def test_stepped_empty_build_finishes_too(self):
+        catalog = TripleCatalog([], engine=ENGINE_MIXER)
+        catalog.begin()
+        self.assertTrue(catalog.step(0.01))
+        catalog.finish()
+        self.assertTrue(catalog.built)
+        self.assertEqual(catalog.colour_count, 0)
+
+    def test_three_filaments_still_build_the_full_table(self):
+        library = _library(*SIX[:3])
+        catalog = TripleCatalog(library.filaments, engine=ENGINE_MIXER).build()
+        self.assertEqual(catalog.triple_count, 1)
+        self.assertEqual(catalog.recipe_count, TRIPLE_RATIO_COUNT)
+        # colour_count 是去重后的颜色数：这几卷料颜色相近，大量配方混出同一个色。
+        self.assertGreater(catalog.colour_count, 0)
+        self.assertLess(catalog.colour_count, catalog.recipe_count)
+
+
 class TripleCacheTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
