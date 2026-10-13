@@ -1753,6 +1753,101 @@ def run_selftest(*, report_path: Path | None = None) -> int:
                 "undoing the merge restores both colours",
             )
 
+        # 1.6.21 (m01191 item 2)：合并写回原图的是「留下来的那一块**本来的**颜色」，不是
+        # 预览里那卷耗材印出来的颜色。用户的规矩写得很清楚：原图色块 a 对应预览色块 b、
+        # 原图色块 c 对应预览色块 d，b 和 d 合并之后原图里 c 也并进 a，用的是 a 自己的
+        # 颜色——所以原图的颜色集合一点都不变，变的只有色块大小。
+        if len(page.result.palette) >= 2:
+            picked = page._list.row_ids()[:2]
+            page._list.select(picked)
+            app.processEvents()
+            keeper = int(picked[1])
+            indices = _np.asarray(page.result.indices)
+            touched = _np.isin(indices, _np.asarray(picked, dtype=indices.dtype))
+            colours_before = {
+                tuple(int(value) for value in pixel)
+                for pixel in _np.unique(
+                    _np.asarray(page._image.convert("RGBA"))[..., :3].reshape(-1, 3), axis=0
+                )
+            }
+            keeper_colour = page._picture_colour(indices == keeper)
+            check(keeper_colour is not None, "能量出留下来的那一块在原图里本来的颜色")
+            before_merge_image = page._image.tobytes()
+            real_merge = _pp.MergeDialog
+            _pp.MergeDialog = lambda *args, **kwargs: _StubDialog(1, None)
+            try:
+                page._on_merge_colours()
+                app.processEvents()
+            finally:
+                _pp.MergeDialog = real_merge
+            check(page._original_edited, "合并也改原图")
+            painted = _pp._to_image_grid(touched, page._image.size)
+            pixels = _np.asarray(page._image.convert("RGBA"))
+            merged = pixels[painted][pixels[painted][:, 3] > 0][:, :3]
+            check(
+                merged.size > 0
+                and bool((merged == _np.asarray(keeper_colour, dtype=merged.dtype)).all()),
+                "原图里并掉的那些像素用的是留下来的那一块本来的颜色"
+                f"（期望 {keeper_colour}）",
+            )
+            colours_after = {
+                tuple(int(value) for value in pixel)
+                for pixel in _np.unique(
+                    _np.asarray(page._image.convert("RGBA"))[..., :3].reshape(-1, 3), axis=0
+                )
+            }
+            check(
+                colours_after <= colours_before,
+                f"合并不会让原图多出颜色（多了 {sorted(colours_after - colours_before)}）",
+            )
+            check(
+                len(page.result.palette) == before_colours - 1,
+                "合并在预览里仍然是少了一种颜色",
+            )
+            page._undo()
+            app.processEvents()
+            check(
+                page._image.tobytes() == before_merge_image,
+                "Ctrl+Z 把合并改过的原图也退回去",
+            )
+
+        # 1.6.21 (m01191 item 1)：列表里一个都没选中，预览就不画高亮、不画描边。
+        # 用户报的正是这条（未选中颜色时预览还显示色块），而他说不清自己是怎么把选中取消掉
+        # 的，所以这里按「选中集是空的」本身来验证，而不是按某一条路来验证。
+        one = page._list.row_ids()
+        if one:
+            page._list.select([one[0]])
+            app.processEvents()
+            check(page._view._dim_pixmap() is not None, "选中一种颜色时预览画着它")
+            rows = page._list._list
+            rows.clearSelection()
+            rows.setCurrentRow(-1)
+            app.processEvents()
+            check(
+                page._view._selected == -1
+                and page._view._dim_pixmap() is None
+                and page._list.current() == -1
+                and not page._list.selected_indices(),
+                "选中集空掉之后预览什么都不画（点列表下面空白处那条路）",
+            )
+        page._set_pick_mode(_pp.PICK_EDGE, save=False)
+        app.processEvents()
+        if page._blocks is not None and page._blocks.count:
+            page._list.select([page._list.row_ids()[0]])
+            app.processEvents()
+            check(page._view._selected_mask is not None, "块模式下选中的那一块画了出来")
+            page._list._list.clearSelection()
+            page._list._list.setCurrentRow(-1)
+            app.processEvents()
+            check(
+                page._view._selected_mask is None
+                and page._list.current() == -1
+                and not page._list.selected_indices(),
+                "块模式下选中集空掉，预览的描边也收掉",
+            )
+            page._set_pick_mode(_pp.PICK_COLOUR, save=False)
+            app.processEvents()
+
         # 1.6.13 #4: 「按当前色块重新匹配」 takes the colours on screen as settled — a
         # deleted colour stays deleted — and only chooses the rolls behind them again.
         keep_count = len(page.result.palette)

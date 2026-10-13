@@ -2466,6 +2466,107 @@ def main() -> int:
                 page._undo()
                 app.processEvents()
 
+            # 1.6.21 (m01191 item 2): 合并 writes the surviving block's OWN colour back into
+            # 原图, not the matched roll's colour.  The user's rule: 原图色块 c 并进原图色块 a
+            # 之后，c 的像素在原图里用的是 a 自己的颜色——原图的颜色集合一点都不变，
+            # 变的只是色块大小，所以「按当前色块重新匹配」拿到的还是原图自己那几种颜色。
+            if len(page._result.palette) >= 2:
+                merge_picked = page._list.row_ids()[:2]
+                page._list.select(merge_picked)
+                app.processEvents()
+                keeper = int(merge_picked[1])
+                merge_indices = _np.asarray(page._result.indices)
+                touched = _np.isin(
+                    merge_indices, _np.asarray(merge_picked, dtype=merge_indices.dtype)
+                )
+                colours_before_merge = {
+                    tuple(int(value) for value in pixel)
+                    for pixel in _np.unique(
+                        _np.asarray(page._image.convert("RGBA"))[..., :3].reshape(-1, 3),
+                        axis=0,
+                    )
+                }
+                keeper_colour = page._picture_colour(merge_indices == keeper)
+                before_merge_image = page._image.tobytes()
+                real_merge = _picture_page.MergeDialog
+                _picture_page.MergeDialog = lambda *args, **kwargs: _StubDialog(1)
+                try:
+                    page._on_merge_colours()
+                    app.processEvents()
+                finally:
+                    _picture_page.MergeDialog = real_merge
+                check(
+                    page._original_edited and page._image.tobytes() != before_merge_image,
+                    "merging colours edits 原图 too",
+                )
+                painted = _picture_page._to_image_grid(touched, page._image.size)
+                merge_pixels = _np.asarray(page._image.convert("RGBA"))
+                merged = merge_pixels[painted][merge_pixels[painted][:, 3] > 0][:, :3]
+                check(
+                    keeper_colour is not None
+                    and merged.size > 0
+                    and bool(
+                        (merged == _np.asarray(keeper_colour, dtype=merged.dtype)).all()
+                    ),
+                    "合并 writes the surviving block's own colour into 原图 "
+                    f"(expected {keeper_colour})",
+                )
+                colours_after_merge = {
+                    tuple(int(value) for value in pixel)
+                    for pixel in _np.unique(
+                        _np.asarray(page._image.convert("RGBA"))[..., :3].reshape(-1, 3),
+                        axis=0,
+                    )
+                }
+                check(
+                    colours_after_merge <= colours_before_merge,
+                    "合并 never adds a colour 原图 did not already have "
+                    f"({sorted(colours_after_merge - colours_before_merge)} are new)",
+                )
+                page._undo()
+                app.processEvents()
+                check(
+                    page._image.tobytes() == before_merge_image,
+                    "Ctrl+Z puts 原图 back after a merge",
+                )
+
+            # 1.6.21 (m01191 item 1): an empty selection means 预览 draws nothing.  Clicking
+            # the blank space under the rows (or unticking the last row in 多选) empties the
+            # list without going through any of the paths that used to clear the highlight,
+            # so the rule hangs off the selection itself now.
+            empty_ids = page._list.row_ids()
+            if empty_ids:
+                page._list.select([empty_ids[0]])
+                app.processEvents()
+                check(page._view._dim_pixmap() is not None, "a picked colour is drawn in 预览")
+                page._list._list.clearSelection()
+                page._list._list.setCurrentRow(-1)
+                app.processEvents()
+                check(
+                    page._view._selected == -1
+                    and page._view._dim_pixmap() is None
+                    and page._list.current() == -1
+                    and not page._delete_button.isEnabled(),
+                    "an empty selection takes the highlight off 预览 (点空白处那条路)",
+                )
+            page._set_pick_mode(_picture_page.PICK_EDGE, save=False)
+            app.processEvents()
+            if page._blocks is not None and page._blocks.count:
+                page._list.select([page._list.row_ids()[0]])
+                app.processEvents()
+                check(page._view._selected_mask is not None, "块模式下选中的那一块画了出来")
+                page._list._list.clearSelection()
+                page._list._list.setCurrentRow(-1)
+                app.processEvents()
+                check(
+                    page._view._selected_mask is None
+                    and page._list.current() == -1
+                    and not page._merge_button.isEnabled(),
+                    "an empty selection takes the block outline off 预览 too",
+                )
+                page._set_pick_mode(_picture_page.PICK_COLOUR, save=False)
+                app.processEvents()
+
             # --- the plans the cap allows (1.6.12: 「耗材方案」) -----------------
 
             # This picture is flat enough to print exactly with four rolls, and
