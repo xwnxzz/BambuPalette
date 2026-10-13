@@ -1918,6 +1918,61 @@ def run_selftest(*, report_path: Path | None = None) -> int:
             f"（不透明 {opaque:.1%}、打印 {printed:.1%}）",
         )
 
+        # 1.6.22 (m01647)：导出时的「圆滑色块」。默认勾上；勾上之后模型是在细一档的
+        # 栅格上重新分类的，斜着走的边界不再是台阶，但整块仍然是一块闭合实体——这是
+        # 轮廓平滑法做不到的那条（1.6.5 报过 14,650 条开口边）。
+        from .mesh.plate import edge_health as _edge_health
+        from .mesh.plate import plate_mesh as _plate_mesh
+
+        check(
+            page._smooth_box.text() == _pp.SMOOTH_LABEL,
+            f"底栏那个勾叫「{_pp.SMOOTH_LABEL}」（现在是 {page._smooth_box.text()!r}）",
+        )
+        check(page._smooth_box.isChecked(), "它默认是勾上的")
+        check(
+            page._plate_settings().smooth_edges,
+            "勾上的状态进了 PlateSettings",
+        )
+        smooth_plate = page.buildPlate()
+        smooth_size = smooth_plate.pixel_size_mm
+        smooth_tris = smooth_plate.triangle_count
+        smooth_points, smooth_faces, _smooth_parts = _plate_mesh(smooth_plate)
+        _smooth_open, _smooth_manifold = _edge_health(smooth_points, smooth_faces)
+        check(
+            _smooth_open == 0 and _smooth_manifold == 0,
+            f"圆滑之后的整块还是闭合实体（开口 {_smooth_open}、非流形 {_smooth_manifold}）",
+        )
+        check(
+            any("圆滑" in note for note in smooth_plate.notes),
+            f"状态里说明了这次是圆滑过的（{smooth_plate.notes}）",
+        )
+        page._smooth_box.setChecked(False)
+        app.processEvents()
+        check(not page._plate_settings().smooth_edges, "取消勾选之后 PlateSettings 里就是 False")
+        plain_plate = page.buildPlate()
+        check(
+            abs(plain_plate.pixel_size_mm - plain_plate.width_mm / page.result.width) < 1e-9,
+            f"不勾时网格就是图片自己那一格（{plain_plate.pixel_size_mm:.4f} mm）",
+        )
+        check(
+            smooth_size < plain_plate.pixel_size_mm,
+            f"勾上时网格更细（{smooth_size:.4f} mm vs {plain_plate.pixel_size_mm:.4f} mm）",
+        )
+        check(
+            abs(plain_plate.width_mm - smooth_plate.width_mm) < 1e-9
+            and abs(plain_plate.depth_mm - smooth_plate.depth_mm) < 1e-9
+            and abs(plain_plate.volume_mm3 - smooth_plate.volume_mm3)
+            / smooth_plate.volume_mm3 < 0.02,
+            f"圆滑不改板子的宽、深和体积（{smooth_plate.volume_mm3:.1f} → {plain_plate.volume_mm3:.1f} mm³）",
+        )
+        check(
+            plain_plate.triangle_count > 0 and smooth_tris > 0,
+            f"两条路的三角面数都是正的（圆滑 {smooth_tris}）",
+        )
+        page._smooth_box.setChecked(True)
+        app.processEvents()
+        plate = page.buildPlate()
+
         three_mf = write_3mf(
             plate,
             scratch / "selftest.3mf",

@@ -28,6 +28,7 @@ from app.core.image_matching import MatchSettings, build_palette, match_image  #
 from app.core.library import Filament, FilamentLibrary  # noqa: E402
 from app.core.mixes import MixCatalog  # noqa: E402
 from app.mesh.plate import (  # noqa: E402
+    SMOOTH_FACTOR,
     PlateSettings,
     _merge_stacked,
     build_plate,
@@ -35,7 +36,10 @@ from app.mesh.plate import (  # noqa: E402
     plate_mesh,
     prism_mesh,
     rectangles,
+    run_rectangles,
     signed_volume,
+    smooth_factor,
+    smooth_indices,
 )
 
 SPOOLS = (
@@ -128,6 +132,108 @@ class RectangleTests(unittest.TestCase):
         merged = _merge_stacked(rectangles(mask))
         self.assertEqual(len(merged), 20)
         self.assertTrue(np.array_equal(_paint(mask, merged) == 1, mask))
+
+
+class SmoothingTests(unittest.TestCase):
+    """「圆滑色块」(m01647, 1.6.22): 边界不再锁在匹配栅格的格线上。
+
+    做法是「把匹配栅格细分之后重新分类」，不是抽轮廓再平滑多边形：轮廓法下两个
+    色块共享的那条边界、以及它和第三个色块交汇的拐点，各自平滑出来的顶点不会逐位
+    相同，焊接不到同一个整数格，整块就不再是闭合实体（1.6.5 报的 14,650 条开口边
+    就是这个形状）。标签栅格天生闭合：每个细像元只属于一种颜色。
+    """
+
+    def setUp(self):
+        self.library = _library()
+        self.catalog = MixCatalog(self.library.filaments, engine=ENGINE_BAMBU).build()
+        self.palette = build_palette(self.library, self.catalog)
+        self.result = match_image(_quadrant_image(20), self.palette, MatchSettings(max_colours=8))
+
+    def test_run_rectangles_tiles_the_mask_exactly(self):
+        rng = np.random.default_rng(20260802)
+        for shape in ((9, 9), (17, 31), (40, 23)):
+            with self.subTest(shape=shape):
+                mask = rng.random(shape) > 0.45
+                canvas = _paint(mask, run_rectangles(mask))
+                self.assertTrue(np.array_equal(canvas == 1, mask))
+                self.assertTrue(np.array_equal(canvas > 1, np.zeros(shape, dtype=bool)))
+
+    def test_run_rectangles_matches_the_slow_one_on_an_easy_mask(self):
+        mask = np.zeros((7, 9), dtype=bool)
+        mask[1:6, 2:8] = True
+        self.assertEqual(run_rectangles(mask), [(2, 1, 6, 5)])
+        self.assertEqual(run_rectangles(np.zeros((4, 4), dtype=bool)), [])
+
+    def test_run_rectangles_refuses_a_one_dimensional_mask(self):
+        with self.assertRaises(ValueError):
+            run_rectangles(np.zeros(4, dtype=bool))
+
+    def test_the_factor_respects_both_cell_budgets(self):
+        # 一个颜色：4 倍细分 (512² → 2048²) 在 4.5M 像元上限以内。
+        self.assertEqual(smooth_factor(512, 512, 1), SMOOTH_FACTOR)
+        # 32 种颜色：给每种颜色一趟取样，预算 48M/32 = 1.5M 像元 → 只能退到 2 倍。
+        self.assertEqual(smooth_factor(512, 512, 32), 2)
+        # 4000² = 16M 像元，连 2 倍都不该放（下限 SMOOTH_ALWAYS_CELLS 也拦不住）。
+        self.assertEqual(smooth_factor(4000, 4000, 1), 1)
+
+    def test_smooth_indices_keeps_the_shape_and_the_labels(self):
+        indices = np.array([[0, 0, 1], [0, 2, 2]], dtype=np.int32)
+        fine = smooth_indices(indices, factor=3)
+        self.assertEqual(fine.shape, (6, 9))
+        self.assertEqual(set(np.unique(fine).tolist()), set(np.unique(indices).tolist()))
+
+    def test_smooth_indices_maps_transparency_back_to_minus_one(self):
+        indices = np.array([[0, -1], [-1, 1]], dtype=np.int32)
+        fine = smooth_indices(indices, factor=2)
+        self.assertEqual(set(np.unique(fine).tolist()) - {-1, 0, 1}, set())
+
+    def test_smooth_indices_keeps_a_one_pixel_wide_line(self):
+        indices = np.zeros((16, 16), dtype=np.int32)
+        indices[:, 8] = 1
+        fine = smooth_indices(indices, factor=SMOOTH_FACTOR)
+        self.assertTrue(bool((fine == 0).any()))
+        self.assertTrue(bool((fine == 1).any()), "一条一像素宽的线被磨没了")
+
+    def test_a_curved_border_leaves_the_match_grid(self):
+        yy, xx = np.mgrid[0:24, 0:24]
+        inside = (xx - 11.5) ** 2 + (yy - 11.5) ** 2 <= 9.0**2
+        indices = np.where(inside, 1, 0).astype(np.int32)
+        fine = smooth_indices(indices, factor=SMOOTH_FACTOR)
+        starts = [int(np.flatnonzero(row == 1)[0]) for row in fine if bool((row == 1).any())]
+        self.assertTrue(starts)
+        # 最近邻放大只会让每个起点落在 SMOOTH_FACTOR 的整数倍上；双线性取样之后
+        # 边界落在细格之间，起点取遍不同的余数。
+        self.assertGreater(
+            len({value % SMOOTH_FACTOR for value in starts}), 1, "边界还整格贴在粗格线上"
+        )
+
+    def test_a_smooth_plate_is_still_one_closed_solid(self):
+        plate = build_plate(self.result, PlateSettings(target_width_mm=100.0))
+        points, faces, _ = plate_mesh(plate)
+        boundary, non_manifold = edge_health(points, faces)
+        self.assertEqual(boundary, 0, "圆滑之后组装起来还是要闭合")
+        self.assertEqual(non_manifold, 0)
+        self.assertTrue(any("圆滑" in note for note in plate.notes), plate.notes)
+
+    def test_smoothing_keeps_the_width_and_the_area(self):
+        coarse = build_plate(
+            self.result, PlateSettings(target_width_mm=100.0, smooth_edges=False)
+        )
+        smooth = build_plate(self.result, PlateSettings(target_width_mm=100.0))
+        self.assertAlmostEqual(smooth.width_mm, 100.0, places=9)
+        self.assertAlmostEqual(smooth.depth_mm, coarse.depth_mm, places=9)
+        self.assertAlmostEqual(
+            sum(part.region_pixels for part in smooth.parts[1:]) * smooth.pixel_size_mm**2,
+            sum(part.region_pixels for part in coarse.parts[1:]) * coarse.pixel_size_mm**2,
+            places=6,
+        )
+
+    def test_turning_smoothing_off_reproduces_1_6_21(self):
+        plate = build_plate(
+            self.result, PlateSettings(target_width_mm=100.0, smooth_edges=False)
+        )
+        self.assertAlmostEqual(plate.pixel_size_mm, 100.0 / self.result.width, places=9)
+        self.assertFalse(any("圆滑" in note for note in plate.notes), plate.notes)
 
 
 class PrismTests(unittest.TestCase):
@@ -256,14 +362,15 @@ class PlateTests(unittest.TestCase):
         self.assertGreater(signed_volume(points, faces), 0.0)
 
     def test_the_assembled_volume_is_the_printed_volume(self):
-        """Volume = printed pixels x cell area x total thickness, exactly."""
+        """Volume = printed cells x cell area x total thickness, exactly.
+
+        1.6.22 起默认「圆滑色块」，网格比图片像素细一档，``plate.pixel_size_mm``
+        报的是模型自己那一格；所以这里按**面积**对账，也就是「印出来的面积 × 总厚度」。
+        """
         plate = build_plate(self.result, PlateSettings(target_width_mm=100.0))
         points, faces, _ = plate_mesh(plate)
-        expected = (
-            int(np.count_nonzero(self.result.indices >= 0))
-            * plate.pixel_size_mm**2
-            * plate.total_thickness_mm
-        )
+        printed = sum(part.region_pixels for part in plate.parts[1:])
+        expected = printed * plate.pixel_size_mm**2 * plate.total_thickness_mm
         self.assertAlmostEqual(signed_volume(points, faces), expected, places=6)
 
     def test_no_face_is_a_sliver(self):
@@ -307,16 +414,25 @@ class PlateTests(unittest.TestCase):
             )
 
     def test_region_pixels_cover_the_printed_pixels(self):
+        """每个色块的 ``region_pixels`` 加起来正好是印出来的面积。
+
+        网格在 1.6.22 起可能比图片像素细（「圆滑色块」），格子的数不再是
+        ``result.counts``，所以这里按面积对：色块面积之和 = 图里实心像素的面积。
+        """
         plate = build_plate(self.result, PlateSettings())
+        cell = plate.pixel_size_mm
+        picture_pixel = plate.width_mm / self.result.width
         # parts[0] is the base plate covering the whole silhouette; the colour
         # prisms on top of it must tile exactly the printed pixels.
-        self.assertEqual(
-            sum(part.region_pixels for part in plate.parts[1:]),
-            int(self.result.counts.sum()),
+        self.assertAlmostEqual(
+            sum(part.region_pixels for part in plate.parts[1:]) * cell * cell,
+            int(self.result.counts.sum()) * picture_pixel * picture_pixel,
+            places=6,
         )
-        self.assertEqual(
-            plate.parts[0].region_pixels,
-            int(np.count_nonzero(self.result.indices >= 0)),
+        self.assertAlmostEqual(
+            plate.parts[0].region_pixels * cell * cell,
+            int(np.count_nonzero(self.result.indices >= 0)) * picture_pixel * picture_pixel,
+            places=6,
         )
 
     def test_stats_describe_the_plate(self):

@@ -24,18 +24,22 @@ whole solid, because a per-part repair cannot see the edge its neighbour owns.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import math
+from dataclasses import dataclass, field, replace
 from typing import Sequence
 
 import numpy as np
 
-from ..core.image_matching import MatchResult, PaletteEntry
+from ..core.image_matching import MatchResult, PaletteEntry, ProgressFn
 
 __all__ = [
     "PlatePart",
     "PlateModel",
     "PlateSettings",
     "rectangles",
+    "run_rectangles",
+    "smooth_factor",
+    "smooth_indices",
     "prism_mesh",
     "stitch_t_junctions",
     "merge_parts",
@@ -70,6 +74,12 @@ class PlateSettings:
     max_footprint_mm: float = 250.0
     #: Cells finer than this are below what an 0.4 mm nozzle resolves.
     min_pixel_mm: float = 0.35
+    #: 导出时把色块边界圆滑 (1.6.22)。 匹配栅格上的色块边界是「一格一格的台阶」，
+    #: 150 mm 宽、512 像素的图上约 0.29 mm 一级，在 Bambu Studio 里放大看就是锯齿。
+    #: 打开之后先在匹配栅格上把每种颜色糊一遍，再细分若干倍重新分类，边界落在细
+    #: 栅格的像元之间（默认细到图片像素的四分之一，约 0.07 mm），比喷嘴细，打出来
+    #: 是圆的。 界面上的勾默认打开。
+    smooth_edges: bool = True
 
     def clamped(self) -> "PlateSettings":
         return PlateSettings(
@@ -79,7 +89,26 @@ class PlateSettings:
             base_index=int(self.base_index),
             max_footprint_mm=max(20.0, min(1000.0, float(self.max_footprint_mm))),
             min_pixel_mm=max(0.05, min(2.0, float(self.min_pixel_mm))),
+            smooth_edges=bool(self.smooth_edges),
         )
+
+
+#: 圆滑色块时把匹配栅格放大几倍，最多这么多。 4 倍把 0.29 mm 的台阶变成 0.07 mm，
+#: 比 0.4 mm 的喷嘴细一档；再细只是把导出时间拉长，打印上区分不出来。
+SMOOTH_FACTOR = 4
+#: 细栅格的像元上限。 一张 512×512 的图放大 4 倍是 419 万个像元，正是这一步的开销
+#: 所在（每种颜色都要在细栅格上做一次双线性取样），比这更大就少放几倍。
+SMOOTH_MAX_CELLS = 4_500_000
+#: 「细格像元 × 颜色数」的预算：颜色越多，每种颜色那一趟也越贵。 32 色的图在 512²
+#: 下退到 2 倍（0.15 mm 一格，还是比喷嘴细），导出不至于从 3 秒涨到 9 秒。
+SMOOTH_SLOT_BUDGET = 48_000_000
+#: 但至少放 2 倍：这是「圆滑」和「不圆滑」的分界，除非图本身已经大得放不动了。
+SMOOTH_ALWAYS_CELLS = 16_000_000
+#: 放大前的高斯 σ，单位是匹配栅格的像元。 它决定边界的「圆」到什么程度，也决定多细
+#: 的东西会被磨掉，所以是量出来的：一块 64×64 的色块里放一条 1 像元宽的线，细分 4 倍
+#: 后 σ=0.4/0.5 留下 99%，σ=0.6 只剩 49%，σ=0.8 直接没了（2 像元宽以上各档都还在）。
+#: 所以取 0.5：比一个像元细的胡须、描边照样印得出来，台阶的直角仍旧被磨圆。
+SMOOTH_SIGMA = 0.5
 
 
 @dataclass
@@ -221,6 +250,51 @@ def rectangles(mask: np.ndarray) -> list[tuple[int, int, int, int]]:
     return out
 
 
+def run_rectangles(mask: np.ndarray) -> list[tuple[int, int, int, int]]:
+    """Tile a mask with rectangles found from vectorised row runs.
+
+    Same contract as :func:`rectangles` — the rectangles cover the mask exactly
+    once, no overlap and no gaps — but the runs of every row come out of one
+    numpy pass and are then pulled down while the same span keeps repeating.  The
+    greedy walk costs a Python step per *cell*, which is fine on the match grid
+    and far too slow on the refined grid of :func:`smooth_indices` (a 512×512
+    picture refined 4× has four million cells).
+    """
+    occupied = np.asarray(mask, dtype=bool)
+    if occupied.ndim != 2:
+        raise ValueError("mask must be two-dimensional")
+    height, width = occupied.shape
+    if height == 0 or width == 0 or not occupied.any():
+        return []
+
+    # Pad with a false border: then every run of the row is a false→true
+    # transition followed by a true→false one, in row-major order.
+    padded = np.zeros((height, width + 2), dtype=bool)
+    padded[:, 1:-1] = occupied
+    changes = np.flatnonzero(padded[:, 1:] != padded[:, :-1])
+    rows, columns = np.divmod(changes, width + 1)
+    starts = columns[0::2]
+    stops = columns[1::2]
+    row_of = rows[0::2]
+
+    out: list[tuple[int, int, int, int]] = []
+    running: dict[tuple[int, int], tuple[int, int]] = {}
+    for y, a, b in zip(row_of.tolist(), starts.tolist(), stops.tolist()):
+        span = (a, b)
+        previous = running.get(span)
+        if previous is not None and previous[1] == y - 1:
+            running[span] = (previous[0], y)
+            continue
+        if previous is not None:
+            out.append((span[0], previous[0], span[1] - span[0], previous[1] - previous[0] + 1))
+            del running[span]
+        running[span] = (y, y)
+    for span, (y_start, y_stop) in running.items():
+        out.append((span[0], y_start, span[1] - span[0], y_stop - y_start + 1))
+    out.sort(key=lambda item: (item[1], item[0]))
+    return out
+
+
 def _merge_stacked(rects: list[tuple[int, int, int, int]]) -> list[tuple[int, int, int, int]]:
     """Fuse rectangles that share an x-range and touch vertically.
 
@@ -244,6 +318,149 @@ def _merge_stacked(rects: list[tuple[int, int, int, int]]) -> list[tuple[int, in
         merged.append((x, y_start, w, y_stop - y_start))
     merged.sort(key=lambda item: (item[1], item[0]))
     return merged
+
+
+# ---------------------------------------------------------------------------
+# Round edges (1.6.22)
+# ---------------------------------------------------------------------------
+def smooth_factor(height: int, width: int, colours: int = 1) -> int:
+    """How many times to refine the match grid before re-classifying it.
+
+    :data:`SMOOTH_FACTOR` unless the refined grid would pass one of two budgets:
+    the absolute size cap :data:`SMOOTH_MAX_CELLS`, or the per-picture
+    :data:`SMOOTH_SLOT_BUDGET` shared out over the colours (the field sampling
+    costs one pass per colour).  Even then it keeps at least two steps, which is
+    what makes the difference between a staircase and a border, unless the match
+    grid itself is already past :data:`SMOOTH_ALWAYS_CELLS`.
+    """
+    cells = max(1, int(height)) * max(1, int(width))
+    allowed = min(SMOOTH_MAX_CELLS, SMOOTH_SLOT_BUDGET // max(1, int(colours)))
+    allowed = max(allowed, min(cells * 2 * 2, SMOOTH_ALWAYS_CELLS))
+    steps = SMOOTH_FACTOR
+    while steps > 1 and cells * steps * steps > allowed:
+        steps -= 1
+    return max(1, steps)
+
+
+def _gaussian_kernel(sigma: float) -> np.ndarray:
+    """Normalised 1-D Gaussian, cut at three standard deviations."""
+    radius = max(1, int(math.ceil(3.0 * float(sigma))))
+    offsets = np.arange(-radius, radius + 1, dtype=np.float64)
+    weights = np.exp(-(offsets * offsets) / (2.0 * float(sigma) ** 2))
+    return weights / weights.sum()
+
+
+def _blur_separable(field: np.ndarray, kernel: np.ndarray) -> np.ndarray:
+    """Blur a 2-D float field, repeating the outermost row and column."""
+    radius = len(kernel) // 2
+    height, width = field.shape
+    spread = np.pad(field, ((radius, radius), (0, 0)), mode="edge")
+    rows = np.zeros_like(field)
+    for index, weight in enumerate(kernel):
+        rows += weight * spread[index : index + height]
+    spread = np.pad(rows, ((0, 0), (radius, radius)), mode="edge")
+    out = np.zeros_like(field)
+    for index, weight in enumerate(kernel):
+        out += weight * spread[:, index : index + width]
+    return out
+
+
+def _sample_axis(
+    centres: np.ndarray, size: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Lower/upper index and blend weight for sampling a coarse axis."""
+    clamped = np.clip(centres, 0.0, float(size - 1))
+    lower = np.floor(clamped).astype(np.intp)
+    upper = np.minimum(lower + 1, size - 1)
+    return lower, upper, (clamped - lower).astype(np.float32)
+
+
+def smooth_indices(
+    indices: np.ndarray,
+    *,
+    factor: int | None = None,
+    sigma: float = SMOOTH_SIGMA,
+    progress: ProgressFn | None = None,
+) -> np.ndarray:
+    """Re-classify a match grid on a finer lattice so block borders come out round.
+
+    Every block border is a curve sampled on the match grid, so a border that
+    runs at an angle is a one-cell staircase — 0.293 mm of step on a 512-pixel
+    picture printed 150 mm wide, which is a plainly visible saw in the slicer.
+
+    Smoothing the *polygons* of the two blocks that share such a border cannot
+    work: the slab has to stay one closed solid, and two independently smoothed
+    outlines meet at vertices that land on different lattice cells, which opens
+    the seam (that is what produced the 14,650 open edges of 1.6.5).  Refining
+    the label raster instead cannot open anything, because every refined cell
+    belongs to exactly one colour:
+
+    * each colour becomes an indicator field on the match grid, blurred with a
+      small Gaussian (``mode="edge"``, so the border of the picture repeats);
+    * each field is sampled bilinearly at the centres of the refined lattice
+      (``(index + 0.5) / factor - 0.5`` in match-grid coordinates);
+    * every refined cell takes the colour with the strongest field.
+
+    The border therefore crosses *between* refined cells instead of along the
+    match grid's cell lines, and the step size drops to one refined cell
+    (a quarter of a match pixel, ≈0.07 mm on a 150 mm plate), which is finer
+    than the nozzle.  Transparent picture
+    pixels are one more "colour" (slot 0) and stay ``-1``.
+    """
+    labels = np.asarray(indices)
+    if labels.ndim != 2:
+        raise ValueError("indices must be two-dimensional")
+    height, width = (int(size) for size in labels.shape)
+    steps = max(1, int(factor)) if factor else smooth_factor(height, width)
+    if steps <= 1 or height == 0 or width == 0:
+        return labels.astype(np.int32, copy=True)
+
+    # Slot 0 is the transparent/背景 area, palette colour ``i`` is slot ``i + 1``.
+    slots = np.where(labels < 0, 0, labels + 1).astype(np.int32)
+    kernel = _gaussian_kernel(sigma)
+    fine_height, fine_width = height * steps, width * steps
+    rows_low, rows_high, row_weight = _sample_axis(
+        (np.arange(fine_height, dtype=np.float32) + 0.5) / steps - 0.5, height
+    )
+    cols_low, cols_high, col_weight = _sample_axis(
+        (np.arange(fine_width, dtype=np.float32) + 0.5) / steps - 0.5, width
+    )
+    row_weight = row_weight[:, None]
+
+    # Every field is non-negative and they sum to one everywhere, so -1 is
+    # strictly below all of them and the first slot of a tie keeps the cell.
+    best = np.full((fine_height, fine_width), -1.0, dtype=np.float32)
+    chosen = np.zeros((fine_height, fine_width), dtype=np.int32)
+    present = np.unique(slots)
+    for position, slot in enumerate(present):
+        if progress is not None:
+            progress(
+                f"圆滑色块边界 {position + 1}/{len(present)}",
+                (position + 1) / len(present),
+            )
+        field = _blur_separable((slots == slot).astype(np.float32), kernel)
+        rows_a = np.take(field, rows_low, axis=0)
+        rows_b = np.take(field, rows_high, axis=0)
+        chosen_slot = np.take(rows_a, cols_low, axis=1)
+        blended = np.take(rows_a, cols_high, axis=1)
+        np.multiply(chosen_slot, 1.0 - col_weight, out=chosen_slot)
+        np.multiply(blended, col_weight, out=blended)
+        chosen_slot += blended
+        np.multiply(chosen_slot, 1.0 - row_weight, out=chosen_slot)
+        blended = np.take(rows_b, cols_low, axis=1)
+        tail = np.take(rows_b, cols_high, axis=1)
+        np.multiply(blended, 1.0 - col_weight, out=blended)
+        np.multiply(tail, col_weight, out=tail)
+        blended += tail
+        np.multiply(blended, row_weight, out=blended)
+        chosen_slot += blended
+        better = chosen_slot > best
+        if not better.any():
+            continue
+        best[better] = chosen_slot[better]
+        chosen[better] = int(slot)
+
+    return np.where(chosen == 0, np.int32(-1), chosen - 1).astype(np.int32)
 
 
 # ---------------------------------------------------------------------------
@@ -718,6 +935,7 @@ def build_plate(
     settings: PlateSettings | None = None,
     *,
     base_label: str = "底板",
+    progress: ProgressFn | None = None,
 ) -> PlateModel:
     """Build the picture as ONE watertight slab, then cut it into per-filament parts.
 
@@ -738,19 +956,49 @@ def build_plate(
         raise ValueError("没有一个可打印的颜色，无法生成模型。")
 
     notes: list[str] = []
-    pixel = config.target_width_mm / max(1, result.width)
-    if pixel * result.height > config.max_footprint_mm:
-        pixel = config.max_footprint_mm / max(1, result.height)
+    picture_width = max(1, int(result.width))
+    picture_height = max(1, int(result.height))
+    pixel = config.target_width_mm / picture_width
+    if pixel * picture_height > config.max_footprint_mm:
+        pixel = config.max_footprint_mm / picture_height
         notes.append(
             f"按目标宽度会超出 {config.max_footprint_mm:.0f} mm 的打印范围，已自动缩小"
         )
     if pixel < config.min_pixel_mm:
+        # 用图片自己的像素算：细分之后的网格一定更细，拿细格算会天天误报。
         notes.append(
             f"每个像素只有 {pixel:.3f} mm，比 0.4 mm 喷嘴还细；相邻颜色在打印时会互相覆盖"
         )
 
-    width_mm = result.width * pixel
-    depth_mm = result.height * pixel
+    # --- 导出时圆滑色块 (1.6.22) ---------------------------------------------
+    # 色块边界原本落在匹配栅格的格线上（150 mm 宽、512 像素的图约 0.293 mm 一格），斜着走的地方
+    # 就是台阶。打开这个开关就把栅格放大 steps 倍重新分类：边界落在细格之间，比喷嘴还细。
+    steps = 1
+    if config.smooth_edges:
+        steps = smooth_factor(picture_height, picture_width, len(result.palette))
+        if steps > 1:
+            indices = smooth_indices(result.indices, factor=steps, progress=progress)
+            counts = np.array(
+                [
+                    int(np.count_nonzero(indices == index))
+                    for index in range(len(result.palette))
+                ],
+                dtype=np.asarray(result.counts).dtype,
+            )
+            result = replace(
+                result,
+                width=int(indices.shape[1]),
+                height=int(indices.shape[0]),
+                indices=indices,
+                counts=counts,
+            )
+            notes.append(
+                f"色块边界已圆滑：在 {steps} 倍细分栅格上重新分类，网格 {pixel / steps:.3f} mm"
+            )
+
+    cell = pixel / steps
+    width_mm = result.width * cell
+    depth_mm = result.height * cell
 
     base_index = config.base_index
     if base_index < 0 or base_index >= len(result.palette):
@@ -772,8 +1020,21 @@ def build_plate(
         polygons.append(polygon)
         tags.append(tag)
 
+    def tiles(mask: np.ndarray) -> list[tuple[int, int, int, int]]:
+        """Cover a mask with rectangles.
+
+        The refined grid of :func:`smooth_indices` has 16× the cells of the
+        match grid, and :func:`rectangles` walks them one by one in Python;
+        :func:`run_rectangles` finds the same runs with numpy.  The coarse path
+        keeps the greedy tiling, so an export without the smoothing switch is
+        byte-for-byte what it always was.
+        """
+        if steps > 1:
+            return run_rectangles(mask)
+        return _merge_stacked(rectangles(mask))
+
     # --- the base colour: the underside of the slab --------------------------
-    for x, y, w, h in _merge_stacked(rectangles(silhouette)):
+    for x, y, w, h in tiles(silhouette):
         x0, x1 = float(x), float(x + w)
         y0, y1 = float(y), float(y + h)
         add([(x0, y1, 0.0), (x1, y1, 0.0), (x1, y0, 0.0), (x0, y0, 0.0)], BASE_TAG)
@@ -783,7 +1044,7 @@ def build_plate(
         mask = result.indices == index
         if not mask.any():
             continue
-        for x, y, w, h in _merge_stacked(rectangles(mask)):
+        for x, y, w, h in tiles(mask):
             x0, x1 = float(x), float(x + w)
             y0, y1 = float(y), float(y + h)
             add(
@@ -889,9 +1150,9 @@ def build_plate(
 
     points, faces, face_tags = _assemble(polygons, tags)
 
-    points[:, 0] *= pixel
-    points[:, 1] *= pixel
-    points[:, 1] = height * pixel - points[:, 1]
+    points[:, 0] *= cell
+    points[:, 1] *= cell
+    points[:, 1] = height * cell - points[:, 1]
     faces = faces[:, ::-1]
 
     # --- cut the one solid into per-filament parts ---------------------------
@@ -940,7 +1201,7 @@ def build_plate(
         parts=parts,
         width_mm=width_mm,
         depth_mm=depth_mm,
-        pixel_size_mm=pixel,
+        pixel_size_mm=cell,
         base_thickness_mm=config.base_thickness_mm,
         colour_thickness_mm=config.colour_thickness_mm,
         notes=notes,

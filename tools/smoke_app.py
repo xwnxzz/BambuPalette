@@ -1653,7 +1653,11 @@ def main() -> int:
                 f"one extruder per colour, got {plate.extruder_count}",
             )
             check(
-                plate.parts[0].region_pixels == result.printed_pixels,
+                abs(
+                    plate.parts[0].region_pixels * plate.pixel_size_mm**2
+                    - result.printed_pixels * (plate.width_mm / result.width) ** 2
+                )
+                < 1e-6,
                 "the base plate covers the whole silhouette",
             )
             check(plate.parts[0].z_bottom_mm == 0.0, "the base plate starts on the bed")
@@ -1661,6 +1665,42 @@ def main() -> int:
                 all(part.z_bottom_mm == plate.base_thickness_mm for part in plate.parts[1:]),
                 "every colour prism sits on top of the base plate",
             )
+
+            # --- 1.6.22 (m01647): 「圆滑色块」 --------------------------------
+            from app.mesh.plate import edge_health, plate_mesh
+
+            check(
+                page._smooth_box.text() == _picture_page.SMOOTH_LABEL,
+                f"the export row carries the {_picture_page.SMOOTH_LABEL} box",
+            )
+            check(page._smooth_box.isChecked(), "it is on by default")
+            check(page._plate_settings().smooth_edges, "… and it reaches PlateSettings")
+            check(
+                any("圆滑" in note for note in plate.notes),
+                f"the build says the borders were smoothed, got {plate.notes}",
+            )
+            smooth_points, smooth_faces, _smooth_parts = plate_mesh(plate)
+            check(
+                edge_health(smooth_points, smooth_faces) == (0, 0),
+                "a smoothed plate is still one closed solid",
+            )
+            page._smooth_box.setChecked(False)
+            app.processEvents()
+            check(not page._plate_settings().smooth_edges, "unchecking turns it off")
+            plain = page.buildPlate()
+            check(
+                plain.pixel_size_mm > plate.pixel_size_mm
+                and abs(plain.pixel_size_mm - plain.width_mm / result.width) < 1e-9,
+                "without the box the mesh goes back to the picture's own pixel",
+            )
+            check(
+                abs(plain.width_mm - plate.width_mm) < 1e-9
+                and abs(plain.volume_mm3 - plate.volume_mm3) / plate.volume_mm3 < 0.02,
+                "smoothing changes neither the width nor the volume",
+            )
+            page._smooth_box.setChecked(True)
+            app.processEvents()
+            plate = page.buildPlate()
 
             # --- 选中的颜色: both RGBs, the recipe, and manual replacement -------
             from app.core.image_matching import MatchSettings, sort_palette
@@ -1987,6 +2027,10 @@ def main() -> int:
                 and (page._result.indices < 0).sum() > 0,
                 "the deleted region is transparent in the index map",
             )
+            check(page._undo_button.isEnabled(), "删除 can be undone")
+            check("删除" in page._status.text(), f"the status reports 删除: {page._status.text()}")
+            # Building the plate moves the status bar onto its own progress line
+            # (「正在生成模型：…」, 1.6.22), so ask about 删除 before that happens.
             check(
                 len(page.buildPlate().parts) == base_before - 1,
                 "the plate loses the deleted colour's prism",
@@ -1995,8 +2039,6 @@ def main() -> int:
                 page._plate.triangle_count > 0,
                 "the plate still builds with a hole in it",
             )
-            check(page._undo_button.isEnabled(), "删除 can be undone")
-            check("删除" in page._status.text(), f"the status reports 删除: {page._status.text()}")
 
             page._undo()
             app.processEvents()
@@ -2903,6 +2945,20 @@ def main() -> int:
             check(page._project_path == project, "the page remembers where it saved")
             check(page._dirty is False, "saving clears the unsaved flag")
             check("已保存工程" in page._status.text(), f"saving says so: {page._status.text()!r}")
+
+            # 1.6.22 (m01647): the 圆滑色块 tick travels with the project.
+            page._smooth_box.setChecked(False)
+            page._on_save_project()
+            app.processEvents()
+            page._smooth_box.setChecked(True)
+            _StubMessageBox.answer = "不保存"
+            page._on_open_project()
+            app.processEvents()
+            check(
+                page._smooth_box.isChecked() is False,
+                "opening the project puts the 圆滑色块 tick back where it was saved",
+            )
+            page._smooth_box.setChecked(True)
 
             saved_colours = len(page._result.palette)
             saved_printed = page._result.printed_pixels

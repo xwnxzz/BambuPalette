@@ -149,6 +149,15 @@ USAGE_HINT_TEXT = "匹配完成后，这里列出这一版用到了哪几卷耗�
 LIST_TITLE_COLOUR = "打印图片需要的颜色"
 LIST_TITLE_BLOCK = "图片上色块的颜色"
 
+#: 导出时圆滑色块的开关（m01647）。默认勾上，就在两个「生成」按钮左边。
+SMOOTH_LABEL = "圆滑色块"
+SMOOTH_TIP = (
+    "勾上之后，导出的 3MF/OBJ 会在细一档的栅格上重新分类色块，斜着走的边界不再是"
+    "一格一格的台阶（默认细到图片像素的四分之一：150 mm 宽、512 像素的图约 0.07 mm 一格，"
+    "颜色多时退到二分之一，都比喷嘴细），打出来是圆的。\n"
+    "只影响导出，预览和「原图」不变；不勾就按 1.6.21 的样子导出。"
+)
+
 PAGE_HELP = (
     "图像转换这一步：\n"
     f"· {ZOOM_HINT}\n"
@@ -190,7 +199,13 @@ PAGE_HELP = (
     "（1.6.21 起）。\n"
     "· 「打开工程」之后，「耗材方案」除了文件里存着的那一套，还会把同一批色块的其它卷组搭配"
     "列在下面（1.6.20 起）：文件里只记得住挑中的那一套，别的搭法本来要按「按当前色块重新匹配」"
-    "才看得到。当前这一套仍然是文件里那一套，勾还在它上面。"
+    "才看得到。当前这一套仍然是文件里那一套，勾还在它上面。\n"
+    "· 「圆滑色块」默认勾上（1.6.22 起）：模型里的色块边界本来落在匹配像素的格线上，斜着走的"
+    "地方就是一格一格的台阶（150 mm 宽、512 像素的图约 0.29 mm 一级），在 Bambu Studio 里放大看"
+    "是锯齿。勾上之后导出时会在细一档的栅格上重新分类，边界落在格子之间（默认细到图片像素的"
+    "四分之一，约 0.07 mm，颜色多时退到二分之一，都比喷嘴细），打出来"
+    "是圆的；同一个开关也写进 .bpproj，所以存过的工程下次打开还是上次那个样子。这个开关只影响"
+    "导出的 3MF/OBJ——预览和「原图」画的还是匹配栅格，不勾就照 1.6.21 的样子导出。"
 )
 
 
@@ -1431,6 +1446,12 @@ class PicturePage(QWidget):
 
         self._base_combo = QComboBox()
 
+        # 导出时圆滑色块 (1.6.22): 匹配栅格上的色块边界是一格一格的台阶，在 Bambu
+        # Studio 里放大看就是锯齿。 默认勾上；不勾就照 1.6.21 的样子导出。
+        self._smooth_box = QCheckBox(SMOOTH_LABEL)
+        self._smooth_box.setChecked(True)
+        self._smooth_box.setToolTip(SMOOTH_TIP)
+
         self._export_3mf = QPushButton("生成 3MF（Bambu Studio）")
         self._export_3mf.setProperty("accent", "true")
         self._export_3mf.clicked.connect(lambda: self._on_export("3mf"))
@@ -1449,6 +1470,7 @@ class PicturePage(QWidget):
         bottom.addWidget(QLabel("底板颜色:"))
         bottom.addWidget(self._base_combo)
         bottom.addStretch(1)
+        bottom.addWidget(self._smooth_box)
         bottom.addWidget(self._export_obj)
         bottom.addWidget(self._export_3mf)
 
@@ -1737,6 +1759,7 @@ class PicturePage(QWidget):
             self._base_spin,
             self._colour_spin,
             self._base_combo,
+            self._smooth_box,
             self._export_3mf,
             self._export_obj,
         ):
@@ -1964,6 +1987,7 @@ class PicturePage(QWidget):
         self._width_spin.setValue(float(state.plate.target_width_mm))
         self._base_spin.setValue(float(state.plate.base_thickness_mm))
         self._colour_spin.setValue(float(state.plate.colour_thickness_mm))
+        self._smooth_box.setChecked(bool(state.plate.smooth_edges))
         # The 方案 list belongs to a match, and 「打开工程」 deliberately does not run
         # one: the colour table in the file is what the user saved, edits and all,
         # and re-matching could answer something slightly different.  So the panel
@@ -3604,31 +3628,51 @@ class PicturePage(QWidget):
             base_thickness_mm=float(self._base_spin.value()),
             colour_thickness_mm=float(self._colour_spin.value()),
             base_index=int(base_index) if base_index is not None else -1,
+            smooth_edges=bool(self._smooth_box.isChecked()),
         ).clamped()
 
     def buildPlate(self) -> PlateModel:
         if self._result is None:
             raise ValueError("请先导入并匹配一张图片")
         self._plate = build_plate(
-            self._result, self._plate_settings(), base_label="底板"
+            self._result,
+            self._plate_settings(),
+            base_label="底板",
+            progress=self._report_export,
         )
         return self._plate
 
+    def _report_export(self, message: str, fraction: float) -> None:
+        """One step of :func:`build_plate`, drawn while the export is running.
+
+        圆滑色块要在细栅格上给每种颜色各做一趟取样，32 色的图能跑到好几秒；没有这根
+        进度条用户看到的就是一个不动的窗口。 和匹配时一样用 ``ExcludeUserInputEvents``，
+        免得在导出中间再点一次「生成」。
+        """
+        self._progress.setValue(int(max(0.0, min(1.0, fraction)) * PROGRESS_STEPS))
+        self._status.setText(f"正在生成模型：{message}…")
+        QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+
     def _on_export(self, kind: str) -> None:
-        # Building the plate for a 512×512 picture with 12 colours takes ~2 s and
-        # writing the 3MF another ~0.4 s.  Without a wait cursor and a line of
-        # text the window simply stops answering, which is the whole 「未响应」
-        # complaint; the cursor is popped again on every exit path.
+        # Building the plate for a 512×512 picture takes ~2 s, and with 「圆滑色块」
+        # on (the default) the refinement adds a pass per colour on the fine grid.
+        # Without a wait cursor, the progress bar and a line of text the window
+        # simply stops answering, which is the whole 「未响应」 complaint; the
+        # cursor is popped again on every exit path.
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         self._status.setText("正在生成模型…")
+        self._progress.setValue(0)
+        self._progress.setVisible(True)
         QApplication.processEvents()
         try:
             plate = self.buildPlate()
         except Exception as error:
             QApplication.restoreOverrideCursor()
+            self._progress.setVisible(False)
             QMessageBox.warning(self, "无法生成模型", str(error))
             return
         QApplication.restoreOverrideCursor()
+        self._progress.setVisible(False)
         suffix = ".3mf" if kind == "3mf" else ".obj"
         label = "3MF 模型" if kind == "3mf" else "OBJ 模型"
         suggested = f"{self._image_name}_{datetime.now():%Y%m%d-%H%M%S}{suffix}"

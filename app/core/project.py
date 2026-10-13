@@ -62,13 +62,15 @@ _LAYER = "色块图层.npy"
 #: （alpha_threshold / merge_delta_e / smooth_radius）用户改不到，写进文件只会变成
 #: 一份需要维护的副本。
 _SETTING_KEYS = ("max_colours", "max_dimension", "dither", "max_spools")
-#: :class:`PlateSettings` 的全部字段。
+#: :class:`PlateSettings` 的全部字段。 ``smooth_edges`` 是 1.6.22 加的：旧工程没有
+#: 这一项，读盘时按 dataclass 的默认值补上，也就是「旧工程打开也是勾上的」。
 _PLATE_KEYS = (
     "target_width_mm",
     "base_thickness_mm",
     "colour_thickness_mm",
     "max_footprint_mm",
     "min_pixel_mm",
+    "smooth_edges",
 )
 
 
