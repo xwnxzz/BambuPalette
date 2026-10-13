@@ -64,6 +64,7 @@ _LAYER = "色块图层.npy"
 _SETTING_KEYS = ("max_colours", "max_dimension", "dither", "max_spools")
 #: :class:`PlateSettings` 的全部字段。 ``smooth_edges`` 是 1.6.22 加的：旧工程没有
 #: 这一项，读盘时按 dataclass 的默认值补上，也就是「旧工程打开也是勾上的」。
+#: ``image_on_bottom`` 是 1.6.23 加的：旧工程同样按默认补上，也就是「图片印在底面」。
 _PLATE_KEYS = (
     "target_width_mm",
     "base_thickness_mm",
@@ -71,6 +72,7 @@ _PLATE_KEYS = (
     "max_footprint_mm",
     "min_pixel_mm",
     "smooth_edges",
+    "image_on_bottom",
 )
 
 

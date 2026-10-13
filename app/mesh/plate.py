@@ -80,6 +80,9 @@ class PlateSettings:
     #: 栅格的像元之间（默认细到图片像素的四分之一，约 0.07 mm），比喷嘴细，打出来
     #: 是圆的。 界面上的勾默认打开。
     smooth_edges: bool = True
+    #: 图片印在底面还是顶面 (1.6.23)。 默认底面：图片贴着打印板，顶面是一整片底板色，
+    #: 打出来顶面平整、不被色块的边线划过。 打开工程时这一项随工程走。
+    image_on_bottom: bool = True
 
     def clamped(self) -> "PlateSettings":
         return PlateSettings(
@@ -90,6 +93,7 @@ class PlateSettings:
             max_footprint_mm=max(20.0, min(1000.0, float(self.max_footprint_mm))),
             min_pixel_mm=max(0.05, min(2.0, float(self.min_pixel_mm))),
             smooth_edges=bool(self.smooth_edges),
+            image_on_bottom=bool(self.image_on_bottom),
         )
 
 
@@ -1155,6 +1159,20 @@ def build_plate(
     points[:, 1] = height * cell - points[:, 1]
     faces = faces[:, ::-1]
 
+    # --- 图片印在哪一面 (1.6.23) ---------------------------------------------
+    # 上面的多边形天生是「图片朝上」的：底面整片是底板色，z_colour_top 那一层按色块铺开。
+    # 要让图片朝下，就把整块实体在 Z 上照一次镜子：顶面 ↔ 底面、色块层 ↔ 底板层，一件都
+    # 不少。 镜像会翻朝向，所以绕序要再翻一次，法线才仍旧朝外；两侧的 z 说明也跟着对调。
+    if config.image_on_bottom:
+        thickness = z_colour_top
+        points[:, 2] = thickness - points[:, 2]
+        faces = faces[:, ::-1]
+        base_z = (config.colour_thickness_mm, thickness)
+        colour_z = (0.0, config.colour_thickness_mm)
+    else:
+        base_z = (0.0, z_base_top)
+        colour_z = (z_base_top, z_colour_top)
+
     # --- cut the one solid into per-filament parts ---------------------------
     parts: list[PlatePart] = [
         _slice_part(
@@ -1167,8 +1185,8 @@ def build_plate(
             palette_index=base_index,
             extruder=base_extruder,
             region_pixels=int(np.count_nonzero(silhouette)),
-            z_bottom_mm=0.0,
-            z_top_mm=z_base_top,
+            z_bottom_mm=base_z[0],
+            z_top_mm=base_z[1],
         )
     ]
 
@@ -1187,8 +1205,8 @@ def build_plate(
                 palette_index=index,
                 extruder=index + 1,
                 region_pixels=count,
-                z_bottom_mm=z_base_top,
-                z_top_mm=z_colour_top,
+                z_bottom_mm=colour_z[0],
+                z_top_mm=colour_z[1],
             )
         )
 

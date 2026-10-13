@@ -1660,10 +1660,15 @@ def main() -> int:
                 < 1e-6,
                 "the base plate covers the whole silhouette",
             )
-            check(plate.parts[0].z_bottom_mm == 0.0, "the base plate starts on the bed")
+            # 1.6.23 (m02289 item 2): the picture prints face down by default, so it is
+            # the colour layer that touches the bed and the base slab that is on top.
             check(
-                all(part.z_bottom_mm == plate.base_thickness_mm for part in plate.parts[1:]),
-                "every colour prism sits on top of the base plate",
+                plate.parts[0].z_bottom_mm == plate.colour_thickness_mm,
+                "the base plate is the top of the slab now",
+            )
+            check(
+                all(part.z_bottom_mm == 0.0 for part in plate.parts[1:]),
+                "every colour prism starts on the bed",
             )
 
             # --- 1.6.22 (m01647): 「圆滑色块」 --------------------------------
@@ -1700,6 +1705,66 @@ def main() -> int:
             )
             page._smooth_box.setChecked(True)
             app.processEvents()
+            plate = page.buildPlate()
+
+            # --- 1.6.23 (m02289 item 2): 图片位置 底面 / 顶面 -------------------
+            from app.mesh.plate import signed_volume as _signed_volume
+
+            check(
+                page._side_combo.currentText() == _picture_page.IMAGE_SIDE_BOTTOM,
+                f"图片位置 defaults to {_picture_page.IMAGE_SIDE_BOTTOM}",
+            )
+            check(
+                page._side_combo.count() == 2
+                and page._side_combo.itemText(1) == _picture_page.IMAGE_SIDE_TOP,
+                "… and offers exactly 底面 / 顶面",
+            )
+            check(page._plate_settings().image_on_bottom, "the default reaches PlateSettings")
+            face_down = page.buildPlate()
+            check(
+                face_down.parts[0].z_bottom_mm == face_down.colour_thickness_mm
+                and all(part.z_bottom_mm == 0.0 for part in face_down.parts[1:]),
+                "底面 puts the colour layer on the bed and the base slab on top",
+            )
+            page._side_combo.setCurrentIndex(1)
+            app.processEvents()
+            check(not page._plate_settings().image_on_bottom, "顶面 turns it off")
+            face_up = page.buildPlate()
+            check(
+                face_up.parts[0].z_bottom_mm == 0.0
+                and all(
+                    part.z_bottom_mm == face_up.base_thickness_mm
+                    for part in face_up.parts[1:]
+                ),
+                "顶面 is the 1.6.22 layout: base on the bed, picture on top",
+            )
+            check(
+                abs(face_up.width_mm - face_down.width_mm) < 1e-9
+                and abs(face_up.volume_mm3 - face_down.volume_mm3) / face_down.volume_mm3 < 1e-9,
+                "flipping the picture changes neither the width nor the volume",
+            )
+            thickness = face_up.total_thickness_mm
+            check(
+                all(
+                    abs(float(a.vertices[:, 2].min()) - (thickness - float(b.vertices[:, 2].max())))
+                    < 1e-9
+                    and abs(
+                        float(a.vertices[:, 2].max()) - (thickness - float(b.vertices[:, 2].min()))
+                    )
+                    < 1e-9
+                    for a, b in zip(face_down.parts, face_up.parts)
+                ),
+                "底面 part for part is 顶面 mirrored through the slab",
+            )
+            down_points, down_faces, _ = plate_mesh(face_down)
+            check(
+                edge_health(down_points, down_faces) == (0, 0)
+                and _signed_volume(down_points, down_faces) > 0,
+                "the face-down plate is still one closed solid with outward normals",
+            )
+            page._side_combo.setCurrentIndex(0)
+            app.processEvents()
+            check(page._side_combo.currentText() == _picture_page.IMAGE_SIDE_BOTTOM, "back to 底面")
             plate = page.buildPlate()
 
             # --- 选中的颜色: both RGBs, the recipe, and manual replacement -------
@@ -1947,15 +2012,18 @@ def main() -> int:
             check(page._delete_button.isEnabled(), "删除 lights up once a colour is picked")
 
             # 「多选」: on, two plain clicks keep BOTH colours (the whole point is
-            # not having to know about Ctrl).  Off, one click replaces the other.
+            # not having to know about Ctrl).  Off, the list holds exactly one row —
+            # m02289 item 1: 「没有多选却多选了色块」 used to happen by three doors
+            # (Ctrl+click, turning 多选 off with a set in hand, an edit reselecting
+            # every block it touched); all three are shut now.
             from PySide6.QtWidgets import QAbstractItemView as _QAbstractItemView
 
             check(page._multi_button.isCheckable(), "多选 is a toggle")
             check(not page._multi_button.isChecked(), "多选 starts off")
             check(
                 page._list._list.selectionMode()
-                == _QAbstractItemView.SelectionMode.ExtendedSelection,
-                "off means the familiar Ctrl+click list",
+                == _QAbstractItemView.SelectionMode.SingleSelection,
+                "off means the list can only hold one row",
             )
             page._multi_button.setChecked(True)
             app.processEvents()
@@ -1976,13 +2044,22 @@ def main() -> int:
             page._multi_button.setChecked(False)
             app.processEvents()
             check(
-                len(page._list.selected_indices()) == 2,
-                "the selection survives turning 多选 back off",
+                len(page._list.selected_indices()) == 1,
+                "turning 多选 off drops the extra rows, keeping one: "
+                f"{page._list.selected_indices()}",
             )
             check(
                 page._list._list.selectionMode()
-                == _QAbstractItemView.SelectionMode.ExtendedSelection,
-                "turning 多选 off restores Ctrl+click behaviour",
+                == _QAbstractItemView.SelectionMode.SingleSelection,
+                "turning 多选 off restores the one-row list",
+            )
+            # The guard behind the mode: whatever put a second row in the selection,
+            # 多选 off is only ever allowed to hold one (m02289 item 1).
+            page._list.select([0, 1])
+            app.processEvents()
+            check(
+                len(page._list.selected_indices()) == 1,
+                f"多选 off cannot hold two rows even when asked: {page._list.selected_indices()}",
             )
             page._list.select([doomed])
 
@@ -2067,6 +2144,8 @@ def main() -> int:
                 keep_key = page._result.palette[1].key
                 page._list.select([0])
                 check(not page._merge_button.isEnabled(), "合并 needs two colours, not one")
+                check(not page._merge_button.isEnabled(), "合并 stays off while 多选 is off")
+                page._multi_button.setChecked(True)
                 page._list.select([0, 1])
                 check(page._merge_button.isEnabled(), "合并 lights up with two colours picked")
                 page._push()
@@ -2097,6 +2176,8 @@ def main() -> int:
                     not page._merged and len(page._result.palette) == colours_before,
                     "undoing the merge restores both colours",
                 )
+                page._multi_button.setChecked(False)
+                app.processEvents()
             from app.ui.picture_page import MergeDialog  # noqa: PLC0415
 
             dialog = MergeDialog(page._result.palette[:3], parent=page)
@@ -2514,8 +2595,15 @@ def main() -> int:
             # 变的只是色块大小，所以「按当前色块重新匹配」拿到的还是原图自己那几种颜色。
             if len(page._result.palette) >= 2:
                 merge_picked = page._list.row_ids()[:2]
+                # Two colours at once only happen with 「多选」 on (m02289 item 1).
+                page._multi_button.setChecked(True)
                 page._list.select(merge_picked)
                 app.processEvents()
+                check(
+                    len(page._list.selected_indices()) == 2,
+                    "多选 on lets 合并 see both colours: "
+                    f"{page._list.selected_indices()}",
+                )
                 keeper = int(merge_picked[1])
                 merge_indices = _np.asarray(page._result.indices)
                 touched = _np.isin(
@@ -2571,6 +2659,8 @@ def main() -> int:
                     page._image.tobytes() == before_merge_image,
                     "Ctrl+Z puts 原图 back after a merge",
                 )
+                page._multi_button.setChecked(False)
+                app.processEvents()
 
             # 1.6.21 (m01191 item 1): an empty selection means 预览 draws nothing.  Clicking
             # the blank space under the rows (or unticking the last row in 多选) empties the
@@ -2947,10 +3037,13 @@ def main() -> int:
             check("已保存工程" in page._status.text(), f"saving says so: {page._status.text()!r}")
 
             # 1.6.22 (m01647): the 圆滑色块 tick travels with the project.
+            # 1.6.23 (m02289 item 2): so does 图片位置.
             page._smooth_box.setChecked(False)
+            page._side_combo.setCurrentIndex(1)
             page._on_save_project()
             app.processEvents()
             page._smooth_box.setChecked(True)
+            page._side_combo.setCurrentIndex(0)
             _StubMessageBox.answer = "不保存"
             page._on_open_project()
             app.processEvents()
@@ -2958,7 +3051,13 @@ def main() -> int:
                 page._smooth_box.isChecked() is False,
                 "opening the project puts the 圆滑色块 tick back where it was saved",
             )
+            check(
+                page._side_combo.currentText() == _picture_page.IMAGE_SIDE_TOP,
+                "opening the project puts 图片位置 back where it was saved: "
+                f"{page._side_combo.currentText()!r}",
+            )
             page._smooth_box.setChecked(True)
+            page._side_combo.setCurrentIndex(0)
 
             saved_colours = len(page._result.palette)
             saved_printed = page._result.printed_pixels

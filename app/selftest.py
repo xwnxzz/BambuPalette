@@ -1259,8 +1259,16 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         page._multi_button.setChecked(False)
         app.processEvents()
         check(
-            len(page._list.selected_indices()) == 2,
-            "the selection survives turning 多选 back off",
+            len(page._list.selected_indices()) == 1,
+            "关掉「多选」之后列表只剩一行 (m02289 item 1): "
+            f"{page._list.selected_indices()}",
+        )
+        page._list.select([0, 1])
+        app.processEvents()
+        check(
+            len(page._list.selected_indices()) == 1,
+            "「多选」关着的时候，就算代码想选两行也只留下一行: "
+            f"{page._list.selected_indices()}",
         )
         # m10238 item 4b: a click must never reshuffle the list, or the row under
         # the cursor becomes a different colour than the one just clicked.
@@ -1437,7 +1445,10 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         merged = False
         if len(pair) == 2 and blocks.value(pair[0]) != blocks.value(pair[1]):
             merged = True
+            # 一次动两块：只有「多选」开着才做得到 (m02289 item 1)。
+            page._multi_button.setChecked(True)
             page._list.select(pair)
+            app.processEvents()
             keep_entry = page.result.palette[blocks.value(pair[1])]
             real_merge = _pp.MergeDialog
             _pp.MergeDialog = lambda *args, **kwargs: _StubDialog(1, None)
@@ -1459,7 +1470,9 @@ def run_selftest(*, report_path: Path | None = None) -> int:
 
         # 更换颜色：选中的块一起换。
         if merged:
+            page._multi_button.setChecked(True)
             page._list.select(pair)
+            app.processEvents()
             current = {page.result.palette[blocks.value(label)].key for label in pair}
             wanted = next(
                 (entry for entry in page._candidate_palette() if entry.key not in current),
@@ -1486,6 +1499,8 @@ def run_selftest(*, report_path: Path | None = None) -> int:
                 page._undo()
                 app.processEvents()
                 check(not page._block_edits, "Ctrl+Z 撤销更换颜色")
+            page._multi_button.setChecked(False)
+            app.processEvents()
 
         # 切换选择方式本身也算一步：Ctrl+Z 能把用户带回上一种模式。
         page._set_pick_mode(_pp.PICK_COLOUR, save=False)
@@ -1759,6 +1774,7 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         # 颜色——所以原图的颜色集合一点都不变，变的只有色块大小。
         if len(page.result.palette) >= 2:
             picked = page._list.row_ids()[:2]
+            page._multi_button.setChecked(True)
             page._list.select(picked)
             app.processEvents()
             keeper = int(picked[1])
@@ -1810,6 +1826,8 @@ def run_selftest(*, report_path: Path | None = None) -> int:
                 page._image.tobytes() == before_merge_image,
                 "Ctrl+Z 把合并改过的原图也退回去",
             )
+            page._multi_button.setChecked(False)
+            app.processEvents()
 
         # 1.6.21 (m01191 item 1)：列表里一个都没选中，预览就不画高亮、不画描边。
         # 用户报的正是这条（未选中颜色时预览还显示色块），而他说不清自己是怎么把选中取消掉
@@ -1971,6 +1989,78 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         )
         page._smooth_box.setChecked(True)
         app.processEvents()
+        plate = page.buildPlate()
+
+        # 1.6.23 (m02289 item 2)：图片印在哪一面。默认底面：色块层贴着打印板，顶面是
+        # 一整片底板色。换一面就是把整块实体在 Z 上照一次镜子，绕序再翻回来，所以
+        # 仍旧是一块闭合实体、体积不变。
+        from .mesh.plate import signed_volume as _signed_volume
+
+        check(
+            page._side_combo.currentText() == _pp.IMAGE_SIDE_BOTTOM,
+            f"「{_pp.IMAGE_SIDE_LABEL}」默认是{_pp.IMAGE_SIDE_BOTTOM}"
+            f"（现在是 {page._side_combo.currentText()!r}）",
+        )
+        check(
+            page._side_combo.count() == 2
+            and page._side_combo.itemText(0) == _pp.IMAGE_SIDE_BOTTOM
+            and page._side_combo.itemText(1) == _pp.IMAGE_SIDE_TOP,
+            "只有底面和顶面两个选项",
+        )
+        check(page._plate_settings().image_on_bottom, "默认的底面进了 PlateSettings")
+        face_down = page.buildPlate()
+        check(
+            abs(face_down.parts[0].z_bottom_mm - face_down.colour_thickness_mm) < 1e-9
+            and all(abs(part.z_bottom_mm) < 1e-9 for part in face_down.parts[1:]),
+            f"底面：色块层在下（{face_down.parts[0].z_bottom_mm:.2f} mm 起），底板在上",
+        )
+        page._side_combo.setCurrentIndex(1)
+        app.processEvents()
+        check(not page._plate_settings().image_on_bottom, "选顶面之后 PlateSettings 里就是 False")
+        face_up = page.buildPlate()
+        check(
+            abs(face_up.parts[0].z_bottom_mm) < 1e-9
+            and all(
+                abs(part.z_bottom_mm - face_up.base_thickness_mm) < 1e-9
+                for part in face_up.parts[1:]
+            ),
+            f"顶面：底板在下，色块层压在上面（{face_up.parts[1].z_bottom_mm:.2f} mm 起）",
+        )
+        check(
+            abs(face_up.width_mm - face_down.width_mm) < 1e-9
+            and abs(face_up.depth_mm - face_down.depth_mm) < 1e-9
+            and abs(face_up.volume_mm3 - face_down.volume_mm3) / face_down.volume_mm3 < 1e-9,
+            f"换一面不改宽、深和体积（{face_down.volume_mm3:.1f} vs {face_up.volume_mm3:.1f} mm³）",
+        )
+        _thickness = face_up.total_thickness_mm
+        check(
+            len(face_down.parts) == len(face_up.parts)
+            and all(
+                abs(float(a.vertices[:, 2].min()) - (_thickness - float(b.vertices[:, 2].max())))
+                < 1e-9
+                and abs(
+                    float(a.vertices[:, 2].max()) - (_thickness - float(b.vertices[:, 2].min()))
+                )
+                < 1e-9
+                for a, b in zip(face_down.parts, face_up.parts)
+            ),
+            "两面的每个部件逐一对得上（底面就是顶面照 Z 的镜子）",
+        )
+        _down_points, _down_faces, _down_tags = _plate_mesh(face_down)
+        _down_open, _down_manifold = _edge_health(_down_points, _down_faces)
+        check(
+            _down_open == 0
+            and _down_manifold == 0
+            and _signed_volume(_down_points, _down_faces) > 0,
+            f"底面的整块照样闭合、法线朝外（开口 {_down_open}、非流形 {_down_manifold}）",
+        )
+        page._side_combo.setCurrentIndex(0)
+        app.processEvents()
+        check(
+            page._side_combo.currentText() == _pp.IMAGE_SIDE_BOTTOM
+            and page._plate_settings().image_on_bottom,
+            "换回底面之后一切都回去了",
+        )
         plate = page.buildPlate()
 
         three_mf = write_3mf(

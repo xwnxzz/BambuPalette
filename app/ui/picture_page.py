@@ -158,6 +158,18 @@ SMOOTH_TIP = (
     "只影响导出，预览和「原图」不变；不勾就按 1.6.21 的样子导出。"
 )
 
+#: 图片印在哪一面（m02289 item 2）。默认底面：图片贴着打印板，顶面是一整片底板色。
+IMAGE_SIDE_LABEL = "图片位置"
+IMAGE_SIDE_BOTTOM = "底面"
+IMAGE_SIDE_TOP = "顶面"
+IMAGE_SIDE_TIP = (
+    "图片印在模型的哪一面。\n"
+    f"· {IMAGE_SIDE_BOTTOM}（默认）：图片朝下贴着打印板，顶面是一整片底板色，打出来顶面平整、"
+    "不被色块的边线划过。\n"
+    f"· {IMAGE_SIDE_TOP}：图片朝上，就是 1.6.22 及以前的样子。\n"
+    "两面都是同一块闭合实体，只是上下对调；尺寸、厚度、体积都不变。"
+)
+
 PAGE_HELP = (
     "图像转换这一步：\n"
     f"· {ZOOM_HINT}\n"
@@ -205,7 +217,11 @@ PAGE_HELP = (
     "是锯齿。勾上之后导出时会在细一档的栅格上重新分类，边界落在格子之间（默认细到图片像素的"
     "四分之一，约 0.07 mm，颜色多时退到二分之一，都比喷嘴细），打出来"
     "是圆的；同一个开关也写进 .bpproj，所以存过的工程下次打开还是上次那个样子。这个开关只影响"
-    "导出的 3MF/OBJ——预览和「原图」画的还是匹配栅格，不勾就照 1.6.21 的样子导出。"
+    "导出的 3MF/OBJ——预览和「原图」画的还是匹配栅格，不勾就照 1.6.21 的样子导出。\n"
+    f"· 「{IMAGE_SIDE_LABEL}」选图片印在模型的哪一面（1.6.23 起）：{IMAGE_SIDE_BOTTOM}（默认）"
+    f"是图片朝下贴着打印板、顶面一整片底板色，打出来顶面平整；{IMAGE_SIDE_TOP} 是图片朝上，"
+    "也就是 1.6.22 及以前的样子。两面都是同一块闭合实体上下对调，尺寸、厚度、体积都不变；"
+    "这一项也写进 .bpproj。"
 )
 
 
@@ -830,9 +846,10 @@ class ColourList(QWidget):
         self._list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._list.setTextElideMode(Qt.TextElideMode.ElideRight)
         self._list.setWordWrap(False)
-        # 「删除」 and 「合并」 both work on several colours at once, so the list
-        # has to allow a multi-selection; a plain click still selects just one.
-        self._list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        # 「删除」 and 「合并」 both work on several colours at once, but only after
+        # the user says so: 「多选」 starts off and off means exactly one row
+        # (m02289 item 1 — 「没有多选却多选了色块」).
+        self._list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self._list.currentRowChanged.connect(self._on_row_changed)
         self._list.itemSelectionChanged.connect(self._on_selection_changed)
         self._list.itemDoubleClicked.connect(self._on_row_double_clicked)
@@ -983,7 +1000,7 @@ class ColourList(QWidget):
         What happens to the selection depends on the mode, and getting this wrong
         greys 删除 / 合并 / 更换颜色 out again:
 
-        * 「一次只选一种」 (``ExtendedSelection``): ``setCurrentRow`` selects this
+        * 「一次只选一种」 (``SingleSelection``): ``setCurrentRow`` selects this
           row and drops the others — that IS the new selection, so nothing is put
           back.  It runs suppressed, so the cache and the buttons are refreshed by
           hand afterwards.
@@ -1044,15 +1061,21 @@ class ColourList(QWidget):
     def setMultiSelect(self, on: bool) -> None:
         """Make a plain click ADD to the selection instead of replacing it.
 
-        Ctrl+click did this already, but a modifier nobody was told about is not
+        Ctrl+click used to do this, but a modifier nobody was told about is not
         a feature — the page puts a 「多选」 toggle in front of the buttons
         instead.  The mode is changed on the widget (we never fake a selection),
         so the same ``itemSelectionChanged`` path keeps 删除 / 合并 in sync.
+
+        Off is not 「ExtendedSelection with Ctrl」 but a real single selection:
+        多选 关着就是一次只认一样东西 (m02289 item 1).  用户报的正是「没有多选却多
+        选了几块」——那条路上有三扇门：Ctrl+click 悄悄加行、关掉「多选」时把多选
+        留在列表里、以及编辑之后按块回填选中集。三扇门一起关上：关掉时只留光标那一
+        行，模式回到 SingleSelection，回填也只看第一块（``_apply_edits``）。
         """
         mode = (
             QAbstractItemView.SelectionMode.MultiSelection
             if on
-            else QAbstractItemView.SelectionMode.ExtendedSelection
+            else QAbstractItemView.SelectionMode.SingleSelection
         )
         if self._list.selectionMode() == mode:
             return
@@ -1064,7 +1087,12 @@ class ColourList(QWidget):
         self._suppress = True
         self._list.setSelectionMode(mode)
         self._suppress = False
-        self.select(keep)
+        if on:
+            self.select(keep)
+            return
+        # 关掉「多选」：光标那一行活下去（没有光标就留第一个），其余放掉。
+        survivor = self._pinned if self._pinned in keep else (keep[0] if keep else -1)
+        self.select([] if survivor < 0 else [survivor])
 
     def _refresh(self) -> None:
         result = self._result
@@ -1173,7 +1201,19 @@ class ColourList(QWidget):
     def _on_selection_changed(self) -> None:
         if self._suppress:
             return
-        self._picked = set(self.selected_indices())
+        picked = self.selected_indices()
+        if len(picked) > 1 and self._list.selectionMode() != (
+            QAbstractItemView.SelectionMode.MultiSelection
+        ):
+            # 最后一道门：「多选」关着就只认一样东西——不管这多出来的几行是
+            # Ctrl+click、item.setSelected() 还是别的代码留下的 (m02289 item 1)。
+            keeper = self._pinned if self._pinned in picked else picked[0]
+            self._suppress = True
+            self.select([keeper])
+            self._suppress = False
+            self._pinned = keeper
+            picked = [keeper]
+        self._picked = set(picked)
         if not self._picked:
             # 「一个都没选中」也要把光标那一行放掉。点列表下面的空白处（Qt 直接清选中）
             # 或者「多选」里点掉最后一行都会走到这里，而页面上的预览高亮只认选中集：
@@ -1452,6 +1492,12 @@ class PicturePage(QWidget):
         self._smooth_box.setChecked(True)
         self._smooth_box.setToolTip(SMOOTH_TIP)
 
+        # 图片印在哪一面 (1.6.23): 默认底面，和 1.6.22 及以前的导出上下对调。
+        self._side_combo = QComboBox()
+        self._side_combo.addItem(IMAGE_SIDE_BOTTOM, True)
+        self._side_combo.addItem(IMAGE_SIDE_TOP, False)
+        self._side_combo.setToolTip(IMAGE_SIDE_TIP)
+
         self._export_3mf = QPushButton("生成 3MF（Bambu Studio）")
         self._export_3mf.setProperty("accent", "true")
         self._export_3mf.clicked.connect(lambda: self._on_export("3mf"))
@@ -1470,6 +1516,8 @@ class PicturePage(QWidget):
         bottom.addWidget(QLabel("底板颜色:"))
         bottom.addWidget(self._base_combo)
         bottom.addStretch(1)
+        bottom.addWidget(QLabel(IMAGE_SIDE_LABEL + ":"))
+        bottom.addWidget(self._side_combo)
         bottom.addWidget(self._smooth_box)
         bottom.addWidget(self._export_obj)
         bottom.addWidget(self._export_3mf)
@@ -1759,6 +1807,7 @@ class PicturePage(QWidget):
             self._base_spin,
             self._colour_spin,
             self._base_combo,
+            self._side_combo,
             self._smooth_box,
             self._export_3mf,
             self._export_obj,
@@ -1988,6 +2037,7 @@ class PicturePage(QWidget):
         self._base_spin.setValue(float(state.plate.base_thickness_mm))
         self._colour_spin.setValue(float(state.plate.colour_thickness_mm))
         self._smooth_box.setChecked(bool(state.plate.smooth_edges))
+        self._side_combo.setCurrentIndex(0 if state.plate.image_on_bottom else 1)
         # The 方案 list belongs to a match, and 「打开工程」 deliberately does not run
         # one: the colour table in the file is what the user saved, edits and all,
         # and re-matching could answer something slightly different.  So the panel
@@ -3047,6 +3097,10 @@ class PicturePage(QWidget):
         if blocks is not None:
             # 块模式：选中的是块编号，跟调色板下标没有关系，所以整条高亮都走块表。
             wanted = self._blocks_after(reselect)
+            if wanted and not self._multi_button.isChecked():
+                # 「多选」关着的时候，编辑之后也只认一块：不然列表里会自己冒出两块
+                # 高亮，而按钮明明在说「一次一样」(m02289 item 1)。
+                wanted = wanted[:1]
             if wanted:
                 self._list.select(wanted)
             if wanted:
@@ -3226,13 +3280,23 @@ class PicturePage(QWidget):
             label.setText(title)
 
     def _on_multi_toggled(self, on: bool) -> None:
-        """「多选」：click to add a colour, click again to drop it — no Ctrl."""
+        """「多选」：click to add a colour, click again to drop it — no Ctrl.
+
+        关掉的时候把多出来的那几行放掉，并在状态行说明白——用户报过「没有多选却
+        多选了色块」，那一行消失不能是悄悄发生的 (m02289 item 1)。
+        """
+        before = len(self._list.selected_indices())
         self._list.setMultiSelect(on)
         # Accent while it is ON, so "clicks add up" is never a guess.
         self._multi_button.setProperty("accent", "true" if on else "false")
         style = self._multi_button.style()
         style.unpolish(self._multi_button)
         style.polish(self._multi_button)
+        if not on and before > 1:
+            self._status.setText(
+                f"已关掉「多选」：刚才选中的 {before} 项只留了当前这一项，"
+                "要一次改几样就再点开「多选」。"
+            )
 
     def _update_actions(self) -> None:
         """删除 needs one row, 合并 needs two, and the history drives the rest.
@@ -3629,6 +3693,7 @@ class PicturePage(QWidget):
             colour_thickness_mm=float(self._colour_spin.value()),
             base_index=int(base_index) if base_index is not None else -1,
             smooth_edges=bool(self._smooth_box.isChecked()),
+            image_on_bottom=bool(self._side_combo.currentData()),
         ).clamped()
 
     def buildPlate(self) -> PlateModel:

@@ -307,10 +307,64 @@ class PlateTests(unittest.TestCase):
         self.assertEqual(len(plate.parts), 1 + len(self.result.palette))
         self.assertEqual(plate.parts[0].name, "底板")
         self.assertEqual(plate.extruder_count, len(self.result.palette))
+        # The picture prints face down by default (1.6.23), so the colour layer sits
+        # on the bed and the base slab is the top of the plate.
+        self.assertEqual(plate.parts[0].z_bottom_mm, plate.colour_thickness_mm)
+        self.assertEqual(plate.parts[0].z_top_mm, plate.total_thickness_mm)
+        for part in plate.parts[1:]:
+            self.assertAlmostEqual(part.z_bottom_mm, 0.0, places=9)
+            self.assertAlmostEqual(part.z_top_mm, plate.colour_thickness_mm, places=9)
+
+    def test_the_picture_can_print_face_up_instead(self):
+        plate = build_plate(
+            self.result, PlateSettings(target_width_mm=100.0, image_on_bottom=False)
+        )
         self.assertEqual(plate.parts[0].z_bottom_mm, 0.0)
+        self.assertAlmostEqual(plate.parts[0].z_top_mm, plate.base_thickness_mm, places=9)
         for part in plate.parts[1:]:
             self.assertAlmostEqual(part.z_bottom_mm, plate.base_thickness_mm, places=9)
             self.assertAlmostEqual(part.z_top_mm, plate.total_thickness_mm, places=9)
+
+    def test_the_two_sides_are_mirror_images_of_each_other(self):
+        down = build_plate(self.result, PlateSettings(target_width_mm=100.0))
+        up = build_plate(
+            self.result, PlateSettings(target_width_mm=100.0, image_on_bottom=False)
+        )
+        thickness = down.total_thickness_mm
+        self.assertEqual(len(down.parts), len(up.parts))
+        for a, b in zip(down.parts, up.parts):
+            self.assertEqual(a.name, b.name)
+            self.assertEqual(a.extruder, b.extruder)
+            self.assertTrue(np.allclose(a.vertices[:, 0], b.vertices[:, 0]))
+            self.assertTrue(np.allclose(a.vertices[:, 1], b.vertices[:, 1]))
+            self.assertTrue(
+                np.allclose(a.vertices[:, 2], thickness - b.vertices[:, 2]),
+                f"{a.name} is not the z-mirror of its face-up twin",
+            )
+        # A reflection flips orientation, so the winding has to be reversed to
+        # compensate — otherwise every normal points into the solid and the volume
+        # comes out negative.
+        down_points, down_faces, _ = plate_mesh(down)
+        up_points, up_faces, _ = plate_mesh(up)
+        self.assertGreater(signed_volume(down_points, down_faces), 0.0)
+        self.assertGreater(signed_volume(up_points, up_faces), 0.0)
+        self.assertAlmostEqual(down.volume_mm3, up.volume_mm3, places=6)
+
+    def test_both_sides_are_watertight(self):
+        for face_down in (True, False):
+            with self.subTest(face_down=face_down):
+                plate = build_plate(
+                    self.result,
+                    PlateSettings(target_width_mm=100.0, image_on_bottom=face_down),
+                )
+                points, faces, _tags = plate_mesh(plate)
+                self.assertEqual(edge_health(points, faces), (0, 0))
+                self.assertGreater(signed_volume(points, faces), 0.0)
+                self.assertTrue(
+                    np.all(points[:, 2] >= -1e-9)
+                    and np.all(points[:, 2] <= plate.total_thickness_mm + 1e-9),
+                    "the slab has to sit between the bed and its own thickness",
+                )
 
     def test_the_base_uses_the_largest_colour_by_default(self):
         plate = build_plate(self.result, PlateSettings())
