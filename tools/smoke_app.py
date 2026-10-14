@@ -1425,6 +1425,51 @@ def main() -> int:
         len(single._combined) == 83,
         f"switching back cannot resurrect the ABS spool, got {len(single._combined)} colours",
     )
+
+    # 一种材质下的卷被删光：这种材质要从下拉里消失，材质切回第一种，并且说出来
+    # (m10789 item 1)。以前下拉悄悄落回第一种、状态栏却还印着被删掉的那种名字，
+    # 设置里也还记着它 —— 用户看到的就是「材质无法切换了」。
+    picker.setCurrentIndex(picker.findData("PLA"))
+    app.processEvents()
+    check(
+        material_window.library.material == "PLA",
+        f"the picker can still go back to another material, got {material_window.library.material!r}",
+    )
+    for _round in range(2):
+        material_window._list.setCurrentRow(0)
+        app.processEvents()
+        material_window._on_delete()
+        app.processEvents()
+    check(
+        material_window.library.material == "PETG HF",
+        "deleting a material's last spool falls back to the first material, got "
+        f"{material_window.library.material!r}",
+    )
+    check(
+        [picker.itemText(index) for index in range(picker.count())] == ["PETG HF（2）", "ABS（1）"],
+        "an emptied material leaves the 材质 picker, got "
+        f"{[picker.itemText(index) for index in range(picker.count())]}",
+    )
+    check(
+        picker.isEnabled() and picker.currentData() == "PETG HF",
+        "the picker still works after the material it was on disappeared",
+    )
+    check(
+        "「PLA」下的耗材已经全部删除" in material_window._status.text()
+        and "已切回「PETG HF」" in material_window._status.text(),
+        "the bottom line says why the material changed, got "
+        f"{material_window._status.text()[:70]!r}",
+    )
+    check(
+        "PLA" not in material_window._library_hint.text(),
+        "the empty hint no longer names the deleted material, got "
+        f"{material_window._library_hint.text()[:50]!r}",
+    )
+    check(
+        len(material_window._combined) == 83 and material_window._catalog.pair_count == 1,
+        "the surviving material took the colours over, got "
+        f"{len(material_window._combined)} colours / {material_window._catalog.pair_count} pairs",
+    )
     material_window.close()
     app.processEvents()
 

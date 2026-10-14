@@ -413,6 +413,9 @@ class MainWindow(QMainWindow):
         )
         self._material_combo.currentIndexChanged.connect(self._on_material_changed)
         self._material_guard = False
+        # 上一轮删空一种材质留下的那句话（m10789 item 1）。它挂在状态栏上直到下一次
+        # 重载耗材库：三色混色算完还会再刷一次状态栏，写死在状态栏里的一句话会被刷掉。
+        self._material_note = ""
         material_row = QWidget()
         material_layout = QHBoxLayout(material_row)
         material_layout.setContentsMargins(0, 0, 0, 0)
@@ -498,6 +501,10 @@ class MainWindow(QMainWindow):
 
     # -- library -----------------------------------------------------------------
     def _reload_library(self) -> None:
+        # 先定下「现在按哪种材质配色」，再画清单 (m10789 item 1)：一种材质下的卷被删光
+        # 时 _refresh_material_combo 会把材质切回第一种，如果清单还按已经不在的那个名字
+        # 过滤，左边会空着说「当前材质「PETG」下还没有耗材」，右边却在按新材质算颜色。
+        dropped = self._refresh_material_combo()
         self._suppress_list_signal = True
         self._list.clear()
         # The spools are about to be replaced, so the search haystacks keyed by
@@ -550,25 +557,51 @@ class MainWindow(QMainWindow):
         self._library_hint.setVisible(not has_any)
         self._list.setVisible(has_any)
         self._clear_button.setEnabled(has_any)
-        self._refresh_material_combo()
         self._rebuild_catalog()
         self._save_library()
+        if dropped:
+            # 材质被换掉的原因要说出来 (m10789 item 1)：删完最后一卷后如果只把下拉
+            # 悄悄换成第一种，用户看到的是「材质下拉坏了，切不回原来那种」——而实际
+            # 上是那种材质在库里已经一卷都不剩，下拉里没有它才是对的。
+            if self.library.material:
+                self._material_note = (
+                    f"「{dropped}」下的耗材已经全部删除，"
+                    f"已切回「{self.library.material}」（{len(self.library.visible)} 卷参与配色）"
+                )
+            else:
+                self._material_note = f"「{dropped}」下的耗材已经全部删除，耗材库已经空了"
+            self._update_status()
+        else:
+            self._material_note = ""
 
-    def _refresh_material_combo(self) -> None:
+    def _refresh_material_combo(self) -> str | None:
         """Fill the 材质 picker from the library, keeping the current choice.
 
         The counts ride in the label because 「PETG HF（3）」 answers the question
         the switch is about — how many spools of that material will actually be
         spent — without opening anything (m05557 item 1).
+
+        Returns the 耗材种类 we had to leave, or ``None``.  A material whose every
+        spool is gone is not in the list any more (``materials()`` counts spools),
+        so the picker cannot show it: the choice falls back to the first material
+        and that fallback is written back to the settings.  Without the write-back
+        the next launch would read the deleted material out of the settings again
+        and the window would come up claiming 「当前材质「PETG」下还没有耗材」 while
+        the list is full — the state the user read as 「材质无法切换了」 (m10789 item 1).
         """
         names = self.library.materials()
+        dropped: str | None = None
         self._material_guard = True
         try:
             self._material_combo.clear()
             if not names:
+                if self.library.material:
+                    dropped = self.library.material
+                    self.library.material = ANY_MATERIAL
+                    settings.save_settings({"material": ANY_MATERIAL})
                 self._material_combo.addItem("—", ANY_MATERIAL)
                 self._material_combo.setEnabled(False)
-                return
+                return dropped
             self._material_combo.setEnabled(True)
             counts: dict[str, int] = {}
             for filament in self.library:
@@ -580,10 +613,13 @@ class MainWindow(QMainWindow):
             index = self._material_combo.findData(self.library.material)
             if index < 0:
                 index = 0
+                dropped = self.library.material or None
                 self.library.material = self._material_combo.itemData(0) or ANY_MATERIAL
+                settings.save_settings({"material": self.library.material})
             self._material_combo.setCurrentIndex(index)
         finally:
             self._material_guard = False
+        return dropped
 
     def _on_material_changed(self, index: int) -> None:
         """切换材质 = 换一份耗材清单，所有颜色跟着重来一遍 (m05557 item 1).
@@ -1285,6 +1321,8 @@ class MainWindow(QMainWindow):
                 f" · 现在按 {self.library.material} 配色，"
                 f"另有 {other_material} 卷是别的材质"
             )
+        if self._material_note:
+            note += f" · {self._material_note}"
         note += f" · 去重后共 {everything:,} 个颜色"
         if self._pair_filter is not None:
             note += " · 已筛选"

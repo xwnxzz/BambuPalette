@@ -592,6 +592,52 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         remembered == "PLA",
         f"选的材质记住了，下次开窗就用它（{remembered!r}）",
     )
+
+    # 一种材质下的卷被删光：这种材质要从下拉里消失、材质回落到第一种、并且说出来
+    # （m10789 item 1）。以前下拉悄悄落回第一种，状态栏却还印着被删掉的那种名字，
+    # 设置里也还记着它 —— 用户看到的就是「材质无法切换了」。
+    material_combo.setCurrentIndex(material_combo.findData("PLA"))
+    app.processEvents()
+    check(
+        material_window.library.material == "PLA",
+        f"下拉还能切到别的材质（{material_window.library.material!r}）",
+    )
+    for _round in range(2):
+        material_window._list.setCurrentRow(0)
+        app.processEvents()
+        material_window._on_delete()
+        app.processEvents()
+    check(
+        material_window.library.material == "PETG HF",
+        f"删光一种材质的耗材后回落到第一种材质（{material_window.library.material!r}）",
+    )
+    left = [material_combo.itemText(index) for index in range(material_combo.count())]
+    check(
+        left == ["PETG HF（2）", "ABS（1）"],
+        f"删空的材质从下拉里消失（{left}）",
+    )
+    check(
+        material_combo.isEnabled() and material_combo.currentData() == "PETG HF",
+        f"材质下拉还能继续用（{material_combo.currentData()!r}）",
+    )
+    check(
+        "「PLA」下的耗材已经全部删除" in material_window._status.text()
+        and "已切回「PETG HF」" in material_window._status.text(),
+        f"底栏说清为什么换了材质（{material_window._status.text()[:70]!r}）",
+    )
+    check(
+        "PLA" not in material_window._library_hint.text(),
+        f"空库提示不再提被删掉的那种（{material_window._library_hint.text()[:50]!r}）",
+    )
+    check(
+        _material_settings().get("material") == "PETG HF",
+        "回落的材质写进设置，下次开窗不会再捡回被删掉的那种",
+    )
+    combined = len(material_window._combined) if material_window._combined is not None else -1
+    check(
+        combined == 83 and material_window._catalog.pair_count == 1,
+        f"留下的那种材质接手了颜色（{combined} 个 / {material_window._catalog.pair_count} 对）",
+    )
     material_window.close()
     app.processEvents()
 
