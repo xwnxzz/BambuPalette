@@ -107,6 +107,9 @@ from .swatch import swatch_pixmap
 __all__ = ["PicturePage", "PictureView", "ColourList"]
 
 IMAGE_FILTER = "图片 (*.png *.jpg *.jpeg *.bmp *.webp *.gif *.tif *.tiff);;所有文件 (*)"
+#: 「导出原图」只写 PNG：原图里可能带着「删掉的地方是透明的」这种 alpha，换成 JPEG 就丢了
+#: （m12426 item 3）。
+PNG_FILTER = "PNG 图片 (*.png);;所有文件 (*)"
 
 #: Wheel zoom runs between 「整张铺满面板」 (1.0) and this many times the fit.
 ZOOM_MIN = 1.0
@@ -1158,16 +1161,67 @@ class ColourList(QWidget):
         # whatever happens to be row 0 now.
         self._reveal()
 
-    def _fill_colour_rows(self, result: MatchResult, total: int) -> None:
-        """「按颜色选择」：一行一种颜色，行号就是调色板下标。"""
+    def _groups(self, result: MatchResult) -> list[tuple[int, list[int]]]:
+        """一行一种**打印出来的颜色**：同一个配方被几块选中就并成一行（m12426 item 1）。
+
+        标题写着「打印图片需要的颜色」，那这张表就不该有重复行 —— 用户看到同一种颜色
+        出现三次（三个色块都印 ``#F5D2B8``），那是色块级的事实，属于「按色块边缘选择」
+        那张表（一行一块，m11985），不该在这里冒出来。
+
+        返回 ``(代表位子, 这一行的所有位子)``，代表取像素最多的那一个，这样高亮、详情
+        和「图片里的颜色」都指着他。
+        """
+        order: list[tuple[int, list[int]]] = []
+        seen: dict[str, int] = {}
         for index in self._order:
+            key = result.palette[index].key
+            if key in seen:
+                order[seen[key]][1].append(index)
+                continue
+            seen[key] = len(order)
+            order.append((index, [index]))
+        grouped = []
+        for index, members in order:
+            survivor = max(members, key=lambda position: int(result.counts[position]))
+            grouped.append((int(survivor), [int(position) for position in members]))
+        return grouped
+
+    def members_of(self, index: int) -> list[int]:
+        """这一行代表的**所有**调色板位子（分组之后一行可能顶着好几个）。
+
+        「删除」「合并」「更换颜色」说的是「这一种颜色」，所以它们要作用在这一行的
+        全部位子上，而不是碰巧当代表的那个 (m12426 item 1)。
+        """
+        result = self._result
+        if result is None or not 0 <= int(index) < len(result.palette):
+            return [int(index)]
+        key = result.palette[int(index)].key
+        return [
+            position
+            for position in range(len(result.palette))
+            if result.palette[position].key == key
+        ]
+
+    def expanded(self, indices: list[int]) -> list[int]:
+        """把行号摊开成它们代表的全部位子，按出现的先后去重。"""
+        out: list[int] = []
+        for index in indices:
+            for position in self.members_of(int(index)):
+                if position not in out:
+                    out.append(position)
+        return out
+
+    def _fill_colour_rows(self, result: MatchResult, total: int) -> None:
+        """「按颜色选择」：一行一种打印出来的颜色，行号是它的代表位子。"""
+        for index, members in self._groups(result):
             entry = result.palette[index]
-            count = int(result.counts[index])
+            count = int(sum(int(result.counts[position]) for position in members))
             image_hex = hex_of(result.region_colour(index))
             share = count / total * 100.0
+            where = "" if len(members) == 1 else f" 等 {len(members)} 处"
             row = QListWidgetItem(
                 compare_pixmap(image_hex, entry.color_hex, 44, 20),
-                f"{image_hex} → {entry.color_hex}    {share:.1f}%\n"
+                f"{image_hex}{where} → {entry.color_hex}    {share:.1f}%\n"
                 f"{entry_recipe_text(entry, self._library, compact=True)}",
             )
             row.setData(Qt.ItemDataRole.UserRole, int(index))
@@ -1217,9 +1271,12 @@ class ColourList(QWidget):
             )
             return
         extra = f" · 选中 {selected} 种" if selected else ""
+        # 「共几种颜色」按**打印出来的颜色**数：同一个配方被三块选中是一种颜色，不是三种
+        # （m12426 item 1）。要看色块数量是「按色块边缘选择」那张表的事。
+        colours = len({entry.key for entry in result.palette})
         self._summary.setText(
             f"{result.width}×{result.height} 像素 · 实心 {result.printed_pixels} 像素"
-            f" · 共 {len(result.palette)} 种颜色{extra}"
+            f" · 共 {colours} 种颜色{extra}"
         )
 
     def _on_row_changed(self, row: int) -> None:
@@ -1408,11 +1465,10 @@ class PicturePage(QWidget):
         self._redo_stack: list[tuple] = []
         #: Live palette index -> original index, rebuilt by ``_compose``.
         self._live_map: list[int] = []
-        #: The colour on screen right now (-1 = none), and the ones it replaced.
-        #: Clicking the same row again steps back through this list, so
-        #: 「取消选中」 returns to the preview the user came from.
+        #: The colour on screen right now (-1 = none).「取消选中」就是什么都不选，不再
+        #: 退回「上一次看过的颜色」——那看起来像「点这一个却选中了上一次那个」
+        #: （m12426 item 2）。
         self._shown = -1
-        self._preview_history: list[int] = []
         # Set when the library changed while this page was off screen; the
         # re-match is then done in showEvent instead of in setLibrary.
         self._stale = False
@@ -1465,6 +1521,13 @@ class PicturePage(QWidget):
         self._save_project_button = QPushButton("保存工程")
         self._save_project_button.clicked.connect(lambda: self._on_save_project())
 
+        # 「导出原图」：把改过的原图存成 PNG（m12426 item 3）。删除和合并会**同时改原图**
+        # （m02316 item 2），可存下来的只有工程文件里的那份；用户要把这张改过的图拿到
+        # 别处用（继续修图、发给别人），得有个直接存图的出口。它跟 导入/打开/保存 三个
+        # 文件动作排在一起，也不上蓝色 —— 这一页的蓝按钮只有 生成 3MF。
+        self._export_original_button = QPushButton("导出原图")
+        self._export_original_button.clicked.connect(self._on_export_original)
+
         self._colour_count = QSpinBox()
         self._colour_count.setRange(2, MAX_PAINTED_FILAMENTS)
         self._colour_count.setValue(DEFAULT_MAX_COLOURS)
@@ -1490,6 +1553,7 @@ class PicturePage(QWidget):
         top.addWidget(self._import_button)
         top.addWidget(self._open_project_button)
         top.addWidget(self._save_project_button)
+        top.addWidget(self._export_original_button)
         top.addWidget(QLabel("颜色数量:"))
         top.addWidget(self._colour_count)
         top.addWidget(QLabel("耗材上限:"))
@@ -2033,6 +2097,39 @@ class PicturePage(QWidget):
             self.loadImage(Path(name))
         except Exception as error:  # pragma: no cover - the dialog is interactive
             QMessageBox.warning(self, "无法读取图片", str(error))
+
+    def _on_export_original(self) -> None:
+        """把改过的原图存成 PNG（m12426 item 3）。
+
+        删除 / 合并 / 更换颜色都会**同时改原图**（m02316 item 2），可改完的这张图一直
+        只活在工程文件里 —— 用户要拿去继续修图、发给别人，就得有个直接存图的出口。
+        存的就是 ``self._image``：和「原图」面板里画的是同一张，被删掉的地方是透明的
+        （「留空不打印」），alpha 原样保留。
+        """
+        if self._image is None:
+            self._status.setText("先导入一张图片，再导出原图。")
+            return
+        suggested = f"{self._image_name}-原图.png"
+        start = str(
+            (self._project_path.with_name(suggested))
+            if self._project_path
+            else (paths.exports_dir() / suggested)
+        )
+        name, _ = QFileDialog.getSaveFileName(self, "导出原图", start, PNG_FILTER)
+        if not name:
+            return
+        target = Path(name)
+        if target.suffix.lower() != ".png":
+            target = target.with_suffix(".png")
+        try:
+            self._image.save(target)
+        except Exception as error:  # pragma: no cover - the dialog is interactive
+            QMessageBox.warning(self, "导出原图失败", str(error))
+            return
+        self._status.setText(
+            f"已导出原图 {target.name}（{target.parent}）：这张图里已经带着删除和合并的结果，"
+            "删掉的地方是透明的。"
+        )
 
     # -- 工程：存下来，下次接着改 -----------------------------------------
     def _on_open_project(self) -> None:
@@ -2852,14 +2949,11 @@ class PicturePage(QWidget):
     def _select(self, index: int) -> None:
         """Show one colour everywhere it appears: picture, list and detail.
 
-        The colour that was on screen goes on ``_preview_history`` first, which
-        is what 「再点一下取消选中」 steps back through.  块模式下不记这笔账：那里的
-        编号是块，不是颜色，翻回上一块等于换了一块选中（m02316 item 6）。
+        以前这里会把「上一个看过的颜色」记一笔，好让「再点一下取消选中」退回去；m12426
+        item 2 之后取消选中就是**什么都不选**（``_on_colour_deselected``），这笔账不用
+        记了 —— 用户点的是哪一个，屏幕上就只有哪一个。
         """
-        index = int(index)
-        if self._blocks is None and index != self._shown and self._shown >= 0:
-            self._preview_history.append(self._shown)
-        self._show_colour(index)
+        self._show_colour(int(index))
 
     def _show_colour(self, index: int, *, keep_picked: bool = False) -> None:
         """Put ``index`` on screen without touching the preview history.
@@ -2920,24 +3014,17 @@ class PicturePage(QWidget):
         self._select(index)
 
     def _on_colour_deselected(self, index: int) -> None:
-        """Clicking the colour that is already on screen puts it away.
+        """Clicking the thing that is already on screen puts it away (m12426 item 2).
 
-        The preview steps back to whatever it showed before that colour, which
-        is the whole point of keeping the history: the user got here to compare,
-        and losing the comparison would be worse than losing the colour.
-
-        块模式下不退回：那里的编号是块，翻出来的旧编号在新一组块里照样合法，
-        于是「取消选中」看起来像「选中了另一块」，这正是用户报的 m02316 item 6。
-        取消选中就是什么都不选，预览也收起高亮。
+        单选时再点一下已经选中的颜色／色块，意思就是「取消选中」：**什么都不选**，清单里
+        没有选中行，预览里也没有高亮。以前颜色模式下会退回「上一次看过的颜色」，于是看
+        起来像「我点的是这一个，它却选中了上一次那个」—— 正是用户报的那一条。块模式早
+        就是这个规矩（m02316 item 6），现在两种模式一致。
         """
         if self._shown < 0 or int(index) != self._shown:
             return
-        if self._blocks is not None:
-            self._preview_history.clear()
-            self._show_colour(-1)
-            return
-        previous = self._preview_history.pop() if self._preview_history else -1
-        self._show_colour(previous)
+        self._list.clear_selection()
+        self._show_colour(-1)
 
     def _on_region_clicked(self, index: int) -> None:
         """A click in 「预览」 means the same thing as a click on that row.
@@ -3230,11 +3317,9 @@ class PicturePage(QWidget):
         """
         self._result = self._compose()
         self._plate = None
-        # The rows were rebuilt, so the colours the preview history pointed at no
-        # longer mean what they meant; 「取消选中」 starts over from here.
+        # 行都重建过了，屏幕上那个颜色不再有意义：一切从头开始。
         anchor = keep if keep is not None else self._list.current()
         self._shown = -1
-        self._preview_history.clear()
         result = self._result
         if result is None:
             self._blocks = None
@@ -3628,6 +3713,9 @@ class PicturePage(QWidget):
         if self._blocks is not None:
             self._delete_blocks(picked)
             return
+        # 一行一种颜色，可能顶着好几个位子（m12426 item 1）：删的是「这一种颜色」，
+        # 所以它的每一处都要一起删。
+        picked = self._list.expanded(picked)
         originals = [self._live_map[i] for i in picked if 0 <= i < len(self._live_map)]
         if not originals or self._result is None:
             return
@@ -3718,6 +3806,8 @@ class PicturePage(QWidget):
         if self._blocks is not None:
             self._merge_blocks(picked)
             return
+        # 合并说的是「这几行一起变成挑中的那一种」；一行可能顶着好几个位子
+        # （m12426 item 1），它们跟着各自那一行走。
         entries = [self._result.palette[index] for index in picked]
         dialog = MergeDialog(entries, parent=self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -3725,14 +3815,18 @@ class PicturePage(QWidget):
         choice = dialog.chosen()
         if not 0 <= choice < len(picked):
             return
-        target = self._live_map[picked[choice]]
+        chosen = int(picked[choice])
+        picked = self._list.expanded(picked)
+        target = self._live_map[chosen]
         originals = [self._live_map[index] for index in picked]
         self._push()
         # 原图 一起改（m02316 item 2）：合并几种颜色 = 这些像素在源图里并进留下来的那一种，
         # 用的是**它本来的颜色**，不是预览里那卷耗材的打印色 (m01191 item 2)。所以原图的
         # 颜色集合不变、变的只是色块大小，换成别的方案之后它们还是同一种颜色。
         mask = np.isin(np.asarray(self._result.indices), np.asarray(picked, dtype=np.int32))
-        survivor = np.asarray(self._result.indices) == int(picked[choice])
+        # 取色用的是「用户挑中的那一行」——picked 上面已经被展开成一行背后的好几个位子，
+        # 不能拿展开后的随便一个下标当留下来的那一块 (m12426 item 1)。
+        survivor = np.asarray(self._result.indices) == chosen
         colour = self._picture_colour(survivor)
         if colour is not None:
             self._paint_original(mask, colour)
@@ -3840,9 +3934,16 @@ class PicturePage(QWidget):
         chosen = dialog.chosen()
         if chosen is None:
             return
+        # 「更换颜色」说的是这一行这一种颜色，它顶着的每一处都要换（m12426 item 1）。
+        originals = [
+            self._live_map[position]
+            for position in self._list.expanded([index])
+            if 0 <= position < len(self._live_map)
+        ]
         original = self._live_map[index]
         self._push()
-        self._replaced[original] = chosen
+        for slot in originals or [original]:
+            self._replaced[slot] = chosen
         self._apply_edits(keep=original)
         self._mark_plans_stale()
 

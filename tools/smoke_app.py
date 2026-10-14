@@ -2371,6 +2371,48 @@ def main() -> int:
                 "a second Ctrl+Z is back to the clean match",
             )
 
+            # --- m12426 item 1: 一行一种打印色 --------------------------------
+            palette_keys = [entry.key for entry in page._result.palette]
+            distinct = len(set(palette_keys))
+            check(
+                page._list._list.count() == distinct,
+                f"「按颜色选择」一行一种打印色（{page._list._list.count()} 行 / {distinct} 种）",
+            )
+            check(
+                f"共 {distinct} 种颜色" in page._list._summary.text(),
+                f"小结也按打印色计数：{page._list._summary.text()[-14:]}",
+            )
+            if distinct < len(palette_keys):
+                grouped = [
+                    row
+                    for row in range(page._list._list.count())
+                    if "等" in page._list._list.item(row).text()
+                ]
+                check(
+                    bool(grouped),
+                    f"同一个配方的几处合成一行，行里写明「等 N 处」：{grouped}",
+                )
+
+            # --- m12426 item 2: 单选再点一下 = 什么都不选 ---------------------
+            page._list.select([0])
+            app.processEvents()
+            page._select(page._list.selected_indices()[0])
+            app.processEvents()
+            first = page._list._list.item(0)
+            page._list._press_index = int(first.data(Qt.ItemDataRole.UserRole))
+            page._list._press_shown = page._list._pinned
+            page._list._on_row_clicked(first)
+            app.processEvents()
+            check(
+                not page._list.selected_indices() and page._shown < 0,
+                "再点一下已经选中的颜色：什么都不选，不像以前那样退回上一次那个"
+                f"（选中 {page._list.selected_indices()}、_shown {page._shown}）",
+            )
+            check(
+                not page._delete_button.isEnabled() and not page._merge_button.isEnabled(),
+                "一个都没选中时 删除 / 合并 都灰着",
+            )
+
             # 合并: the merge itself, then undo, then the dialog's own plumbing.
             if len(page._result.palette) >= 2:
                 keep_key = page._result.palette[1].key
@@ -2528,6 +2570,39 @@ def main() -> int:
             original_box = _picture_page.QMessageBox
             _picture_page.QMessageBox = _StubMessageBox
             try:
+                # m12426 item 3: 「导出原图」 writes the edited original as a PNG, alpha
+                # included — the picture the 原图 panel draws, not the preview.
+                page._list.clear_selection()
+                original_target = TEMP / "edited-original.png"
+                _picture_page.QFileDialog = _StubChooser(original_target)
+                page._on_export_original()
+                app.processEvents()
+                check(
+                    original_target.is_file() and original_target.stat().st_size > 0,
+                    f"导出原图 wrote {original_target.name}",
+                )
+                from PIL import Image as _Image
+
+                exported = _Image.open(original_target).convert("RGBA")
+                check(
+                    exported.size == page._image.size,
+                    f"导出的原图尺寸和图一致 {exported.size} == {page._image.size}",
+                )
+                check(
+                    "导出原图" in page._status.text(),
+                    f"状态栏说明导出了原图：{page._status.text()[:40]}",
+                )
+                _picture_page.QFileDialog = _StubChooser(TEMP / "no-image.png")
+                saved_image = page._image
+                page._image = None
+                page._on_export_original()
+                app.processEvents()
+                check(
+                    "先导入" in page._status.text(),
+                    f"没有图的时候导出原图会拒绝：{page._status.text()[:24]}",
+                )
+                page._image = saved_image
+                page._refresh_source()
                 for kind, suffix in (("3mf", ".3mf"), ("obj", ".obj")):
                     target = TEMP / f"plate{suffix}"
                     _picture_page.QFileDialog = _StubChooser(target)

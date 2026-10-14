@@ -900,13 +900,16 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     check(page._list.current() == other, "and the list follows the click")
     _click(other)
     check(
-        page._view._selected == block,
-        "clicking the same colour again steps back to the preview before it",
+        page._view._selected == -1 and page._list.current() == -1,
+        "再点一下已经选中的颜色：什么都不选"
+        "（m12426 item 2：以前会退回「上一次那个」，现在不退了）",
     )
-    _click(block)
+    _click(other)
+    check(page._view._selected == other, "一个都没选中时点一下还是正常选中它")
+    _click(other)
     check(
         page._view._selected == -1 and page._list.current() == -1,
-        "with nothing to step back to it simply puts the colour away",
+        "再点一下又收起来：取消选中就是什么都不选，没有「上一次」可退",
     )
     page._select(block)
     app.processEvents()
@@ -1459,6 +1462,36 @@ def run_selftest(*, report_path: Path | None = None) -> int:
             "多选" in page._merge_button.toolTip(),
             "合并 的提示告诉他先开多选",
         )
+        # m12426 item 1：清单一行一种**打印色** —— 同一个配方的几处合成一行（数量对不上
+        # 时行里写「等 N 处」），小结里的「共 N 种颜色」也按打印色数。
+        keys = [entry.key for entry in page._result.palette]
+        check(
+            rows.count() == len(set(keys)),
+            f"「按颜色选择」一行一种打印色（{rows.count()} 行 / {len(set(keys))} 种）",
+        )
+        check(
+            f"共 {len(set(keys))} 种颜色" in page._list._summary.text(),
+            f"小结也按打印色计数：{page._list._summary.text()[-14:]}",
+        )
+        # m12426 item 2：单选时再点一下已经选中的颜色 = 什么都不选（以前会退回上一次那个）。
+        page._list.select([0])
+        app.processEvents()
+        page._select(page._list.selected_indices()[0])
+        app.processEvents()
+        first_row = rows.item(0)
+        page._list._press_index = int(first_row.data(0x0100))
+        page._list._press_shown = page._list._pinned
+        page._list._on_row_clicked(first_row)
+        app.processEvents()
+        check(
+            not page._list.selected_indices() and page._shown < 0,
+            "再点一下已经选中的颜色：什么都不选"
+            f"（选中 {page._list.selected_indices()}、_shown {page._shown}）",
+        )
+        check(
+            not page._delete_button.isEnabled() and not page._merge_button.isEnabled(),
+            "一个都没选中时 删除 / 合并 都灰着",
+        )
 
         menu = build_palette(page.library, page._catalog, include_mixes=True)
         picker = ColourPickerDialog(
@@ -1574,17 +1607,26 @@ def run_selftest(*, report_path: Path | None = None) -> int:
             "clicking a colour never reorders the list",
         )
         check(page._list._row_of(1) == 1, "the clicked colour stays in its own row")
+        # m12426 item 1：一行是一种**打印色**，删一行就把这一行背后的几处一起删掉。
+        doomed_members = page._list.members_of(doomed)
+        doomed_pixels = sum(
+            int((page.result.indices == position).sum()) for position in doomed_members
+        )
         page._list.clear_selection()
         page._list.select([doomed])
         page._on_delete_colours()
         app.processEvents()
         check(doomed in page._deleted, "the deleted colour is remembered as an edit")
         check(
-            len(page.result.palette) == before_colours - 1,
+            set(doomed_members) <= set(page._deleted),
+            f"删掉这一行 = 删掉它的 {len(doomed_members)} 处（m12426 item 1）",
+        )
+        check(
+            len(page.result.palette) == before_colours - len(doomed_members),
             f"deleting one colour leaves {len(page.result.palette)}",
         )
         check(
-            page.result.printed_pixels == before_pixels - doomed_count,
+            page.result.printed_pixels == before_pixels - doomed_pixels,
             "the deleted pixels are the ones that stop being printed",
         )
         check(bool((page.result.indices < 0).any()), "the deleted region is transparent")
@@ -1610,7 +1652,7 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         page._redo()
         app.processEvents()
         check(
-            len(page.result.palette) == before_colours - 1,
+            len(page.result.palette) == before_colours - len(doomed_members),
             "Ctrl+Y deletes it again",
         )
         page._undo()
@@ -1812,8 +1854,10 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         page._undo()
         app.processEvents()
         check(
-            page._list.row_count() == len(page.result.palette),
-            "回到颜色模式：列表又是一行一种颜色",
+            page._list.row_count() == len({entry.key for entry in page.result.palette}),
+            "回到颜色模式：列表又是一行一种打印色（m12426 item 1），"
+            f"got {page._list.row_count()} 行 / "
+            f"{len({entry.key for entry in page.result.palette})} 种",
         )
 
         # 1.6.19 (m01566 item 1)：Del 就是点「删除」。事件直接派给页面／列表，焦点在
@@ -2208,8 +2252,15 @@ def run_selftest(*, report_path: Path | None = None) -> int:
             page._list.select(picked)
             app.processEvents()
             keeper = int(picked[1])
+            # m12426 item 1：一行可能顶着好几个位子，合并的时候它们一起走。
+            expanded = page._list.expanded(picked)
+            folded = [
+                index
+                for index in expanded
+                if index not in page._list.members_of(keeper)
+            ]
             indices = _np.asarray(page.result.indices)
-            touched = _np.isin(indices, _np.asarray(picked, dtype=indices.dtype))
+            touched = _np.isin(indices, _np.asarray(expanded, dtype=indices.dtype))
             colours_before = {
                 tuple(int(value) for value in pixel)
                 for pixel in _np.unique(
@@ -2247,8 +2298,9 @@ def run_selftest(*, report_path: Path | None = None) -> int:
                 f"合并不会让原图多出颜色（多了 {sorted(colours_after - colours_before)}）",
             )
             check(
-                len(page.result.palette) == before_colours - 1,
-                "合并在预览里仍然是少了一种颜色",
+                len(page.result.palette) == before_colours - len(folded),
+                f"合并在预览里少掉 {len(folded)} 种颜色"
+                f"（{before_colours} → {len(page.result.palette)}，m12426 item 1）",
             )
             page._undo()
             app.processEvents()
@@ -2565,6 +2617,39 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         check(three_mf.is_file() and three_mf.stat().st_size > 0, f"3MF written ({three_mf.stat().st_size} B)")
         check(obj.is_file() and obj.stat().st_size > 0, f"OBJ written ({obj.stat().st_size} B)")
         check((scratch / "selftest.mtl").is_file(), "MTL written")
+
+        # m12426 item 3：导出修改后的原图 —— 存下来的就是「原图」面板画的那一张，
+        # 删除留下的透明也一起存（PNG）。
+        saved_dialog = _pp.QFileDialog
+        _pp.QFileDialog = type(
+            "StubSaveDialog",
+            (),
+            {
+                "getSaveFileName": staticmethod(
+                    lambda *args, **kwargs: (str(scratch / "edited-original.png"), "")
+                )
+            },
+        )
+        try:
+            page._on_export_original()
+        finally:
+            _pp.QFileDialog = saved_dialog
+        app.processEvents()
+        exported_original = scratch / "edited-original.png"
+        check(
+            exported_original.is_file() and exported_original.stat().st_size > 0,
+            f"导出原图 written ({exported_original.stat().st_size if exported_original.exists() else 0} B)",
+        )
+        from PIL import Image as _ExportImage  # noqa: PLC0415
+
+        check(
+            _ExportImage.open(exported_original).size == page._image.size,
+            f"导出的原图尺寸和图一致 {_ExportImage.open(exported_original).size} == {page._image.size}",
+        )
+        check(
+            "导出原图" in page._status.text(),
+            f"状态栏说明导出了原图：{page._status.text()[:28]}",
+        )
 
         if zipfile.is_zipfile(three_mf):
             with zipfile.ZipFile(three_mf) as archive:
