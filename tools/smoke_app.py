@@ -2377,6 +2377,12 @@ def main() -> int:
                 page._list.select([0])
                 check(not page._merge_button.isEnabled(), "合并 needs two colours, not one")
                 check(not page._merge_button.isEnabled(), "合并 stays off while 多选 is off")
+                # m12261: 用户以为按钮坏了，其实是没开「多选」—— 这句话得挂在按钮上。
+                check(
+                    "多选" in page._merge_button.toolTip(),
+                    "合并 的提示告诉他先开多选："
+                    + page._merge_button.toolTip(),
+                )
                 page._multi_button.setChecked(True)
                 page._list.select([0, 1])
                 check(page._merge_button.isEnabled(), "合并 lights up with two colours picked")

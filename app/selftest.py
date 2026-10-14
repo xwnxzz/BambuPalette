@@ -1454,6 +1454,11 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         app.processEvents()
         check(page._delete_button.isEnabled(), "a selected colour can be deleted")
         check(not page._merge_button.isEnabled(), "合并 needs two colours, not one")
+        # m12261: 用户按不动 合并，是因为清单默认是单选的 —— 这句提醒挂在按钮上。
+        check(
+            "多选" in page._merge_button.toolTip(),
+            "合并 的提示告诉他先开多选",
+        )
 
         menu = build_palette(page.library, page._catalog, include_mixes=True)
         picker = ColourPickerDialog(

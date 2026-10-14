@@ -210,6 +210,8 @@ PAGE_HELP = (
     "· 单选时再点一下已经选中的那一行／那一块，就取消选中（预览里的高亮一起收掉），不用先点到"
     "别处去。列表里只要一个都没选中（点列表下面的空白处也算），预览里就不会留着任何高亮和描边"
     "（1.6.21 起）。\n"
+    "· 「删除」要选一行、「合并」要选两行（1.6.34 起把这句话也挂在按钮的提示里）：没点「多选」"
+    "的时候清单是单选的，按住 Ctrl 也选不中第二行——先点「多选」，再点第二行，「合并」就会亮。\n"
     "· 「打开工程」之后，「耗材方案」除了文件里存着的那一套，还会把同一批色块的其它卷组搭配"
     "列在下面（1.6.20 起）：文件里只记得住挑中的那一套，别的搭法本来要按「按当前色块重新匹配」"
     "才看得到。当前这一套仍然是文件里那一套，勾还在它上面。\n"
@@ -1601,6 +1603,10 @@ class PicturePage(QWidget):
 
         self._merge_button = QPushButton("合并")
         self._merge_button.clicked.connect(self._on_merge_colours)
+        # 「合并点不动」是能一句话说清的事：Qt 的单选列表里按住 Ctrl 也选不中第二行，
+        # 必须先开「多选」。把这句话挂在按钮上，省得用户以为按钮坏了。
+        self._merge_tip = "合并要把两行一起选中：先点左边的「多选」，再点第二行"
+        self._merge_button.setToolTip(self._merge_tip)
 
         self._replace_button = QPushButton("更换颜色")
         # Deliberately NOT accented, exactly like 删除 / 合并 / 撤销 / 恢复 next to
