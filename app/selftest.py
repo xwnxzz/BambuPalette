@@ -1071,6 +1071,58 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         app.processEvents()
     check(not _overspent(), f"没有一套超过耗材上限 {page._settings().max_spools} ({_overspent()})")
 
+    # m11180 第 2 条：填完颜色以后改色块（删除 / 合并 / 更换颜色），方案行里的数字是上一次
+    # 匹配算出来的，不会自己跟着走 —— 用户截图里「共 2 种颜色」配「差块 9」就是这么来的
+    # （差块按图片的颜色数算，两种颜色最多两个差块）。行不改数字（不替用户重挑卷），但
+    # 必须标出来，并把「按当前色块重新匹配」指出来。
+
+
+    def _row_numbers(index: int) -> str:
+        row = page._plan_rows_layout.itemAt(index).widget()
+        return " ".join(
+            child.text() for child in row.findChildren(_QLabel) if "平均" in child.text()
+        )
+
+    stale_colours = len(page._result.palette)
+    stale_rows = len(page._plans)
+    check(not page._plans_stale, "刚匹配完的方案表是新鲜的")
+    if stale_rows and stale_colours > 1:
+        page._list.select([0])
+        page._on_delete_colours()
+        app.processEvents()
+        check(len(page._result.palette) < stale_colours, "删掉一种颜色之后调色板少了")
+        check(page._plans_stale, "删掉一种颜色之后方案表被标成「改过了」")
+        check(
+            len(page._plans) == stale_rows and "色块改过了" in _row_numbers(0),
+            f"行没被偷偷换掉，但写明了数字是改之前的：{_row_numbers(0)!r}",
+        )
+        check(
+            "按当前色块重新匹配" in page._plan_group.button(0).toolTip(),
+            "行上的提示里说清按哪个按钮重算",
+        )
+        page._on_rematch_blocks()
+        app.processEvents()
+        check(not page._plans_stale, "按下「按当前色块重新匹配」之后标记清掉了")
+        check(
+            all(option.defects <= len(page._result.palette) for option in page._plans),
+            "重算之后每一行的差块都在图片颜色数之内："
+            f"{[(option.key, option.defects) for option in page._plans]}",
+        )
+        check(
+            "色块改过了" not in _row_numbers(0),
+            f"重算之后行上不再挂标记：{_row_numbers(0)!r}",
+        )
+        page._undo()
+        app.processEvents()
+        check(len(page._plans) == stale_rows, f"撤销把方案表放回去了（{len(page._plans)} 行）")
+        # 再退一步，把「删除一种颜色」也退掉，后面的检查还在原来那张图上跑。
+        page._undo()
+        app.processEvents()
+        check(
+            len(page._result.palette) == stale_colours and not page._plans_stale,
+            "撤销回到改色块之前，调色板和方案表都回到原样",
+        )
+
     check(len(page._plans) >= 2, f"图片装不下时不只一套可选（{len(page._plans)} 套）")
     if len(page._plans) >= 2:
         chosen = page._plans[1]

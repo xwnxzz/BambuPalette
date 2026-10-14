@@ -2446,6 +2446,67 @@ def main() -> int:
                 "undo refills the palette after deleting everything",
             )
 
+            # m11180 item 2: 改完颜色，方案表必须说清「这几个数字是改之前的」。
+            # 删除 / 合并 / 更换颜色 只改「图上有什么颜色」，而行里的 平均 / 最差 /
+            # 差块 是上一次匹配算出来的：用户删到只剩两种颜色，「差块 9」还挂在行上
+            # （差块是按图片的颜色数算的，两种颜色最多两个差块）。行不改数字（不替用户
+            # 重挑卷），但要标出来，并把「按当前色块重新匹配」指给他。
+            stale_colours = len(page._result.palette)
+            stale_rows = len(page._plans)
+            check(stale_rows > 0, f"样图给出了可以检查的方案行，got {stale_rows}")
+            check(not page._plans_stale, "刚匹配完的方案表是新鲜的")
+            page._list.select([0])
+            page._on_delete_colours()
+            app.processEvents()
+            check(
+                len(page._result.palette) < stale_colours,
+                "删掉一种颜色之后调色板确实少了",
+            )
+            check(page._plans_stale, "删掉一种颜色之后方案表被标成「改过了」")
+            check(
+                len(page._plans) == stale_rows,
+                f"标出来而不是偷偷换掉行：行数没变，got {len(page._plans)}",
+            )
+            page._refresh_plans()
+            stale_labels = [
+                label.text()
+                for label in page._plan_rows_layout.itemAt(0)
+                .widget()
+                .findChildren(_picture_page.QLabel)
+                if "平均" in label.text()
+            ]
+            stale_row_text = stale_labels[0] if stale_labels else ""
+            stale_tip = page._plan_group.button(0).toolTip()
+            check(
+                "色块改过了" in stale_row_text,
+                f"第一行写着「色块改过了」：{stale_row_text}",
+            )
+            check(
+                "按当前色块重新匹配" in stale_tip,
+                f"提示里告诉他按哪个按钮重算：{stale_tip}",
+            )
+            page._on_rematch_blocks()
+            app.processEvents()
+            check(not page._plans_stale, "按下「按当前色块重新匹配」之后标记清掉了")
+            check(
+                all(option.defects <= len(page._result.palette) for option in page._plans),
+                "重算之后每一行的差块都在图片颜色数之内："
+                f"{[(option.key, option.defects) for option in page._plans]}",
+            )
+            page._undo()
+            app.processEvents()
+            check(
+                len(page._plans) == stale_rows,
+                f"撤销把方案表也放回去了，got {len(page._plans)} 行",
+            )
+            # 再退一步：把「删掉一种颜色」也退掉，后面的检查要在原来的图上跑。
+            page._undo()
+            app.processEvents()
+            check(
+                len(page._result.palette) == stale_colours and not page._plans_stale,
+                "撤销回到改色块之前，调色板和方案表都回到原样",
+            )
+
             # Exercise the two export buttons, with the file chooser stubbed out.
             original_dialog = _picture_page.QFileDialog
             original_box = _picture_page.QMessageBox

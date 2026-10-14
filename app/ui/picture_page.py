@@ -1661,6 +1661,11 @@ class PicturePage(QWidget):
         # comparison happens on screen instead of inside the program's head, which
         # is exactly what the old single-answer 「重新匹配」 hid.
         self._plans: list[BudgetOption] = []
+        # 方案表里的数字是「上一次匹配」算出来的；删掉 / 合并 / 换掉颜色之后，图上的
+        # 颜色就不再是那一份，行上的 差块 甚至会超过现在的颜色数（m11180 第 5 条）。
+        # 这里只记「改过了」，重算交给「按当前色块重新匹配」——不自动重挑卷，是刻意
+        # 保守：同一套方案是用户挑出来的，不能让程序背着他换（m01411 第 1 条）。
+        self._plans_stale = False
         self._plan_key = ""
         self._plan_group = QButtonGroup(self)
         self._plan_group.setExclusive(True)
@@ -1928,6 +1933,7 @@ class PicturePage(QWidget):
         # undoing past an import would paint the old match over this one.
         self._base = None
         self._plans = []
+        self._plans_stale = False
         self._plan_key = None
         self._deleted = set()
         self._merged = {}
@@ -2090,6 +2096,8 @@ class PicturePage(QWidget):
             from_file=True,
         )
         self._plans = [saved]
+        # 文件里的方案是照文件里那张图算的，两边一致，所以不算「改过了」。
+        self._plans_stale = False
         self._plan_key = state.plan
         # 色块级的改动（哪几块被删掉 / 合并 / 换成了什么）跟删除、合并、更换一起存，
         # 打开工程要把它们摆回同样的顺序，预览才是保存时的那张 (m02366 item 3).
@@ -2355,6 +2363,7 @@ class PicturePage(QWidget):
         # clearing them first is what keeps 「耗材方案」 from showing a choice that
         # is no longer the one being made.
         self._plans = []
+        self._plans_stale = False
         self._refresh_plans("正在重新匹配，马上列出几套耗材搭配。")
         self._begin_match()
         try:
@@ -2468,6 +2477,8 @@ class PicturePage(QWidget):
         if not extra:
             return
         self._plans = [saved, *extra]
+        # 这一份 = 文件里那套 + 照现在这张图现算的几套，都对着现在的色块。
+        self._plans_stale = False
         self._plan_key = saved.key
         self._refresh_plans()
 
@@ -2526,6 +2537,7 @@ class PicturePage(QWidget):
         if self._base is not None:
             self._push()
         self._plans = options
+        self._plans_stale = False
         self._plan_key = options[0].key
         self._base = options[0].result
         self._deleted = set()
@@ -2555,6 +2567,22 @@ class PicturePage(QWidget):
 
         只重画，不重算：真正的搭配要按下 「重新匹配」 才换（m09456 item 4）。
         """
+        if self._plans:
+            self._refresh_plans()
+
+    def _mark_plans_stale(self) -> None:
+        """色块刚被改过：方案表里的数字不是这张图的了，标一下（不重算）。
+
+        删除 / 合并 / 更换颜色 改的是图上有什么颜色，可是方案行还是上一次匹配算出来
+        的那一份：用户删到只剩两种颜色，「差块 9」还挂在行上（差块是按图片的颜色数算
+        的，两种颜色最多两个差块）——「颜色匹配还没改好」有很大一部分就是这个（m11180）。
+
+        为什么只标记不重算：重算＝照现在的色块重新挑卷，等于替用户按了「按当前色块重
+        新匹配」。用户按那个按钮、不满意、又回不去的那次投诉（m01411 第 1 条）之后，
+        「换方案」只发生在用户自己按按钮的时候。这里和「超过现在的上限（N 卷）」一样，
+        把话说清楚，把按钮指给他。
+        """
+        self._plans_stale = True
         if self._plans:
             self._refresh_plans()
 
@@ -2612,6 +2640,16 @@ class PicturePage(QWidget):
                 # 这一行是上一次匹配（上限还是别的数）算出来的，现在装了会超。
                 numbers.setText(numbers.text() + f" · 超过现在的上限（{cap} 卷），按「重新匹配」重算")
                 button.setEnabled(False)
+            elif self._plans_stale:
+                # m11180：这一行是改色块之前算的 —— 数字留着（那是当时那一套的事实），
+                # 但要说清它没跟着改。右栏不宽，行尾只写最短的一句，怎么重算放在提示里。
+                numbers.setText(numbers.text() + " · 色块改过了，数字是改之前的")
+                button.setToolTip(
+                    option.note
+                    + "　这行是改色块之前算的：删掉 / 合并 / 更换颜色 之后，图上的颜色"
+                    "换了，这几个数字（尤其「差块」）还是旧的。按工具条上的"
+                    "「按当前色块重新匹配」，会把搭配照现在的色块重算一遍。"
+                )
             line.addWidget(button)
             line.addWidget(numbers)
             line.addWidget(self._plan_swatches(option))
@@ -3008,6 +3046,7 @@ class PicturePage(QWidget):
             self._mode,
             self._image,
             self._original_edited,
+            self._plans_stale,
         )
 
     def _restore(self, snapshot: tuple) -> None:
@@ -3022,6 +3061,7 @@ class PicturePage(QWidget):
             mode,
             image,
             original_edited,
+            plans_stale,
         ) = snapshot
         self._deleted = set(deleted)
         self._merged = dict(merged)
@@ -3033,6 +3073,8 @@ class PicturePage(QWidget):
         self._mode = mode
         self._image = image
         self._original_edited = bool(original_edited)
+        # 撤销回到「改色块之前」，那一行也就重新变回准的了（m11180）。
+        self._plans_stale = bool(plans_stale)
         # 原图 has to catch up before ``_apply_edits`` hands the views a backdrop.
         self._refresh_source()
 
@@ -3541,6 +3583,7 @@ class PicturePage(QWidget):
         self._block_edits.append(BlockPaint(mask=mask, entry=None, labels=tuple(sorted(labels))))
         # 逐块交回去，删除之后选中的就是「删掉的那几块留下的那几块」(m02316 item 4).
         self._apply_edits(reselect=masks)
+        self._mark_plans_stale()
         self._status.setText(
             f"已删除 {len(masks)} 块：这些地方留空、变成透明，不打印也没有底板；"
             "「原图」同样改掉了，所以重新匹配也不会再填回来。Ctrl+Z 可以撤销。"
@@ -3589,6 +3632,7 @@ class PicturePage(QWidget):
         self._paint_original(mask, None)
         self._deleted.update(originals)
         self._apply_edits()
+        self._mark_plans_stale()
         self._status.setText(
             f"已删除 {len(originals)} 种颜色：这些地方留空、变成透明，"
             "不打印也没有底板；「原图」同样改掉了。Ctrl+Z 可以撤销。"
@@ -3654,6 +3698,7 @@ class PicturePage(QWidget):
                 )
         # 逐块交回去：并掉的那几块现在是一块，选中的就是它 (m02316 item 4).
         self._apply_edits(reselect=masks)
+        self._mark_plans_stale()
         self._status.setText(
             f"已把选中的 {len(masks)} 块都换成 {target.color_hex}，"
             "这些地方整块都用它打印；「原图」里它们也并成了留下来的那一块，"
@@ -3689,6 +3734,7 @@ class PicturePage(QWidget):
             if original != target:
                 self._merged[original] = target
         self._apply_edits(keep=target)
+        self._mark_plans_stale()
         self._status.setText(
             f"已把 {len(originals)} 种颜色合并成 {entries[choice].color_hex}，"
             "整块区域都用它打印；「原图」里这些地方也并进了留下来的那一块，"
@@ -3760,6 +3806,7 @@ class PicturePage(QWidget):
                 )
         # 逐块交回去：换了一块就只该选中那一块 (m02316 item 4).
         self._apply_edits(reselect=masks or mask)
+        self._mark_plans_stale()
         self._status.setText(
             f"已把选中的 {len(labels)} 块换成 {chosen.color_hex}。Ctrl+Z 可以撤销。"
         )
@@ -3791,6 +3838,7 @@ class PicturePage(QWidget):
         self._push()
         self._replaced[original] = chosen
         self._apply_edits(keep=original)
+        self._mark_plans_stale()
 
     def _on_actions_changed(self) -> None:
         if self._result is not None:
