@@ -1470,6 +1470,10 @@ class PicturePage(QWidget):
         self._spool_cap = QSpinBox()
         self._spool_cap.setRange(0, MAX_PAINTED_FILAMENTS)
         self._spool_cap.setValue(DEFAULT_SPOOL_CAP)
+        # m09456 item 4 (1.6.28): 上限改了以后，手上那几行可能已经超过新的上限 —— 用户
+        # 截图里就出现过「耗材上限 4」而方案行写着「用 9 卷」。当场把超限的行标出来，不等
+        # 「重新匹配」（那一次要 1.3–3.0 s，不适合挂在数字框上）。
+        self._spool_cap.valueChanged.connect(self._on_spool_cap_changed)
 
         self._max_dimension = QSpinBox()
         self._max_dimension.setRange(32, 4096)
@@ -2545,6 +2549,14 @@ class PicturePage(QWidget):
         self._announce_edits()
 
     # -- 耗材方案：同一张图，几套搭配，用户自己挑 ---------------------------
+    def _on_spool_cap_changed(self, *_) -> None:
+        """上限一改，旧的那几行就不一定是合法搭配了，当场重画一边记号。
+
+        只重画，不重算：真正的搭配要按下 「重新匹配」 才换（m09456 item 4）。
+        """
+        if self._plans:
+            self._refresh_plans()
+
     def _refresh_plans(self, placeholder: str = "") -> None:
         """Draw one radio row per 方案 and the line that explains the picked one.
 
@@ -2566,6 +2578,8 @@ class PicturePage(QWidget):
             return
         for index, option in enumerate(self._plans):
             average, worst = option.fidelity
+            cap = self._spool_cap.value()
+            over = bool(cap) and len(option.spools) > cap
             row = QWidget()
             line = QHBoxLayout(row)
             line.setContentsMargins(0, 0, 0, 0)
@@ -2583,6 +2597,10 @@ class PicturePage(QWidget):
                 "「差块」= 图片里有几种颜色打出来偏差超过 ΔE00 5（按图片自己的颜色数算），"
                 "越少越不容易一眼看出偏差。"
             )
+            if over:
+                # 这一行是上一次匹配（上限还是别的数）算出来的，现在装了会超。
+                numbers.setText(numbers.text() + f" · 超过现在的上限（{cap} 卷），按「重新匹配」重算")
+                button.setEnabled(False)
             line.addWidget(button)
             line.addWidget(numbers)
             line.addWidget(self._plan_swatches(option))

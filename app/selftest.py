@@ -318,21 +318,20 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     add_dialog = FilamentDialog(
         None, [f.brand for f in window.library.filaments], [], window
     )
-    check(not add_dialog._color.isSet(), "添加耗材 starts with NO preset colour")
-    # m01647 item 1 (「不要预设颜色」): nothing may stand in for the colour the user
-    # has not chosen.  The three spins used to read 0,0,0 and 确认 accepted that as
-    # black, so a spool could be created in a colour nobody picked.
+    check(add_dialog._color.isSet(), "添加耗材 opens on a colour (m09456 第 1 条)")
+    # m09456 第 1 条 (1.6.28)：用户要的就是反过来 —— 打开就写 0,0,0，直接能确认。
+    # （m01647 当年要的是「不要预设颜色」；1.6.28 按用户的新要求改回来。）
     check(
-        add_dialog.values()["color_hex"] == "",
-        f"an untouched dialog carries no colour, got {add_dialog.values()['color_hex']!r}",
+        add_dialog.values()["color_hex"] == "#000000",
+        f"添加耗材 opens on 0, 0, 0 (m09456 第 1 条), got {add_dialog.values()['color_hex']!r}",
     )
     check(
-        not add_dialog._ok_button.isEnabled(),
-        "确认 is grey until a colour is given",
+        add_dialog._ok_button.isEnabled(),
+        "确认 is usable before anything is touched",
     )
     check(
-        not add_dialog._next_button.isEnabled(),
-        "下一个 is grey until a colour is given",
+        add_dialog._next_button.isEnabled(),
+        "下一个 is usable before anything is touched",
     )
     check(
         add_dialog._name.placeholderText() == "",
@@ -393,6 +392,23 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     field._hex.setText("nonsense")
     field._on_hex_edited()
     check(field.hex() == "#C80000", "gibberish leaves the last good colour alone")
+
+    # m09456 第 1 条 (1.6.28): 数字框里直接敲 0 —— 值本来就在最小值 0 上，valueChanged
+    # 不响，只有 lineEdit 的 textEdited 接得住。
+    zeroes = swatch_module.ColorField(None)
+    zeroes._spins[0].lineEdit().textEdited.emit("0")
+    check(
+        zeroes.isSet() and zeroes.hex() == "#000000",
+        f"typing 0 into a channel commits black (m09456 第 1 条), got {zeroes.hex()!r}",
+    )
+    # 新耗材默认就是 0,0,0（同一条），打开即可确认。
+    fresh_dialog = FilamentDialog(None, [], [], window)
+    check(
+        fresh_dialog._color.isSet() and fresh_dialog.values()["color_hex"] == "#000000",
+        f"添加耗材 starts on 0, 0, 0 (m09456 第 1 条), got {fresh_dialog.values()['color_hex']!r}",
+    )
+    check(fresh_dialog._ok_button.isEnabled(), "a new spool can be confirmed straight away")
+    fresh_dialog.close()
 
     # Deleting a spool asks nothing: it just goes.
     check(
@@ -509,14 +525,22 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         "切换后 PETG 的颜色一个都不在格子里",
     )
     check({"#2C2A2C", "#FF6C2B"} <= _grid_hexes(), "PLA 的两卷本色都在格子里")
-    spilled = [
-        material_window._list.item(index).text()
-        for index in range(2)
-        if "现在不配色" not in material_window._list.item(index).text()
-    ]
+    listed = [material_window._list.item(index).text() for index in range(material_window._list.count())]
+    wanted_rows = sum(1 for filament in material_window.library if material_window.library.accepts(filament))
     check(
-        not spilled,
-        f"别的材质的卷还列在库里、只是标着「现在不配色」（{spilled}）",
+        material_window._list.count() == wanted_rows and not any("#F5D2B8" in row for row in listed),
+        f"我的耗材只列现在这种材质（m09456 第 2 条）：{material_window._list.count()} 行 / 应有 {wanted_rows} 行",
+    )
+    spacey = Filament(name="E-空格", brand="b", material_type=" PLA ", color_hex="#FFFFFF")
+    check(
+        material_window.library.accepts(spacey),
+        "耗材种类末尾多一个空格也算同一种材质",
+    )
+    material_window._list.setCurrentRow(0)
+    app.processEvents()
+    check(
+        not hasattr(material_window, "_spell_out") and "#F5D2B8 · " not in material_window._status.text(),
+        f"点耗材不再把它一行写在底栏（m09456 第 3 条）：{material_window._status.text()[:40]!r}",
     )
     check(
         material_window.library.hidden_count == 0,
@@ -946,6 +970,29 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         all(option.title and option.note and option.spools for option in page._plans),
         "每套都写清楚它是什么、代价是什么、用哪几卷",
     )
+    # m09456 第 4 条 (1.6.28)：上限改小以后，手上那几行可能已经装不下了 —— 用户截图里
+    # 出现过「耗材上限 4」而方案行写着「用 9 卷」。当场把超限的行标出来，不必等重新匹配。
+    widest = max(len(option.spools) for option in page._plans)
+    if widest >= 2:
+        page._spool_cap.setValue(widest - 1)
+        app.processEvents()
+        marked = []
+        for index, option in enumerate(page._plans):
+            if len(option.spools) <= widest - 1:
+                continue
+            row = page._plan_rows_layout.itemAt(index).widget()
+            numbers = " ".join(child.text() for child in row.findChildren(_QLabel))
+            marked.append((numbers, page._plan_group.button(index)))
+        check(
+            bool(marked)
+            and all(
+                button is not None and not button.isEnabled() and "超过现在的上限" in numbers
+                for numbers, button in marked
+            ),
+            f"耗材上限改成 {widest - 1} 卷后，用 {widest} 卷的那一行当场被标成超限",
+        )
+        page._spool_cap.setValue(_DEFAULT_SPOOL_CAP)
+        app.processEvents()
     check(not _overspent(), f"没有一套超过耗材上限 {page._settings().max_spools} ({_overspent()})")
 
     check(len(page._plans) >= 2, f"图片装不下时不只一套可选（{len(page._plans)} 套）")

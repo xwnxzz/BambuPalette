@@ -281,7 +281,10 @@ class FilamentLibrary:
         """
         if not self._material:
             return True
-        return filament.material_type.casefold() == self._material.casefold()
+        # 两边都 strip 再比（m09456 item 2）：库里一条「PLA Basic 」多一个空格，
+        # 按名字比较就会把它判成另一种材质 —— 行上却仍然印着「PLA Basic」，
+        # 用户看到的是「明明同一个材质，它却说不配色」。
+        return (filament.material_type or "").strip().casefold() == self._material.casefold()
 
     @property
     def visible(self) -> list[Filament]:

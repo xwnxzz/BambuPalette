@@ -1185,45 +1185,43 @@ def main() -> int:
     from app.ui.filament_dialog import FilamentDialog  # noqa: E402
 
     add_dialog = FilamentDialog(None, [f.brand for f in library.filaments], [], window)
-    check(not add_dialog._color.isSet(), "添加耗材 starts with NO preset colour")
-    # m01647 item 1 (「不要预设颜色」): an untouched dialog means NO colour at all.
-    # It used to mean black — the three spins read 0,0,0, so pressing 确认 gave the
-    # user a black spool they never chose, and the hint advertised that default.
+    # m09456 item 1 (1.6.28): 用户要的就是反过来 —— 打开就写着 0,0,0，直接能确认。
+    # （m01647 item 1 当年要的是「不要预设颜色」，1.6.28 按用户的新要求改回来。）
+    check(add_dialog._color.isSet(), "添加耗材 opens on a colour")
     check(
-        add_dialog.values()["color_hex"] == "",
-        f"an untouched dialog carries no colour, got {add_dialog.values()['color_hex']!r}",
+        add_dialog.values()["color_hex"] == "#000000",
+        f"a fresh dialog starts on black, got {add_dialog.values()['color_hex']!r}",
+    )
+    check(add_dialog._ok_button.isEnabled(), "确认 is usable straight away")
+    check(add_dialog._next_button.isEnabled(), "下一个 is usable straight away")
+    check(
+        [spin.text() for spin in add_dialog._color.findChildren(QSpinBox)] == ["0", "0", "0"],
+        "the RGB boxes show the default 0, 0, 0",
+    )
+    # 数字框里直接敲 0：值就停在最小值上，valueChanged 不响，只有 textEdited 能接住。
+    three = add_dialog._color._spins[0].lineEdit()
+    three.setText("0")
+    three.textEdited.emit("0")
+    check(
+        add_dialog._color.hex() == "#000000",
+        f"typing 0 into a channel keeps black (m09456 第 1 条), got {add_dialog._color.hex()!r}",
     )
     check(
-        not add_dialog._ok_button.isEnabled(),
-        "确认 is grey until the user gives a colour",
-    )
-    check(
-        not add_dialog._next_button.isEnabled(),
-        "下一个 is grey until the user gives a colour",
-    )
-    check(
-        "0, 0, 0" not in add_dialog._hint.text(),
-        f"the hint no longer advertises a default colour, got {add_dialog._hint.text()!r}",
-    )
-    # The spins show blank while nothing is set, so 0/0/0 cannot read as a preset.
-    from PySide6.QtWidgets import QSpinBox as _Spin
-
-    check(
-        [spin.text() for spin in add_dialog._color.findChildren(_Spin)] == [" ", " ", " "],
-        "the RGB boxes show blanks before the user touches them",
+        "0, 0, 0" in add_dialog._hint.text() or "L*" in add_dialog._hint.text(),
+        f"the hint describes the colour that will be saved, got {add_dialog._hint.text()!r}",
     )
     add_dialog._color.setValue("#C8342E")
     check(add_dialog._ok_button.isEnabled(), "确认 comes alive once the user enters a colour")
     check(add_dialog._next_button.isEnabled(), "下一个 comes alive too")
     check(add_dialog.values()["color_hex"] == "#C8342E", "the typed colour is what the spool gets")
     check(
-        [spin.text() for spin in add_dialog._color.findChildren(_Spin)] == ["200", "52", "46"],
+        [spin.text() for spin in add_dialog._color.findChildren(QSpinBox)] == ["200", "52", "46"],
         "the RGB boxes show the chosen colour",
     )
     # A colour whose channels are 0 must still print "0", not a blank.
     add_dialog._color.setValue("#000000")
     check(
-        [spin.text() for spin in add_dialog._color.findChildren(_Spin)] == ["0", "0", "0"],
+        [spin.text() for spin in add_dialog._color.findChildren(QSpinBox)] == ["0", "0", "0"],
         "pure black still shows 0 in every channel",
     )
     add_dialog._color.setValue("#C8342E")
@@ -1359,8 +1357,26 @@ def main() -> int:
         not ({"#F5D2B8", "#C52A36"} & pla_hexes) and {"#2C2A2C", "#FF6C2B"} <= pla_hexes,
         f"every PETG colour left the grid and PLA's arrived, got {sorted(pla_hexes)[:4]}",
     )
-    stray = [row for row in (material_window._list.item(i).text() for i in range(2)) if "现在不配色" not in row]
-    check(not stray, f"the other material's spools stay listed, greyed out ({stray})")
+    rows = [material_window._list.item(i).text() for i in range(material_window._list.count())]
+    expected_rows = sum(1 for filament in material_window.library if material_window.library.accepts(filament))
+    check(
+        material_window._list.count() == expected_rows,
+        f"我的耗材 lists only the material in force, got {material_window._list.count()} rows",
+    )
+    check(
+        all("现在不配色" not in row for row in rows) and not any("#F5D2B8" in row for row in rows),
+        f"the other material's spools leave the list entirely (m09456 第 2 条), got {rows}",
+    )
+    check(
+        material_window.library.accepts(Filament(name="E-", brand="b", material_type=" PLA ", color_hex="#FFFFFF")),
+        "a trailing space in 耗材种类 does not hide the spool",
+    )
+    material_window._list.setCurrentRow(0)
+    app.processEvents()
+    check(
+        not hasattr(material_window, "_spell_out") and "#F5D2B8 · " not in material_window._status.text(),
+        f"picking a spool no longer spells it out on the bottom line (m09456 第 3 条), got {material_window._status.text()[:60]!r}",
+    )
     check(
         material_window.library.hidden_count == 0,
         "switching 材质 never hides a spool (hiding is the user's own act)",
@@ -1489,6 +1505,30 @@ def main() -> int:
         pending.isSet() and pending.hex() == "#123456",
         f"commitPending() reads the typed text without waiting for focus loss, got {pending.hex()!r}",
     )
+
+    # m09456 item 1 (1.6.28): 数字框里直接敲 0 —— 值本来就停在最小值 0 上，valueChanged 一点
+    # 动静都没有，用户看到的就是「0 打不进去」。
+    zeros = ColorField(None)
+    zeros._spins[0].lineEdit().textEdited.emit("0")
+    check(
+        zeros.isSet() and zeros.hex() == "#000000",
+        f"typing 0 into a channel commits black, got {zeros.hex()!r}",
+    )
+    zeros._spins[1].setValue(0)
+    second = zeros._spins[1].lineEdit()
+    second.setText("0")
+    second.textEdited.emit("0")
+    check(zeros.hex() == "#000000", "typing the value a channel already has still commits")
+
+    from app.ui.filament_dialog import FilamentDialog  # noqa: E402
+
+    fresh = FilamentDialog(None)
+    check(
+        fresh._color.isSet() and fresh._color.hex() == "#000000",
+        f"a new spool starts on black, got {fresh._color.hex()!r}",
+    )
+    check(fresh._ok_button.isEnabled(), "a new spool already has a usable 确认")
+    fresh.close()
 
     # --- nearest match --------------------------------------------------------
     nearest = window.nearest_recipe("#982C29")

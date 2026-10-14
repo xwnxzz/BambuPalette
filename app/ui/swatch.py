@@ -192,6 +192,13 @@ class ColorField(QWidget):
             spin.setMinimumWidth(spin_width)
             spin.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             spin.valueChanged.connect(self._on_spin)
+            # 敲在输入框里的每一次都算「用户要这个数字」（m09456 item 1）。只靠
+            # ``valueChanged`` 会漏掉最要紧的一击：未选择时最小值那里显示的是空白
+            # （specialValueText " "），用户为纯黑打「0」，数字从 0 到 0 没变，
+            # 信号不响，程序一点反应都没有——他看到的正是「直接输入 0 输不进去」。
+            line_edit = spin.lineEdit()
+            if line_edit is not None:
+                line_edit.textEdited.connect(self._on_spin_typed)
             self._spin_labels.append(label)
             self._spins.append(spin)
 
@@ -337,6 +344,17 @@ class ColorField(QWidget):
             return
         r, g, b = (spin.value() for spin in self._spins)
         self._set(QColor(r, g, b), announce=True)
+
+    def _on_spin_typed(self, text: str) -> None:
+        """输入框里敲了字：数字就算没变也当作「用户要这个颜色」。
+
+        ``valueChanged`` 只报数字本身的变化，打 0 打到最小值上一点动静都没有。
+        这里补上那一击；真正的取值仍然只有 ``_on_spin`` 一处，免得两条路各读一半
+        （空框当作没敲，否则清空输入框会顺手提交一个 0 号颜色）。
+        """
+        if not text.strip():
+            return
+        self._on_spin()
 
 
 def _normalise_hex(text: str) -> str:

@@ -114,7 +114,11 @@ class FilamentDialog(QDialog):
             self._note.setText(filament.note)
             self._apply_color(filament.color_hex)
         else:
-            self._apply_color(None)
+            # 新耗材默认 0, 0, 0（m09456 item 1）：用户要的就是这一条。原来的
+            # 「一个颜色都不预设」让三个数字框显示空白、确认按钮发灰，而想填黑色的
+            # 人第一件事就是打 0 —— 那时值没变、信号不响，看着像「输不进去」。
+            # 现在对话框一打开就是纯黑，三个框显示 0，确认按钮直接可用。
+            self._apply_color("#000000")
 
     # -- colour plumbing ---------------------------------------------------------
     def _apply_color(self, value) -> None:
@@ -127,29 +131,26 @@ class FilamentDialog(QDialog):
         self._update_hint()
 
     def _resolved_hex(self) -> str:
-        """The colour this dialog means right now — and nothing when none was given.
+        """The colour this dialog means right now.
 
-        There used to be a fallback: with the hex box untouched, the three spin
-        boxes (0 / 0 / 0) were read as the answer, so a spool could be saved
-        without the user ever choosing a colour, and it was black.  That is a
-        preset colour nobody asked for.  The hex box is now the only source:
-        ``ColorField`` fills it as soon as the user types a hex value, picks a
-        suggested one or touches any spin box, and leaves it empty otherwise.
+        新耗材一打开就是 ``#000000``（m09456 item 1），编辑时是这卷料原来的颜色，
+        所以这里读到的永远是用户看得见的那个值。曾经有过一段「什么都不预设」的
+        时间：hex 框空白、三个数字框空白，用户想填黑色打 0 却因为数字没变而没有
+        任何反应；1.6.27 的 ``commitPending`` 又补上了「打完 hex 直接点确认」那条
+        路（焦点还留在输入框里、值还没提交，确认按钮是灰的，灰按钮不接焦点，点击
+        也不会让输入框失焦）。
 
-        ``commitPending`` first (1.6.27): 打完 ``#RRGGBB`` 直接点「确认」时焦点还
-        留在输入框里，值没提交，确认按钮于是还是灰的——灰按钮不接焦点，点击也
-        不会让输入框失焦，就永远卡在那里（用户报的「输入不进去」）。读之前先把
-        输入框里的完整颜色收进来。
+        ``commitPending`` 先跑：读之前先把输入框里的完整颜色收进来。
         """
         self._color.commitPending()
         return self._color.hex()
 
     def _update_hint(self) -> None:
-        """Say what is still missing, and keep 确认 shut until nothing is.
+        """Say what the colour is, and keep 确认 shut until there is one.
 
-        The dialog must not be able to produce a spool with a colour the user
-        never chose, so both save buttons stay grey until ``_resolved_hex()``
-        has something to return.
+        新耗材默认 ``#000000``（m09456 item 1），所以两个保存按钮一打开就是可用的；
+        编辑时也一样。灰按钮只留给「用户把颜色清空了」这一种情况——那时确实没有
+        颜色可存。
         """
         if not self._color.isSet():
             self._hint.setText("请填写颜色：可以直接输入 #RRGGBB，也可以填 R / G / B 三个数字。")

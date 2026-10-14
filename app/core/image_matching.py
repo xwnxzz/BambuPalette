@@ -2390,7 +2390,7 @@ _PLAN_SPECS: tuple[tuple[str, str, str, BudgetObjective, int], ...] = (
     (
         "priority",
         "大色差色块优先",
-        "先把差得最明显的色块认出来，耗材上限优先用满，再用剩下的把整张图拉近。",
+        "先把差得最明显的色块认出来，再让每个色块拿到不同的颜色，耗材上限优先用满，剩下的拉近整张图。",
         _objective_priority,
         5,
     ),
@@ -2487,10 +2487,14 @@ def _ranked_plans(
 
     The sort key is :func:`_fidelity_values` — the same measurement
     :func:`match_fidelity_report` turns into 「平均 / 最差 / 差块」 — so the row on
-    top really is the best one under the name it carries.  A plan that prints the
-    same picture with more rolls wins the tie: 「选择耗材时优先用满耗材上限」
-    (m06704 第 3 条) says the cap is there to be spent, so of two ways that print
-    the same colours the one that uses more of the allowance is the answer.
+    top really is the best one under the name it carries.
+
+    两张票插在最差那块和其余数字之间，照着用户给的顺序排（m09456 第 4 条）：
+    ①先认出大色差色块；②再让每个色块拿到**不同的**颜色（同一个最差值下，印出来
+    的颜色种类越多越好 —— 这正是「猪鼻孔和猪鼻子优先保证，再给每个色块匹配不同
+    的颜色」）；③耗材上限用满（同名次里用的卷越多的方案胜出）。只按最差排会得到
+    「最差那块小了，但好几块被折成同一种颜色」的方案，用户看到的就是「颜色匹配
+    不再像以前那样识别所有色块」。
     """
     indexed: list[tuple[tuple[float, ...], int, MatchResult]] = []
     for index, result in enumerate(pool):
@@ -2498,10 +2502,29 @@ def _ranked_plans(
         if measured is None:
             continue
         values, weights = measured
-        score = objective(values, weights) + (-float(len(_option_rolls(result))),)
+        ranking = objective(values, weights)
+        score = (
+            ranking[:1]
+            + (-float(_printed_colours(result)),)
+            + ranking[1:]
+            + (-float(len(_option_rolls(result))),)
+        )
         indexed.append((score, index, result))
     indexed.sort(key=lambda item: (item[0], item[1]))
     return [result for _score, _index, result in indexed]
+
+
+def _printed_colours(result: MatchResult) -> int:
+    """How many different colours this plan actually lays down.
+
+    Not ``len(result.palette)``: that counts what was on offer.  A plan whose
+    budget fit folded two blocks into one palette entry prints one colour for
+    both, and that is exactly the loss the user complains about.
+    """
+    if not len(result.indices):
+        return 0
+    wanted = result.indices.reshape(-1)
+    return int(np.unique(wanted[wanted >= 0]).size)
 
 
 def _option_rolls(result: MatchResult) -> frozenset[str]:

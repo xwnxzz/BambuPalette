@@ -504,6 +504,11 @@ class MainWindow(QMainWindow):
         # filament id are stale.
         self._haystacks.clear()
         for filament in self.library:
+            if not self.library.accepts(filament):
+                # 「我的耗材」只列当前材质的颜色（m09456 item 2）。以前这里把别的
+                # 材质的卷也灰着排一行（后缀「（PLA Basic，现在不配色）」），用户
+                # 的要求是别显示：换上面的材质下拉，它们整份回来。
+                continue
             # An unnamed spool's display_name IS its hex, so printing both would
             # render "#000000   #000000". The one other thing the user needs is
             # the numbers, so the duplicate becomes "RGB 0, 0, 0".
@@ -511,19 +516,14 @@ class MainWindow(QMainWindow):
             if filament.display_name.strip().casefold() == filament.color_hex.casefold():
                 red, green, blue = filament.rgb
                 detail = f"RGB {red}, {green}, {blue}"
-            # 行留着但灰掉：这种卷只是现在不参与配色，不是被删掉了 (m05557 item 1)。
-            if filament.hidden:
-                suffix = "（已隐藏）"
-            elif not self.library.accepts(filament):
-                suffix = f"（{filament.material_type or '未填种类'}，现在不配色）"
-            else:
-                suffix = ""
+            # 行留着但灰掉：这卷料只是不参与混色，不是被删掉了。
+            suffix = "（已隐藏）" if filament.hidden else ""
             item = QListWidgetItem(
                 swatch_icon(filament.color_hex, 28, 28),
                 f"{filament.display_name}   {detail}" + (f"   {suffix}" if suffix else ""),
             )
             item.setData(Qt.ItemDataRole.UserRole, filament.id)
-            if filament.hidden or not self.library.accepts(filament):
+            if filament.hidden:
                 # 灰掉，让「这卷现在不算数」一眼看得出来。
                 item.setForeground(QBrush(QColor(theme.TEXT_FAINT)))
             if not filament.hidden and self._pair_filter and filament.id in self._pair_filter:
@@ -533,7 +533,20 @@ class MainWindow(QMainWindow):
             self._list.addItem(item)
         self._suppress_list_signal = False
 
-        has_any = len(self.library) > 0
+        has_any = self._list.count() > 0
+        # 空的原因有两种，说错了会让人以为库里真的一卷都没有：这一份材质下没有，
+        # 和整个库都空。别的材质的卷数照着「另有 N 卷」说出来（m09456 item 2）。
+        others = self.library.other_material_count
+        if not has_any and self.library.material and others:
+            self._library_hint.setText(
+                f"当前材质「{self.library.material}」下还没有耗材。"
+                f"另有 {others} 卷是别的材质，换上面的材质下拉就能看到它们。"
+            )
+        else:
+            self._library_hint.setText(
+                "还没有耗材。点「添加耗材」输入颜色、种类和品牌；"
+                "至少两种同种类的耗材就能开始混色。"
+            )
         self._library_hint.setVisible(not has_any)
         self._list.setVisible(has_any)
         self._clear_button.setEnabled(has_any)
@@ -723,26 +736,15 @@ class MainWindow(QMainWindow):
                 return
 
     def _on_list_selection(self, current, previous) -> None:
-        """Spell the selected spool out in the bottom line.
+        """选中一卷料不再把它的名称/品牌/种类/备注念一遍 (m09456 item 3).
 
-        This used to be a hover pop-up on the row: 名称/颜色/品牌/种类/备注.  The
-        pop-up is gone, so the one line that is always visible carries the same
-        facts — the row itself only has room for the name and the hex.
+        这一行原来是悬停气泡的替身：行里只放得下名称和 #RRGGBB，品牌、种类、备注
+        就搬到状态栏常驻。用户要求删掉——选中哪一卷不该让底部换成一串长句，那些
+        事实在右侧详情面板里逐项列着，底部留给「全部颜色」的表格说明。
         """
-        if self._suppress_list_signal or current is None:
+        if self._suppress_list_signal:
             return
-        filament = self.library.get(current.data(Qt.ItemDataRole.UserRole))
-        if filament is None:
-            return
-        line = (
-            f"{filament.display_name} · {filament.color_hex} · "
-            f"{filament.brand or '—'} · {filament.material_type or '—'}"
-        )
-        if filament.note:
-            line += f" · 备注：{filament.note}"
-        if filament.hidden:
-            line += " · 已隐藏，不参与混色"
-        self._status.setText(line)
+        self._update_status()
 
     def _on_list_menu(self, position) -> None:
         from PySide6.QtWidgets import QMenu
