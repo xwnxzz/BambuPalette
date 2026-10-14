@@ -135,7 +135,13 @@ class FilamentDialog(QDialog):
         preset colour nobody asked for.  The hex box is now the only source:
         ``ColorField`` fills it as soon as the user types a hex value, picks a
         suggested one or touches any spin box, and leaves it empty otherwise.
+
+        ``commitPending`` first (1.6.27): 打完 ``#RRGGBB`` 直接点「确认」时焦点还
+        留在输入框里，值没提交，确认按钮于是还是灰的——灰按钮不接焦点，点击也
+        不会让输入框失焦，就永远卡在那里（用户报的「输入不进去」）。读之前先把
+        输入框里的完整颜色收进来。
         """
+        self._color.commitPending()
         return self._color.hex()
 
     def _update_hint(self) -> None:

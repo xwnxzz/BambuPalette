@@ -73,6 +73,24 @@ def _quadrant_image(size: int = 20) -> Image.Image:
     return image
 
 
+def _diagonal_image(size: int = 24) -> Image.Image:
+    """一条 45° 斜边分开两种颜色：斜边上没有一段是水平或竖直的。
+
+    1.6.27 的验收素材：旧的「放大匹配栅格重新分类」把这条边切成台阶，描边界线
+    之后它是一串落在格边中间的折线。
+    """
+    yy, xx = np.mgrid[0:size, 0:size]
+    lower = (xx + yy) >= size
+    canvas = np.zeros((size, size, 4), dtype=np.uint8)
+    top = tuple(int(SPOOLS[0][1].lstrip("#")[index : index + 2], 16) for index in (0, 2, 4))
+    bottom = tuple(int(SPOOLS[1][1].lstrip("#")[index : index + 2], 16) for index in (0, 2, 4))
+    canvas[..., :3] = np.where(
+        lower[..., None], np.array(bottom, dtype=np.uint8), np.array(top, dtype=np.uint8)
+    )
+    canvas[..., 3] = 255
+    return Image.fromarray(canvas, mode="RGBA")
+
+
 def _paint(mask: np.ndarray, rects) -> np.ndarray:
     canvas = np.zeros_like(mask, dtype=np.int64)
     for x, y, w, h in rects:
@@ -206,6 +224,37 @@ class SmoothingTests(unittest.TestCase):
         self.assertGreater(
             len({value % SMOOTH_FACTOR for value in starts}), 1, "边界还整格贴在粗格线上"
         )
+
+    def test_a_slanted_border_is_drawn_between_the_lattice_points(self):
+        """1.6.27：勾上圆滑是「描出那条边界线」，交点落在格点之间。
+
+        只看颜色件的顶面顶点：不圆滑时色块就是那些格子，顶点全在整数格点上；
+        描过之后每条边界线的交点落在格边中间，顶面里必然出现非整数坐标。
+        """
+        result = match_image(_diagonal_image(24), self.palette, MatchSettings(max_colours=8))
+        plates = (
+            (
+                build_plate(
+                    result,
+                    PlateSettings(target_width_mm=100.0, image_on_bottom=False, smooth_edges=False),
+                ),
+                False,
+            ),
+            (build_plate(result, PlateSettings(target_width_mm=100.0, image_on_bottom=False)), True),
+        )
+        for plate, expected in plates:
+            offset = 0.0
+            for part in plate.parts[1:]:
+                vertices = np.asarray(part.vertices, dtype=np.float64)
+                if not vertices.size:
+                    continue
+                cells = vertices[:, :2] / plate.pixel_size_mm
+                offset = max(offset, float(np.abs(cells - np.round(cells)).max()))
+            self.assertEqual(
+                offset > 1e-6,
+                expected,
+                f"顶面顶点离格点的最大偏移 {offset:.6f} 与预期不符",
+            )
 
     def test_a_smooth_plate_is_still_one_closed_solid(self):
         plate = build_plate(self.result, PlateSettings(target_width_mm=100.0))

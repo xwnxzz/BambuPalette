@@ -28,6 +28,7 @@ from app.core.image_matching import (  # noqa: E402
     _BAD_BLOCK_DELTA_E,
     _KMEANS_ITERATIONS,
     _PLAN_SPECS,
+    _budget_objective,
     MatchSettings,
     TriplePalette,
     _fit_spool_budget,
@@ -38,6 +39,7 @@ from app.core.image_matching import (  # noqa: E402
     _merge_similar_colours,
     _objective_closest,
     _objective_distinct,
+    _objective_priority,
     _objective_worst,
     _pack,
     _plans,
@@ -90,6 +92,21 @@ def _quadrant_image(size: int = 40) -> Image.Image:
         colour = tuple(int(value.lstrip("#")[i : i + 2], 16) for i in (0, 2, 4))
         image.paste(Image.new("RGBA", (half, half), colour + (255,)), (x, y))
     return image
+
+
+def _stroke_image(size: int = 64) -> Image.Image:
+    """White paper, a pale body, and a small dark stroke — the user's pig, in miniature.
+
+    The stroke covers 1.6% of the pixels, the same order as the brown brow on the
+    pig that came out pink (m06704 第 3 条): a big area a plan can buy with the
+    average, and a small feature only a worst-led plan will pay for.
+    """
+    array = np.zeros((size, size, 3), dtype=np.uint8)
+    array[:, :] = (255, 255, 255)
+    array[4 : size - 4, 4 : size - 4] = (0xF5, 0xD2, 0xB8)
+    array[20:24, 20:44] = (0x6A, 0x43, 0x30)
+    array[36:40, 36:40] = (0x2C, 0x2A, 0x2C)
+    return Image.fromarray(array, "RGB").convert("RGBA")
 
 
 class ColourReductionTests(unittest.TestCase):
@@ -1135,7 +1152,7 @@ class BudgetOptionTests(unittest.TestCase):
         plain = match_image(_quadrant_image(), self.palette, settings)
         options = match_options(_quadrant_image(), self.palette, settings)
 
-        self.assertEqual(options[0].key, "closest")
+        self.assertEqual(options[0].key, "priority")
         self.assertEqual(
             [entry.key for entry in options[0].result.palette],
             [entry.key for entry in plain.palette],
@@ -1161,7 +1178,7 @@ class BudgetOptionTests(unittest.TestCase):
         options = match_options(
             _quadrant_image(), self.palette, MatchSettings(max_colours=4, max_spools=0)
         )
-        self.assertEqual([option.key for option in options], ["closest"])
+        self.assertEqual([option.key for option in options], ["priority"])
         wanted = {parent for entry in result.palette for parent in entry.filament_ids}
         self.assertEqual(set(options[0].spools), wanted)
 
@@ -1194,7 +1211,7 @@ class BudgetOptionTests(unittest.TestCase):
         options = match_options(
             _quadrant_image(), self.palette, MatchSettings(max_colours=4, max_spools=2)
         )
-        self.assertEqual([option.key for option in options][0], "closest")
+        self.assertEqual([option.key for option in options][0], "priority")
         for option in options:
             self.assertEqual(plan_caption(option.key), (option.title, option.note))
             self.assertTrue(option.title.strip())
@@ -1293,6 +1310,53 @@ class BudgetOptionTests(unittest.TestCase):
             require=every,
         )
         self.assertEqual(options, [])
+
+    def test_the_user_rule_is_the_default_and_the_first_row(self):
+        # m06704 第 3 条: 「优先保证大色差色块被识别，然后大色差色块在限制条件下
+        # 去匹配颜色」.  The plain 「重新匹配」 and the first 耗材方案 row have to be
+        # that rule, or the page opens on a plan the user never asked for.
+        self.assertIs(_budget_objective, _objective_priority)
+        self.assertEqual(_PLAN_SPECS[0][0], "priority")
+        self.assertIs(_PLAN_SPECS[0][3], _objective_priority)
+
+    def test_the_worst_block_leads_and_the_average_only_breaks_the_tie(self):
+        worst = np.array([0.5, 33.0, 1.0])
+        weights = np.array([0.6, 0.016, 0.384])
+        leading, defects, average = _objective_priority(worst, weights)
+        self.assertEqual(leading, 33.0)  # the stroke, not the paper
+        self.assertEqual(defects, 1.0)
+        self.assertAlmostEqual(average, float(weights @ worst))
+        # The average-led rule is the mirror image: it answers 「总体最接近」 and
+        # never sees the stroke unless the total happens to need it.
+        self.assertEqual(_objective_closest(worst, weights)[0], average)
+
+    def test_a_pale_body_does_not_buy_the_dark_stroke(self):
+        # Measured on `_stroke_image` with a cap of three rolls of the test
+        # library: the average-led search spends two rolls and leaves the stroke
+        # at ΔE00 27.20; the user's rule spends the third roll and brings it to
+        # 14.05 — and pays for it, 10.69 average against 7.39.  That trade is
+        # exactly what 「优先保证大色差色块」 asks for, so it is asserted, cost
+        # included, rather than smoothed over.
+        library = _library()
+        catalog = MixCatalog(library.filaments, engine=ENGINE_BAMBU).build()
+        palette = build_palette(library, catalog)
+        settings = MatchSettings(max_colours=3, max_spools=3)
+        prepared = _prepare(_stroke_image(), palette, settings, None)
+        average_led = _plans(prepared, settings.max_spools, _objective_closest, limit=1)[0]
+        user_rule = _plans(prepared, settings.max_spools, _objective_priority, limit=1)[0]
+
+        average_average, average_worst, _ = match_fidelity_report(average_led)
+        rule_average, rule_worst, _ = match_fidelity_report(user_rule)
+        self.assertAlmostEqual(average_worst, 27.20, places=1)
+        self.assertAlmostEqual(rule_worst, 14.05, places=1)
+        self.assertLess(rule_worst, average_worst)
+        self.assertAlmostEqual(average_average, 7.39, places=1)
+        self.assertAlmostEqual(rule_average, 10.69, places=1)
+        self.assertGreater(rule_average, average_average)
+        rule_rolls = {spool for entry in user_rule.palette for spool in entry.filament_ids}
+        average_rolls = {spool for entry in average_led.palette for spool in entry.filament_ids}
+        self.assertLessEqual(len(rule_rolls), 3)
+        self.assertGreater(len(rule_rolls), len(average_rolls))
 
     def _spool(self, name: str) -> str:
         return next(

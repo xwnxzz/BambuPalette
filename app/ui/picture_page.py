@@ -2379,10 +2379,9 @@ class PicturePage(QWidget):
             )
             self._set_controls_enabled(self._result is not None)
             return
-        # The first 方案 is 「总体最接近」, the answer a single-answer matcher would
-        # have given, so 「重新匹配」 still lands where it always did and the other
-        # rows are the alternatives the user can now see instead of never being
-        # told about.
+        # 1.6.27 起第一行是 「大色差色块优先」 (m06704 第 3 条), which is also what
+        # 「重新匹配」 uses, so the plain button lands on the row the user asked to be
+        # the answer and the other rows stay the alternatives.
         self._adopt_options(options)
 
     def _original_means(self, result: MatchResult) -> np.ndarray | None:

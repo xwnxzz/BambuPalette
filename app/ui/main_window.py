@@ -1429,7 +1429,11 @@ class MainWindow(QMainWindow):
         looking at in the table, then the R / G / B numbers as they stand.
         软件打开时这个字段已经是纯黑（``DEFAULT_TARGET_HEX``），所以「借用」这一步
         只有在用户自己把目标颜色清空之后才会用到（m02366 item 1）。
+
+        先 ``commitPending()``（1.6.27）：在目标颜色框里打完 hex 立刻按这个按钮时，
+        焦点还在输入框里，值没提交——搜到的会是上一个颜色。
         """
+        self._target_color.commitPending()
         target = self._target_color.hex()
         borrowed = ""
         if not target:

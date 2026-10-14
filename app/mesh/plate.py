@@ -2,7 +2,6 @@
 
 The user's requirement is explicit: the export must be a *flat* print, not a
 relief.  Two thicknesses are therefore all we need —
-
 * the slab is ``base_thickness_mm`` thick in the base colour, so the object is a
   solid with exactly the picture's outline;
 * the top ``colour_thickness_mm`` of that same slab carries the picture's colours,
@@ -26,7 +25,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field, replace
-from typing import Sequence
+from typing import Callable, Sequence
 
 import numpy as np
 
@@ -40,6 +39,7 @@ __all__ = [
     "run_rectangles",
     "smooth_factor",
     "smooth_indices",
+    "smooth_lattice",
     "prism_mesh",
     "stitch_t_junctions",
     "merge_parts",
@@ -74,11 +74,11 @@ class PlateSettings:
     max_footprint_mm: float = 250.0
     #: Cells finer than this are below what an 0.4 mm nozzle resolves.
     min_pixel_mm: float = 0.35
-    #: 导出时把色块边界圆滑 (1.6.22)。 匹配栅格上的色块边界是「一格一格的台阶」，
+    #: 导出时把色块边界圆滑 (1.6.22 / 1.6.27)。 匹配栅格上的色块边界是「一格一格的台阶」，
     #: 150 mm 宽、512 像素的图上约 0.29 mm 一级，在 Bambu Studio 里放大看就是锯齿。
-    #: 打开之后先在匹配栅格上把每种颜色糊一遍，再细分若干倍重新分类，边界落在细
-    #: 栅格的像元之间（默认细到图片像素的四分之一，约 0.07 mm），比喷嘴细，打出来
-    #: 是圆的。 界面上的勾默认打开。
+    #: 打开之后先在匹配栅格上把每种颜色糊一遍再细分若干倍：1.6.27 起直接描出那条边界线
+    #: （斜的边是直弦、弯的边是折线，一步约 0.07 mm，见 smooth_lattice），描不动时才退回
+    #: 按细格重新分类。 界面上的勾默认打着。
     smooth_edges: bool = True
     #: 图片印在底面还是顶面 (1.6.23)。 默认底面：图片贴着打印板，顶面是一整片底板色，
     #: 打出来顶面平整、不被色块的边线划过。 打开工程时这一项随工程走。
@@ -111,7 +111,7 @@ SMOOTH_ALWAYS_CELLS = 16_000_000
 #: 放大前的高斯 σ，单位是匹配栅格的像元。 它决定边界的「圆」到什么程度，也决定多细
 #: 的东西会被磨掉，所以是量出来的：一块 64×64 的色块里放一条 1 像元宽的线，细分 4 倍
 #: 后 σ=0.4/0.5 留下 99%，σ=0.6 只剩 49%，σ=0.8 直接没了（2 像元宽以上各档都还在）。
-#: 所以取 0.5：比一个像元细的胡须、描边照样印得出来，台阶的直角仍旧被磨圆。
+#: 所以取 0.5：比一像元细的胡须，描边照样印得出来，台阶的直角仍旧被磨圆。
 SMOOTH_SIGMA = 0.5
 
 
@@ -468,6 +468,508 @@ def smooth_indices(
 
 
 # ---------------------------------------------------------------------------
+# Tracing the border (1.6.27)
+# ---------------------------------------------------------------------------
+#: Lattice coordinates are integers and crossings sit between them, so a
+#: difference below this is "the same point".
+_TRACE_EPS = 1e-9
+
+#: A border that runs exactly along a lattice line makes the two blurred fields
+#: equal there, and the sampled labels then differ from cell to cell by float
+#: noise: the crossing lands on the lattice point itself and leaves a piece of
+#: some 1e-8 cells of area.  Those bits are folded into their neighbour (see
+#: :func:`_trace_square`), and a point this close to a lattice point *is* that
+#: lattice point: the interpolation of a crossing that really sits on a line
+#: comes out as much as a few thousandths of a cell away from it (measured:
+#: 267.9999 instead of 268 on the selftest picture, 12.99866 instead of 13 on a
+#: 16 px stress case), and that hair is enough to keep two "same" points apart in
+#: the assembler.  A fiftieth of a cell is far below the resolution the matcher
+#: works at, and twenty times below one fine cell, the thinnest real feature.
+_TRACE_SNAP = 5e-3
+
+#: Below this area a piece of a square is one of those lattice-line bits, not a
+#: colour: a single fine cell is 0.0625 of a square, and the thinnest strip a
+#: border can cut through one is some 0.03, so this is nearly two orders of
+#: magnitude clear of anything a picture can actually draw.
+_TRACE_MIN_AREA = 1e-3
+
+#: Coordinates the traced geometry is emitted on.  A crossing near a lattice
+#: point (a border that only just misses it) comes out of the field
+#: interpolation a hair away from it, and a piece and the wall beside it then
+#: carry two points a nanometre apart: the assembler welds by exact equality, so
+#: "the same point" stays two vertices, the triangulator cuts a zero-area face
+#: between them, and the slicer reports the plate as open.  Everything is
+#: therefore put on this grid first — a hair below the assembler's own micrometre
+#: and still three orders of magnitude below the thinnest real feature, a fine
+#: cell (0.03 mm on a 512 px picture at four steps).
+_TRACE_QUANTUM = 1e-5
+
+
+def _snap_trace(value: float) -> float:
+    """Put one traced coordinate on the lattice, or on :data:`_TRACE_QUANTUM`."""
+    nearest = round(value)
+    if abs(value - nearest) <= _TRACE_SNAP:
+        return float(nearest)
+    return round(value / _TRACE_QUANTUM) * _TRACE_QUANTUM
+
+
+def _label_border(labels: np.ndarray) -> np.ndarray:
+    """Match-grid cells that have a neighbour with another label.
+
+    The picture's edge repeats (``mode="edge"``, the same as the blur), so a
+    border that runs into the edge of the picture does not look like a change of
+    label just because there is nothing outside it.
+    """
+    height, width = labels.shape
+    padded = np.pad(labels, 1, mode="edge")
+    out = np.zeros((height, width), dtype=bool)
+    for dy in range(3):
+        for dx in range(3):
+            if dy == 1 and dx == 1:
+                continue
+            out |= padded[dy : dy + height, dx : dx + width] != labels
+    return out
+
+
+def _grow(mask: np.ndarray) -> np.ndarray:
+    """Dilate a mask by one cell in all eight directions."""
+    height, width = mask.shape
+    padded = np.pad(mask, 1, mode="constant", constant_values=False)
+    out = np.zeros((height, width), dtype=bool)
+    for dy in range(3):
+        for dx in range(3):
+            out |= padded[dy : dy + height, dx : dx + width]
+    return out
+
+
+def _sample_lattice(
+    fields: list[tuple[int, np.ndarray]],
+    ring: np.ndarray,
+    steps: int,
+    coarse: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Sample every blurred field at the lattice points of the ring's cells.
+
+    This is the cheap half of :func:`smooth_indices`: that one samples the whole
+    refined grid (``colors × steps²`` passes over every match-grid cell), while a
+    border only ever runs through the ring, so the sample count here is
+    O(border × steps) and the fields are already blurred.
+    """
+    height, width = coarse.shape
+    squares = np.repeat(np.repeat(ring, steps, axis=0), steps, axis=1)
+    point = np.zeros((height * steps + 1, width * steps + 1), dtype=bool)
+    point[:-1, :-1] |= squares
+    point[:-1, 1:] |= squares
+    point[1:, :-1] |= squares
+    point[1:, 1:] |= squares
+    rows, cols = np.nonzero(point)
+    y = rows.astype(np.float32) / steps - 0.5
+    x = cols.astype(np.float32) / steps - 0.5
+    rows_low, rows_high, row_weight = _sample_axis(y, height)
+    cols_low, cols_high, col_weight = _sample_axis(x, width)
+
+    best = np.full(rows.shape, -1.0, dtype=np.float32)
+    second = np.zeros(rows.shape, dtype=np.float32)
+    chosen = np.zeros(rows.shape, dtype=np.int32)
+    for slot, field in fields:
+        value = (
+            field[rows_low, cols_low] * (1.0 - row_weight) * (1.0 - col_weight)
+            + field[rows_low, cols_high] * (1.0 - row_weight) * col_weight
+            + field[rows_high, cols_low] * row_weight * (1.0 - col_weight)
+            + field[rows_high, cols_high] * row_weight * col_weight
+        )
+        better = value > best
+        second = np.where(better, np.maximum(best, 0.0), np.maximum(second, value))
+        best = np.where(better, value, best)
+        chosen[better] = slot
+
+    # Away from the ring every point keeps the label of the match-grid cell it
+    # falls in: the ring is wide enough that the border cannot reach its edge.
+    row_cell = np.minimum(np.arange(height * steps + 1) // steps, height - 1)
+    col_cell = np.minimum(np.arange(width * steps + 1) // steps, width - 1)
+    corners = coarse[np.ix_(row_cell, col_cell)].astype(np.int32, copy=True)
+    margin = np.zeros(corners.shape, dtype=np.float32)
+    corners[rows, cols] = np.where(chosen == 0, np.int32(-1), chosen - 1)
+    margin[rows, cols] = best - second
+    return corners, margin
+
+
+def _lattice_is_closed(corners: np.ndarray, ring: np.ndarray, steps: int) -> bool:
+    """Is the border clear of the outer edge of the sampled region?
+
+    A crossing *on* that edge would need a vertex the merged rectangles on the
+    other side know nothing about: a T-junction, or a gap where the two sides of
+    the border disagree.  The caller grows the ring until this holds.
+    """
+    squares = np.repeat(np.repeat(ring, steps, axis=0), steps, axis=1)
+    if squares.shape != (corners.shape[0] - 1, corners.shape[1] - 1):
+        return False
+    # Vertical lattice edges, between the squares (row, col) and (row, col + 1):
+    # both ends of the edge are corners of column col + 1.
+    left = corners[:, :-1]
+    border = squares[:, :-1] != squares[:, 1:]
+    if np.any(border & (left[:-1, 1:] != left[1:, 1:])):
+        return False
+    # Horizontal lattice edges, between (row, col) and (row + 1, col): both ends
+    # are corners of row + 1.
+    top = corners[:-1, :]
+    border = squares[:-1, :] != squares[1:, :]
+    if np.any(border & (top[1:, :-1] != top[1:, 1:])):
+        return False
+    return True
+
+
+def smooth_lattice(
+    indices: np.ndarray,
+    *,
+    factor: int | None = None,
+    sigma: float = SMOOTH_SIGMA,
+    progress: ProgressFn | None = None,
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
+    """Refine a match grid and hand back the lattice the exporter traces.
+
+    :func:`smooth_indices` re-labels refined *cells*, which trades the match
+    grid's staircase for a four-times finer one — but a staircase all the same,
+    and a slicer zoomed to 0.02 mm per pixel still shows 0.07 mm of saw tooth
+    (measured on the 512 px pig at 4 steps).  Steps are made of cells, so no
+    number of extra cells removes them.
+
+    The border is traced instead.  Each colour is an indicator field blurred on
+    the match grid, so the border between two colours is where their fields are
+    equal: it crosses the refined lattice edges, not the cells.  Every lattice
+    edge whose two ends disagree carries one crossing point, placed by linear
+    interpolation of ``winner − runner-up``; joining the crossings of a cell
+    (marching squares) gives the border as it really is.  Two crossings make the
+    cell two straight pieces, so a slanted border comes out as one chord instead
+    of a staircase, and a curve as a chord chain at one refined cell per link.
+
+    Returns ``(fine, corners, margin)``:
+
+    * ``fine`` — refined labels for pixel counts, the match-grid label repeated
+      ``steps`` times.  Repeating (rather than re-classifying near the border)
+      keeps the printed area identical to the unsmoothed export, which is what
+      the tests have always asserted; the border geometry carries the shape.
+    * ``corners`` — the winning label at every refined lattice *point*, sampled
+      at ``index / steps − 0.5`` in match-grid coordinates (shape one larger
+      than ``fine`` on both axes), and ``margin`` — winner minus runner-up
+      there, for placing the crossings.
+    * ``(labels, None, None)`` when there is nothing to refine — and
+      ``(raster, None, None)`` with the plain :func:`smooth_indices` result if
+      the border stays ambiguous three cells out, which the walked geometry
+      cannot close and the re-labelled raster can.
+    """
+    labels = np.asarray(indices)
+    if labels.ndim != 2:
+        raise ValueError("indices must be two-dimensional")
+    height, width = (int(size) for size in labels.shape)
+    steps = max(1, int(factor)) if factor else smooth_factor(height, width)
+    if steps <= 1 or height == 0 or width == 0:
+        return labels.astype(np.int32, copy=True), None, None
+
+    slots = np.where(labels < 0, 0, labels + 1).astype(np.int32)
+    kernel = _gaussian_kernel(sigma)
+    present = np.unique(slots)
+    fields: list[tuple[int, np.ndarray]] = []
+    # Every field is non-negative and they sum to one everywhere, so -1 is
+    # strictly below all of them and the first slot of a tie keeps the cell.
+    best = np.full((height, width), -1.0, dtype=np.float32)
+    second = np.zeros((height, width), dtype=np.float32)
+    chosen = np.zeros((height, width), dtype=np.int32)
+    for position, slot in enumerate(present):
+        if progress is not None:
+            progress(
+                f"圆滑色块边界 {position + 1}/{len(present)}",
+                (position + 1) / len(present),
+            )
+        field = _blur_separable((slots == slot).astype(np.float32), kernel)
+        fields.append((int(slot), field))
+        better = field > best
+        second = np.where(better, np.maximum(best, 0.0), np.maximum(second, field))
+        best = np.where(better, field, best)
+        chosen[better] = int(slot)
+
+    coarse = np.where(chosen == 0, np.int32(-1), chosen - 1).astype(np.int32)
+    ring = _grow(_label_border(coarse))
+    corners: np.ndarray | None = None
+    margin: np.ndarray | None = None
+    for _ in range(3):
+        corners, margin = _sample_lattice(fields, ring, steps, coarse)
+        if _lattice_is_closed(corners, ring, steps):
+            break
+        ring = _grow(ring)
+    else:
+        return smooth_indices(labels, factor=steps, progress=progress), None, None
+
+    fine = np.repeat(np.repeat(coarse, steps, axis=0), steps, axis=1)
+    return fine, corners, margin
+
+
+class _Outline:
+    """The material's outline, gathered edge by edge from every solid region.
+
+    A face on its own says nothing about where the slab is open; what says it is
+    *the edge walked once*.  Every solid piece (a traced piece, the perimeter of a
+    refined block) walks its own boundary with the material on its left and hands
+    each directed edge in here:
+
+    * the same undirected edge walked twice is two faces put back to back, so it is
+      material inside — drop it;
+    * an edge walked once is the outline — wall it.
+
+    Two colours meeting simply walk the seam twice and it disappears, which is why
+    no colour-to-colour rule is needed; a chord, a fan spoke and a lattice line all
+    go through the same check, which is why the degenerate cases stopped needing
+    rules of their own.  The only care is T-junctions: a block's edge is longer than
+    the traced pieces that touch it, so every long edge is cut at the vertices
+    already recorded on its line before the count is taken.
+    """
+
+    def __init__(self, quantum: float = _TRACE_QUANTUM) -> None:
+        self._quantum = quantum
+        self._edges: dict[tuple[int, int, int, int], tuple[int, int, int, int, int]] = {}
+        self._columns: dict[int, set[int]] = {}
+        self._rows: dict[int, set[int]] = {}
+
+    def _index(self, point: tuple[float, float]) -> tuple[int, int]:
+        return (
+            int(round(point[0] / self._quantum)),
+            int(round(point[1] / self._quantum)),
+        )
+
+    def add(self, start: tuple[float, float], stop: tuple[float, float], colour: int) -> None:
+        """One directed edge of one solid region: the material sits on its left."""
+        first = self._index(start)
+        second = self._index(stop)
+        if first == second:
+            return
+        key = (min(first[0], second[0]), min(first[1], second[1]),
+               max(first[0], second[0]), max(first[1], second[1]))
+        if key in self._edges:
+            del self._edges[key]
+        else:
+            self._edges[key] = (first[0], first[1], second[0], second[1], colour)
+        self._columns.setdefault(first[0], set()).add(first[1])
+        self._columns.setdefault(second[0], set()).add(second[1])
+        self._rows.setdefault(first[1], set()).add(first[0])
+        self._rows.setdefault(second[1], set()).add(second[0])
+
+    def _keep(
+        self,
+        cut: dict[tuple[int, int, int, int], tuple[int, int, int, int, int]],
+        first: tuple[int, int],
+        second: tuple[int, int],
+        colour: int,
+    ) -> None:
+        key = (min(first[0], second[0]), min(first[1], second[1]),
+               max(first[0], second[0]), max(first[1], second[1]))
+        if key in cut:
+            del cut[key]
+        else:
+            cut[key] = (first[0], first[1], second[0], second[1], colour)
+
+    def _cut(self, edge: tuple[int, int, int, int, int]) -> list[tuple[int, int, int, int, int]]:
+        """One registered edge, cut at the vertices already recorded on its line.
+
+        The pieces keep the edge's own direction: the stops are built from low to
+        high and reversed when the edge runs the other way, or a descending edge
+        hands back (high, low) pieces that match no neighbour at all.
+        """
+        first_x, first_y, second_x, second_y, colour = edge
+        if first_x == second_x:
+            line = sorted(self._columns.get(first_x, ()))
+            low, high = sorted((first_y, second_y))
+            stops = [low] + [value for value in line if low < value < high] + [high]
+            if first_y > second_y:
+                stops.reverse()
+            return [(first_x, one, first_x, other, colour) for one, other in zip(stops, stops[1:])]
+        if first_y == second_y:
+            line = sorted(self._rows.get(first_y, ()))
+            low, high = sorted((first_x, second_x))
+            stops = [low] + [value for value in line if low < value < high] + [high]
+            if first_x > second_x:
+                stops.reverse()
+            return [(one, first_y, other, first_y, colour) for one, other in zip(stops, stops[1:])]
+        return [edge]
+
+    def walls(self) -> list[tuple[float, float, float, float, int]]:
+        """The outline as (x0, y0, x1, y1, colour) in lattice coordinates.
+
+        Every registered edge is cut first and the pieces are counted afterwards.
+        Cutting while counting lets a long block edge re-insert a piece a traced
+        piece had already cancelled — the walk-in order decided the answer, and a
+        seam that should have disappeared came back as a wall.
+        """
+        pieces: list[tuple[int, int, int, int, int]] = []
+        for edge in self._edges.values():
+            pieces.extend(self._cut(edge))
+        cut: dict[tuple[int, int, int, int], tuple[int, int, int, int, int]] = {}
+        for first_x, first_y, second_x, second_y, colour in pieces:
+            self._keep(cut, (first_x, first_y), (second_x, second_y), colour)
+        quantum = self._quantum
+        return [
+            (first_x * quantum, first_y * quantum, second_x * quantum, second_y * quantum, colour)
+            for first_x, first_y, second_x, second_y, colour in cut.values()
+        ]
+
+
+def _trace_square(
+    row: int,
+    col: int,
+    corners: np.ndarray,
+    margin: np.ndarray,
+    columns: int,
+    rows: int,
+    z_base_top: float,
+    z_colour_top: float,
+    add: Callable[[list[Point], int], None],
+    rim: Callable[[tuple[float, float], tuple[float, float], int], None],
+    base_rim: Callable[[tuple[float, float], tuple[float, float], int], None],
+    *,
+    labels: np.ndarray | None = None,
+    uniform: np.ndarray | None = None,
+) -> None:
+    """Build the pieces of one refined square whose four corners disagree.
+
+    Marching squares, walked counter-clockwise so the solid is on the left of
+    every edge: two crossings give two pieces that meet along the chord between
+    them — a straight border is then exactly straight, with no vertex in the
+    middle of it.  Three or four crossings meet inside the square, so each piece
+    takes the middle of the square as a fan tip instead, which keeps the piece
+    count equal to the crossing count and leaves no gap.
+
+    Walls belong to the piece that is *not* transparent, along its own direction
+    (the winding carries the solid on the left, which is what makes the outward
+    normal come out right), plus the stretches of the piece that run along the
+    outer edge of the picture: outside the picture is not solid, so the slab has
+    to be closed there too.
+    """
+    x0, y0 = float(col), float(row)
+    points = ((x0, y0), (x0 + 1.0, y0), (x0 + 1.0, y0 + 1.0), (x0, y0 + 1.0))
+    label = (
+        int(corners[row, col]),
+        int(corners[row, col + 1]),
+        int(corners[row + 1, col + 1]),
+        int(corners[row + 1, col]),
+    )
+    weight = (
+        float(margin[row, col]),
+        float(margin[row, col + 1]),
+        float(margin[row + 1, col + 1]),
+        float(margin[row + 1, col]),
+    )
+
+    def tidy(body: list[tuple[float, float]], snap: float = _TRACE_EPS) -> list[tuple[float, float]]:
+        """Drop a point that repeats its neighbour.
+
+        A border that runs along a lattice line puts two crossings on the same
+        point, and the piece between them is a sliver of no area: leaving the
+        repeats in gives the triangulator triangles of area zero, and leaving the
+        slivers in stacks two faces on the same edges.
+        """
+        out: list[tuple[float, float]] = []
+        for point in body:
+            if out and abs(out[-1][0] - point[0]) <= snap and abs(out[-1][1] - point[1]) <= snap:
+                continue
+            out.append(point)
+        while (
+            len(out) > 1
+            and abs(out[0][0] - out[-1][0]) <= snap
+            and abs(out[0][1] - out[-1][1]) <= snap
+        ):
+            out.pop()
+        return out
+
+    def area_of(body: list[tuple[float, float]]) -> float:
+        total = 0.0
+        for index in range(len(body)):
+            x0, y0 = body[index]
+            x1, y1 = body[(index + 1) % len(body)]
+            total += x0 * y1 - x1 * y0
+        return abs(total) * 0.5
+
+    crossings: dict[int, tuple[float, float]] = {}
+    for index in range(4):
+        following = (index + 1) % 4
+        if label[index] == label[following]:
+            continue
+        total = weight[index] + weight[following]
+        share = 0.5 if total <= 0.0 else weight[index] / total
+        if index == 0:
+            crossings[index] = (_snap_trace(x0 + share), _snap_trace(y0))
+        elif index == 1:
+            crossings[index] = (_snap_trace(x0 + 1.0), _snap_trace(y0 + share))
+        elif index == 2:
+            crossings[index] = (_snap_trace(x0 + 1.0 - share), _snap_trace(y0 + 1.0))
+        else:
+            crossings[index] = (_snap_trace(x0), _snap_trace(y0 + 1.0 - share))
+    if len(crossings) < 2:
+        return
+
+    walk: list[tuple[tuple[float, float], int, bool]] = []
+    for index in range(4):
+        walk.append((points[index], label[index], True))
+        if index in crossings:
+            walk.append((crossings[index], label[index], False))
+    first = next(index for index, token in enumerate(walk) if not token[2])
+    walk = walk[first:] + walk[:first]
+    marks = [index for index, token in enumerate(walk) if not token[2]]
+
+    pieces: list[tuple[list[tuple[float, float]], int]] = []
+    for number, begin in enumerate(marks):
+        if number + 1 < len(marks):
+            body = walk[begin : marks[number + 1]] + [walk[marks[number + 1]]]
+        else:
+            body = walk[begin:] + [walk[0]]
+        colour = next(token[1] for token in body if token[2])
+        pieces.append(([token[0] for token in body], colour))
+    if len(pieces) > 2:
+        middle = (x0 + 0.5, y0 + 0.5)
+        pieces = [(body + [middle], colour) for body, colour in pieces]
+    pieces = [(tidy(body, _TRACE_SNAP), colour) for body, colour in pieces]
+
+    # 边界线本身要走的两条弧，合并之前先留一份：一张色块边界贴着格线走的时候，靠边那件窄到
+    # 没有面积，会被并进邻居、面不该发（见下），可这条边界线还得有人立起来 —— 墙按弧发，
+    # 不按发过面的件发。
+    arcs = [(tidy(body, _TRACE_SNAP), colour) for body, colour in pieces]
+    pieces = list(arcs)
+
+    # 边界正好压在格线上时，有些件是「贴着格线的薄片」，面积小到没有（见 _TRACE_SNAP）：
+    # 它和相邻那件共用那个交点，并进去以后两件合成一整块 —— 面才发得对。
+    merged: list[tuple[list[tuple[float, float]], int]] = []
+    for body, colour in pieces:
+        if merged and area_of(body) <= _TRACE_MIN_AREA:
+            previous, previous_colour = merged[-1]
+            merged[-1] = (tidy(previous + body[1:], _TRACE_SNAP), previous_colour)
+            continue
+        merged.append((body, colour))
+    while len(merged) > 1 and area_of(merged[0][0]) <= _TRACE_MIN_AREA:
+        body, _colour = merged.pop(0)
+        previous, previous_colour = merged[-1]
+        merged[-1] = (tidy(previous + body[1:], _TRACE_SNAP), previous_colour)
+    pieces = merged
+
+    solid = [
+        (body, colour)
+        for body, colour in pieces
+        if colour >= 0 and len(body) >= 3 and area_of(body) > _TRACE_MIN_AREA
+    ]
+
+    # Walls are not decided here any more: every edge of every solid piece goes into
+    # the outline (see :class:`_Outline`), which cancels the ones that are material
+    # inside and hands back the rest.  Two crossings, four crossings, a border lying
+    # exactly on a lattice line and a 0.07-cell sliver all take the same path.
+    # 顶面那层和底板那层各记一份：底板整片是一个色（BASE_TAG），它自己的内部缝要
+    # 自己抵消，不然底板层的墙会沿着色块之间的缝冒出来。
+    for body, colour in solid:
+        add([(x, y, z_colour_top) for x, y in body], colour)
+        # 底面整片是底板色：同一件反过来绕一遍（外法线朝 −z）。
+        add([(x, y, 0.0) for x, y in reversed(body)], BASE_TAG)
+        for index in range(len(body)):
+            rim(body[index], body[(index + 1) % len(body)], colour)
+            base_rim(body[index], body[(index + 1) % len(body)], colour)
+
+
+# ---------------------------------------------------------------------------
 # Mesh
 # ---------------------------------------------------------------------------
 _EPS = 1e-9
@@ -534,12 +1036,15 @@ class _Stitcher:
     """
 
     def __init__(self, points: np.ndarray) -> None:
-        welded, inverse = np.unique(
-            np.asarray(points, dtype=np.float64), axis=0, return_inverse=True
-        )
-        self.points: list[Point] = [tuple(row) for row in welded.tolist()]
+        # 焊接按微米整数格做，不按精确浮点。描出来的交点只保证落在格线之间、走的是
+        # 同一套 1e-5 取整，不保证两次算出来的浮点逐位相同：按精确浮点焊接会把同一个
+        # 点留成两个顶点，T 型接点插进去的那个和邻居自己用的那个对不上号，面上就多出
+        # 一条「开口」边（1.6.27 自检里 160×120 那张图报过 3940 条）。
+        integer = np.rint(np.asarray(points, dtype=np.float64) * _SCALE).astype(np.int64)
+        welded, inverse = np.unique(integer, axis=0, return_inverse=True)
+        self.points: list[Point] = [tuple(row) for row in (welded / _SCALE).tolist()]
         self.inverse = np.asarray(inverse, dtype=np.int64).reshape(-1)
-        self._integer = np.rint(welded * _SCALE).astype(np.int64)
+        self._integer = welded
         self._lines: dict[tuple[str, int, int], list[int]] = {}
         for index, (x, y, z) in enumerate(self._integer.tolist()):
             self._lines.setdefault(("x", y, z), []).append(index)
@@ -974,14 +1479,19 @@ def build_plate(
             f"每个像素只有 {pixel:.3f} mm，比 0.4 mm 喷嘴还细；相邻颜色在打印时会互相覆盖"
         )
 
-    # --- 导出时圆滑色块 (1.6.22) ---------------------------------------------
+    # --- 导出时圆滑色块 (1.6.22 / 1.6.27) -------------------------------------
     # 色块边界原本落在匹配栅格的格线上（150 mm 宽、512 像素的图约 0.293 mm 一格），斜着走的地方
-    # 就是台阶。打开这个开关就把栅格放大 steps 倍重新分类：边界落在细格之间，比喷嘴还细。
+    # 就是台阶。1.6.22 把栅格放大 steps 倍重新分类，台阶细到 1/steps 格；1.6.27 改成直接描那条
+    # 边界线（见 smooth_lattice）：交点落在格边上，斜边是一根直弦、弯边是一串折线，一级台阶也
+    # 剩下。两条路都留着：常走描线，边界在三格外仍说不清时才退回重新分类。
     steps = 1
+    lattice: tuple[np.ndarray, np.ndarray] | None = None
     if config.smooth_edges:
         steps = smooth_factor(picture_height, picture_width, len(result.palette))
         if steps > 1:
-            indices = smooth_indices(result.indices, factor=steps, progress=progress)
+            indices, corners, margin = smooth_lattice(
+                result.indices, factor=steps, progress=progress
+            )
             counts = np.array(
                 [
                     int(np.count_nonzero(indices == index))
@@ -996,9 +1506,16 @@ def build_plate(
                 indices=indices,
                 counts=counts,
             )
-            notes.append(
-                f"色块边界已圆滑：在 {steps} 倍细分栅格上重新分类，网格 {pixel / steps:.3f} mm"
-            )
+            if corners is None or margin is None:
+                notes.append(
+                    f"色块边界已圆滑：在 {steps} 倍细分栅格上重新分类，网格 {pixel / steps:.3f} mm"
+                )
+            else:
+                lattice = (corners, margin)
+                notes.append(
+                    f"色块边界已圆滑：在 {steps} 倍细分栅格上描出边界线，"
+                    f"跨一格 {pixel / steps:.3f} mm，斜的边是直的"
+                )
 
     cell = pixel / steps
     width_mm = result.width * cell
@@ -1032,10 +1549,108 @@ def build_plate(
         :func:`run_rectangles` finds the same runs with numpy.  The coarse path
         keeps the greedy tiling, so an export without the smoothing switch is
         byte-for-byte what it always was.
+
+        A traced border (``lattice``) covers itself below, so this returns
+        nothing then.
         """
+        if lattice is not None:
+            return []
         if steps > 1:
             return run_rectangles(mask)
         return _merge_stacked(rectangles(mask))
+
+    # --- the traced border (1.6.27) ------------------------------------------
+    # 四个角标签一样的细格：边界不会穿过它，照旧合并成大矩形。剩下的一圈（薄薄一条边带）交给
+    # marching squares 描件：矩形和描出来的件都在整数格点上，谁也不会切到别人的边上。
+    if lattice is not None:
+        corners, margin = lattice
+        lower_left = corners[:-1, :-1]
+        lower_right = corners[:-1, 1:]
+        upper_right = corners[1:, 1:]
+        upper_left = corners[1:, :-1]
+        inside = (
+            (lower_left == lower_right)
+            & (lower_right == upper_right)
+            & (upper_right == upper_left)
+        )
+        # ``inside`` is already in fine cells: a fine square whose four lattice
+        # corners agree is the one the trace never touches.  It doubles as the
+        # working mask, because the trace hands back the squares where the border
+        # collapsed onto a lattice line (see :func:`_trace_square`): a square like
+        # that is solid or empty along its whole width after all, so it is filled
+        # and walled by exactly the same two passes as a square that agreed from
+        # the start.
+        uniform_fine = inside
+        outline = _Outline()
+        base_outline = _Outline()
+        for row, col in np.argwhere(~inside.copy()):
+            _trace_square(
+                int(row),
+                int(col),
+                corners,
+                margin,
+                width,
+                height,
+                z_base_top,
+                z_colour_top,
+                add,
+                outline.add,
+                base_outline.add,
+                labels=result.indices,
+                uniform=inside,
+            )
+        for x, y, w, h in run_rectangles(inside & (lower_left >= 0)):
+            x0, x1 = float(x), float(x + w)
+            y0, y1 = float(y), float(y + h)
+            add([(x0, y1, 0.0), (x1, y1, 0.0), (x1, y0, 0.0), (x0, y0, 0.0)], BASE_TAG)
+            # 底板那层的四边走底板自己的账：底板整片是一个色，色块之间的缝在它这里
+            # 根本不存在，两边各走一遍就抵消了。
+            base_outline.add((x0, y0), (x1, y0), BASE_TAG)
+            base_outline.add((x1, y0), (x1, y1), BASE_TAG)
+            base_outline.add((x1, y1), (x0, y1), BASE_TAG)
+            base_outline.add((x0, y1), (x0, y0), BASE_TAG)
+        for index in range(len(result.palette)):
+            mask = inside & (lower_left == index)
+            if not mask.any():
+                continue
+            for x, y, w, h in run_rectangles(mask):
+                x0, x1 = float(x), float(x + w)
+                y0, y1 = float(y), float(y + h)
+                add(
+                    [
+                        (x0, y0, z_colour_top),
+                        (x1, y0, z_colour_top),
+                        (x1, y1, z_colour_top),
+                        (x0, y1, z_colour_top),
+                    ],
+                    index,
+                )
+                # 整块的四条边同样走一遍（材料在左，和描出来的件一个方向）：相邻整块、
+                # 整块和贴着它的窄条都会互相抵消，剩下的才是材料的外形。
+                outline.add((x0, y0), (x1, y0), int(index))
+                outline.add((x1, y0), (x1, y1), int(index))
+                outline.add((x1, y1), (x0, y1), int(index))
+                outline.add((x0, y1), (x0, y0), int(index))
+        for start_x, start_y, stop_x, stop_y, colour in outline.walls():
+            add(
+                [
+                    (start_x, start_y, z_base_top),
+                    (stop_x, stop_y, z_base_top),
+                    (stop_x, stop_y, z_colour_top),
+                    (start_x, start_y, z_colour_top),
+                ],
+                colour,
+            )
+        for start_x, start_y, stop_x, stop_y, _colour in base_outline.walls():
+            add(
+                [
+                    (start_x, start_y, 0.0),
+                    (stop_x, stop_y, 0.0),
+                    (stop_x, stop_y, z_base_top),
+                    (start_x, start_y, z_base_top),
+                ],
+                BASE_TAG,
+            )
 
     # --- the base colour: the underside of the slab --------------------------
     for x, y, w, h in tiles(silhouette):
@@ -1065,92 +1680,95 @@ def build_plate(
     # A wall belongs to a colour only where that colour touches the *outside* of
     # the silhouette.  Where two colours merely touch each other there is no wall
     # at all: it would be an interior face nobody can see and every slicer has to
-    # repair.
-    above = np.vstack([np.zeros((1, width), dtype=bool), silhouette[:-1]])
-    below = np.vstack([silhouette[1:], np.zeros((1, width), dtype=bool)])
-    left = np.hstack([np.zeros((height, 1), dtype=bool), silhouette[:, :-1]])
-    right = np.hstack([silhouette[:, 1:], np.zeros((height, 1), dtype=bool)])
+    # repair.  描出边界线的时候这趟不跑：墙全部由 :class:`_Outline` 从「只被走一次的边」
+    # 里发出来（整块的周长和描出来的件走同一张表，互相抵消），图片最外圈也自然包含在内。
+    if lattice is None:
+        shade = silhouette
+        above = np.vstack([np.zeros((1, width), dtype=bool), shade[:-1]])
+        below = np.vstack([shade[1:], np.zeros((1, width), dtype=bool)])
+        left = np.hstack([np.zeros((height, 1), dtype=bool), shade[:, :-1]])
+        right = np.hstack([shade[:, 1:], np.zeros((height, 1), dtype=bool)])
 
-    for index in range(len(result.palette)):
-        mask = result.indices == index
-        if not mask.any():
-            continue
-        north = mask & ~above
-        south = mask & ~below
-        west = mask & ~left
-        east = mask & ~right
+        for index in range(len(result.palette)):
+            mask = result.indices == index
+            if not mask.any():
+                continue
+            north = mask & ~above
+            south = mask & ~below
+            west = mask & ~left
+            east = mask & ~right
 
-        for y in np.flatnonzero(north.any(axis=1)):
-            plane = float(y)
-            for x0, x1 in _runs(north[y]):
-                a, b = float(x0), float(x1)
-                add(
-                    [(a, plane, 0.0), (b, plane, 0.0), (b, plane, z_base_top), (a, plane, z_base_top)],
-                    BASE_TAG,
-                )
-                add(
-                    [
-                        (a, plane, z_base_top),
-                        (b, plane, z_base_top),
-                        (b, plane, z_colour_top),
-                        (a, plane, z_colour_top),
-                    ],
-                    index,
-                )
+            for y in np.flatnonzero(north.any(axis=1)):
+                plane = float(y)
+                for x0, x1 in _runs(north[y]):
+                    a, b = float(x0), float(x1)
+                    add(
+                        [(a, plane, 0.0), (b, plane, 0.0), (b, plane, z_base_top), (a, plane, z_base_top)],
+                        BASE_TAG,
+                    )
+                    add(
+                        [
+                            (a, plane, z_base_top),
+                            (b, plane, z_base_top),
+                            (b, plane, z_colour_top),
+                            (a, plane, z_colour_top),
+                        ],
+                        index,
+                    )
 
-        for y in np.flatnonzero(south.any(axis=1)):
-            plane = float(y) + 1.0
-            for x0, x1 in _runs(south[y]):
-                a, b = float(x0), float(x1)
-                add(
-                    [(b, plane, 0.0), (a, plane, 0.0), (a, plane, z_base_top), (b, plane, z_base_top)],
-                    BASE_TAG,
-                )
-                add(
-                    [
-                        (b, plane, z_base_top),
-                        (a, plane, z_base_top),
-                        (a, plane, z_colour_top),
-                        (b, plane, z_colour_top),
-                    ],
-                    index,
-                )
+            for y in np.flatnonzero(south.any(axis=1)):
+                plane = float(y) + 1.0
+                for x0, x1 in _runs(south[y]):
+                    a, b = float(x0), float(x1)
+                    add(
+                        [(b, plane, 0.0), (a, plane, 0.0), (a, plane, z_base_top), (b, plane, z_base_top)],
+                        BASE_TAG,
+                    )
+                    add(
+                        [
+                            (b, plane, z_base_top),
+                            (a, plane, z_base_top),
+                            (a, plane, z_colour_top),
+                            (b, plane, z_colour_top),
+                        ],
+                        index,
+                    )
 
-        for x in np.flatnonzero(west.any(axis=0)):
-            plane = float(x)
-            for y0, y1 in _runs(west[:, x]):
-                ya, yb = float(y0), float(y1)
-                add(
-                    [(plane, yb, 0.0), (plane, ya, 0.0), (plane, ya, z_base_top), (plane, yb, z_base_top)],
-                    BASE_TAG,
-                )
-                add(
-                    [
-                        (plane, yb, z_base_top),
-                        (plane, ya, z_base_top),
-                        (plane, ya, z_colour_top),
-                        (plane, yb, z_colour_top),
-                    ],
-                    index,
-                )
+            for x in np.flatnonzero(west.any(axis=0)):
+                plane = float(x)
+                for y0, y1 in _runs(west[:, x]):
+                    ya, yb = float(y0), float(y1)
+                    add(
+                        [(plane, yb, 0.0), (plane, ya, 0.0), (plane, ya, z_base_top), (plane, yb, z_base_top)],
+                        BASE_TAG,
+                    )
+                    add(
+                        [
+                            (plane, yb, z_base_top),
+                            (plane, ya, z_base_top),
+                            (plane, ya, z_colour_top),
+                            (plane, yb, z_colour_top),
+                        ],
+                        index,
+                    )
 
-        for x in np.flatnonzero(east.any(axis=0)):
-            plane = float(x) + 1.0
-            for y0, y1 in _runs(east[:, x]):
-                ya, yb = float(y0), float(y1)
-                add(
-                    [(plane, ya, 0.0), (plane, yb, 0.0), (plane, yb, z_base_top), (plane, ya, z_base_top)],
-                    BASE_TAG,
-                )
-                add(
-                    [
-                        (plane, ya, z_base_top),
-                        (plane, yb, z_base_top),
-                        (plane, yb, z_colour_top),
-                        (plane, ya, z_colour_top),
-                    ],
-                    index,
-                )
+            for x in np.flatnonzero(east.any(axis=0)):
+                plane = float(x) + 1.0
+                for y0, y1 in _runs(east[:, x]):
+                    ya, yb = float(y0), float(y1)
+                    add(
+                        [(plane, ya, 0.0), (plane, yb, 0.0), (plane, yb, z_base_top), (plane, ya, z_base_top)],
+                        BASE_TAG,
+                    )
+                    add(
+                        [
+                            (plane, ya, z_base_top),
+                            (plane, yb, z_base_top),
+                            (plane, yb, z_colour_top),
+                            (plane, ya, z_colour_top),
+                        ],
+                        index,
+                    )
 
     points, faces, face_tags = _assemble(polygons, tags)
 

@@ -1460,6 +1460,36 @@ def main() -> int:
     blank._on_spin()
     check(blank.hex() == "#C834FF", f"the B spin box drives the colour, got {blank.hex()!r}")
 
+    # m06704 item 1 (1.6.27): 打完 #RRGGBB 直接点「确认」时输入框还没失焦，界面就当
+    # 没填颜色（确认按钮是灰的，灰按钮又不接焦点，editingFinished 永远等不到）。现在
+    # 每敲一位就提交一次；三位简写要等到失焦才展开 —— 敲到 "#F5D" 时先按 #FF55DD 读
+    # 会把后面的两位接不上去。
+    typed = ColorField(None)
+    typed._hex.setText("#F5D2B8")
+    typed._on_hex_typed("#F5D2B8")
+    check(
+        typed.isSet() and typed.hex() == "#F5D2B8",
+        f"typing a full hex commits it without leaving the field, got {typed.hex()!r}",
+    )
+    typed._hex.setText("#8cf")
+    typed._on_hex_typed("#8cf")
+    check(
+        typed.hex() == "#F5D2B8",
+        f"a three-digit shorthand is not read while it is still being typed, got {typed.hex()!r}",
+    )
+    typed._on_hex_edited()
+    check(
+        typed.hex() == "#88CCFF",
+        f"it expands once the field is left, got {typed.hex()!r}",
+    )
+    pending = ColorField(None)
+    pending._hex.setText("#123456")
+    pending.commitPending()
+    check(
+        pending.isSet() and pending.hex() == "#123456",
+        f"commitPending() reads the typed text without waiting for focus loss, got {pending.hex()!r}",
+    )
+
     # --- nearest match --------------------------------------------------------
     nearest = window.nearest_recipe("#982C29")
     check(nearest is not None, "nearest_recipe returns something for #982C29")
@@ -2913,6 +2943,26 @@ def main() -> int:
                 "a match offers 耗材方案 and starts on the first one",
             )
             check(page._base is page._plans[0].result, "the preview is that first plan")
+            # m06704 item 3 (1.6.27): 没点名的时候用第一行，而第一行现在是「大色差色块
+            # 优先」——先把差得最明显的色块认出来，平均差得少不再排前面。
+            from app.core import image_matching as _matching  # noqa: PLC0415
+
+            check(
+                _matching._budget_objective is _matching._objective_priority,
+                "the default yardstick is 「大色差色块优先」",
+            )
+            check(
+                page._plans[0].key == "priority",
+                f"the first row is that yardstick, got {page._plans[0].key!r}",
+            )
+            check(
+                page._plans[0].title == _matching._PLAN_SPECS[0][1],
+                "the first row is named after it",
+            )
+            check(
+                _matching.plan_help().find(_matching._PLAN_SPECS[0][1]) >= 0,
+                "the help text explains which row 重新匹配 lands on",
+            )
             check(
                 len(page._plans) >= 2,
                 f"a tight cap offers several recipes, got {len(page._plans)}",

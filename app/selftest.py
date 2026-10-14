@@ -877,6 +877,20 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         page._plan_key == page._plans[0].key and page._base is page._plans[0].result,
         "第一套就是单答案匹配会给的那一套，也是页面正在显示的",
     )
+    # m06704 第 3 条 (1.6.27)：默认口径换成「大色差色块优先」——先把差得最明显的色块
+    # 认出来，平均差得少退到第二行；「重新匹配」和打开不带方案的工程都落在第一行。
+    from .core import image_matching as _matching  # noqa: PLC0415
+
+    check(
+        _matching._budget_objective is _matching._objective_priority,
+        "没点名的时候用的是「大色差色块优先」这把尺子",
+    )
+    check(
+        _matching._PLAN_SPECS[0][0] == "priority"
+        and _matching._PLAN_SPECS[0][1] == page._plans[0].title
+        and page._plans[0].key == "priority",
+        f"第一行是「{_matching._PLAN_SPECS[0][1]}」（现在是 {page._plans[0].key!r}）",
+    )
 
     def _plan_rows() -> list[tuple[str, str]]:
         """Read (名称, 数字) straight off the panel instead of trusting the state."""
@@ -1550,12 +1564,15 @@ def run_selftest(*, report_path: Path | None = None) -> int:
                 app.processEvents()
             finally:
                 _pp.MergeDialog = real_merge
-            picked = page._picked_blocks()[1]
             keys = {
                 page.result.palette[value].key
-                for value in page.result.indices[picked].tolist()
+                for item in pair
+                for value in page.result.indices[blocks.mask(item)].tolist()
             }
-            check(keys == {keep_entry.key}, "合并把选中的块都变成挑中的那种颜色")
+            check(
+                keys == {keep_entry.key},
+                f"合并把选中的块都变成挑中的那种颜色 {sorted(keys)} != {keep_entry.key}",
+            )
             check(len(page._block_edits) == 2, "合并给每一块各记了一条色块级改动")
             page._undo()
             app.processEvents()
@@ -1579,12 +1596,15 @@ def run_selftest(*, report_path: Path | None = None) -> int:
                     app.processEvents()
                 finally:
                     _pp.ColourPickerDialog = real_picker
-                picked = page._picked_blocks()[1]
                 hexes = {
                     page.result.palette[value].color_hex
-                    for value in page.result.indices[picked].tolist()
+                    for item in pair
+                    for value in page.result.indices[blocks.mask(item)].tolist()
                 }
-                check(hexes == {wanted.color_hex}, "更换颜色把选中的块一起换成新颜色")
+                check(
+                    hexes == {wanted.color_hex},
+                    f"更换颜色把选中的块一起换成新颜色 {sorted(hexes)} != {wanted.color_hex}",
+                )
                 check(
                     wanted.key in [entry.key for entry in page.result.palette],
                     "新颜色进了色表",
@@ -1647,8 +1667,17 @@ def run_selftest(*, report_path: Path | None = None) -> int:
             app.processEvents()
             check(not page._typing_in_field(), "焦点不在输入框里：Del 归「删除」")
             # 焦点在数字框里时，Del 属于那个框，页面不能抢。
-            page._colour_count.setFocus()
+            # 焦点这件事在无头/被别的窗口抢走时会拿不到：QApplication.focusWidget()
+            # 看的是「活动窗口」的焦点部件，窗口没激活时它返回 None。所以这里先激活
+            # 窗口再要焦点，拿不到就重试几次，断言的仍然是「焦点在框里时页面不抢 Del」。
+            window.activateWindow()
+            window.raise_()
             app.processEvents()
+            for _ in range(6):
+                page._colour_count.setFocus()
+                app.processEvents()
+                if page._typing_in_field():
+                    break
             check(page._typing_in_field(), "焦点在数字框里：Del 归输入框")
             app.sendEvent(
                 page,
@@ -2161,6 +2190,24 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         check(
             any("圆滑" in note for note in smooth_plate.notes),
             f"状态里说明了这次是圆滑过的（{smooth_plate.notes}）",
+        )
+        # 1.6.27 (m06704 第 2 条)：圆滑不再是把细栅格重新分类一遍（那样台阶只是变小），
+        # 而是直接把那条边界线描出来、顶点落在格线之间，所以斜边是直的。
+        check(
+            any("描出边界线" in note for note in smooth_plate.notes),
+            f"状态里写的是描出边界线（{smooth_plate.notes}）",
+        )
+        _offsets = [
+            max(
+                abs(coordinate - round(coordinate))
+                for row in part.vertices[:, :2] / smooth_plate.pixel_size_mm
+                for coordinate in row
+            )
+            for part in smooth_plate.parts[1:]
+        ]
+        check(
+            bool(_offsets) and max(_offsets) > 1e-6,
+            f"颜色件的顶点落在格线之间（最大偏离 {max(_offsets, default=0.0):.4f} 格）",
         )
         page._smooth_box.setChecked(False)
         app.processEvents()

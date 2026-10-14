@@ -1399,10 +1399,37 @@ def _objective_distinct(worst: np.ndarray, weights: np.ndarray) -> tuple[float, 
     )
 
 
+def _objective_priority(worst: np.ndarray, weights: np.ndarray) -> tuple[float, ...]:
+    """大色差色块优先：rescue the block that looks worst, then count the others.
+
+    The user's own rule, in their words: the blocks with a big colour difference
+    have to be recognised first, then those blocks get their colour under the
+    remaining budget, and the 耗材上限 is spent rather than saved (m06704 第 3 条).
+
+    The average cannot speak for a small feature.  On the user's pig the brow
+    stroke is 1.6% of the pixels, so the average-led plan bought the background
+    with the rolls that would have printed it and came out with a **brown stroke
+    printed pink** (ΔE00 33 measured) while its average stayed at 2.29.  Leading
+    with ``worst.max()`` and following with the count of plainly-wrong blocks
+    (:data:`_BAD_BLOCK_DELTA_E`) puts a colour on the stroke first; the average
+    only breaks the tie, which is why this is the default from 1.6.27 on.
+    """
+    return (
+        float(worst.max()),
+        float(np.count_nonzero(worst > _BAD_BLOCK_DELTA_E)),
+        float(weights @ worst),
+    )
+
+
 #: What :func:`match_image` uses when the caller does not name a 方案, and the
 #: objective behind the first entry :func:`match_options` offers.  The two agree
-#: on purpose: the page shows 「重新匹配」 landing on the 总体最接近 plan.
-_budget_objective: BudgetObjective = _objective_closest
+#: on purpose: the page shows 「重新匹配」 landing on the first row.
+#:
+#: 1.6.27 之前这里是 ``_objective_closest``（平均领先）。用户在自己的 41 卷库上看到
+#: 「棕色的笔画被印成粉红」——那块只占 1.6% 像素，平均口径乐意拿它去换大面积，所以
+#: 默认改成大色差优先（m06704 第 3 条）。平均领先的一档仍然是第二行，想整张图最像
+#: 的用户点一下就有。
+_budget_objective: BudgetObjective = _objective_priority
 
 
 @dataclass(frozen=True)
@@ -2350,14 +2377,23 @@ def _without_banned(
 #: different setting.  The plans differ in *which* colours they sacrifice — on the
 #: user's pig 「总体最接近」 keeps the average lowest and 「小色块优先」 costs average
 #: to print the nose — and that is a choice about the picture, not a computable
-#: fact, so the user makes it.
+#: fact, so the user makes it.  **1.6.27 起第一行是大色差色块优先**（用户 m06704 第 3 条
+#: 给的顺序：先把大色差色块认出来，再在限制条件下给它配色，耗材上限优先用满）；平均
+#: 领先的那一档退到第二行，想整张图最像的点一下就有。
 #: ... and how many rows each one offers.  「耗材方案太少了，多推荐几组」 is answered
 #: with more *different roll sets* inside the same rules: the same subsets the
 #: search already scores are ranked, so the second row is the runner-up rather
 #: than a worse objective.  1.6.15（m00830 第 4 条「耗材方案多给些选项」）把每一档都
-#: 加宽：默认那一档五组，另两档各四组。印出来是同一套卷的行仍然只留一行，所以
-#: 卷库小、不少组合打平的图上会少于十三行。
+#: 加宽：前两档各五组，后两档各四组。印出来是同一套卷的行仍然只留一行，所以卷库小、
+#: 不少组合打平的图上会少几行。
 _PLAN_SPECS: tuple[tuple[str, str, str, BudgetObjective, int], ...] = (
+    (
+        "priority",
+        "大色差色块优先",
+        "先把差得最明显的色块认出来，耗材上限优先用满，再用剩下的把整张图拉近。",
+        _objective_priority,
+        5,
+    ),
     (
         "closest",
         "总体最接近",
@@ -2437,6 +2473,10 @@ def plan_help() -> str:
         "· 同一种口径下的第二、第三套不再另起名字：按行里那几卷的颜色认就行，"
         "名称只说明它是按什么标准挑出来的。"
     )
+    lines.append(
+        f"· 不点名的时候用第一行（{_PLAN_SPECS[0][1]}）：「重新匹配」和打开工程时没带方案的图"
+        "都落在这一行；想要别的口径，点那一行再按下面的「用这一套」就行。"
+    )
     return "\n".join(lines)
 
 
@@ -2447,7 +2487,10 @@ def _ranked_plans(
 
     The sort key is :func:`_fidelity_values` — the same measurement
     :func:`match_fidelity_report` turns into 「平均 / 最差 / 差块」 — so the row on
-    top really is the best one under the name it carries.
+    top really is the best one under the name it carries.  A plan that prints the
+    same picture with more rolls wins the tie: 「选择耗材时优先用满耗材上限」
+    (m06704 第 3 条) says the cap is there to be spent, so of two ways that print
+    the same colours the one that uses more of the allowance is the answer.
     """
     indexed: list[tuple[tuple[float, ...], int, MatchResult]] = []
     for index, result in enumerate(pool):
@@ -2455,7 +2498,8 @@ def _ranked_plans(
         if measured is None:
             continue
         values, weights = measured
-        indexed.append((objective(values, weights), index, result))
+        score = objective(values, weights) + (-float(len(_option_rolls(result))),)
+        indexed.append((score, index, result))
     indexed.sort(key=lambda item: (item[0], item[1]))
     return [result for _score, _index, result in indexed]
 
@@ -2474,7 +2518,7 @@ def _offer_options(
 ) -> list[BudgetOption]:
     """Turn the plans every spec asks for into the rows the page shows.
 
-    Each objective searches for itself, and then the **union** of what all three
+    Each objective searches for itself, and then the **union** of what all of them
     found is re-ranked per objective.  Searching separately is a heuristic (the
     budget walk is a beam, not an exhaustive enumeration), so one objective's top
     answer can also be sitting in another objective's list — on the pig the 小色块

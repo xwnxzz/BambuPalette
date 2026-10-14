@@ -228,6 +228,11 @@ class ColorField(QWidget):
             outer.addLayout(second)
 
         self._hex.editingFinished.connect(self._on_hex_edited)
+        # 边打边认（1.6.27）：原来只有 editingFinished 会把输入框里的东西收进来，
+        # 于是「打完 #RRGGBB 直接去点确认」这条最自然的路走不通——确认按钮那时还是
+        # 灰的，灰按钮不接焦点，点击也不会让输入框失焦，editingFinished 永远不来，
+        # 表现就是「输入不进去」。现在每敲一个字符都试一次，打完立刻算数。
+        self._hex.textEdited.connect(self._on_hex_typed)
         self.setValue(value)
 
     # -- reading -----------------------------------------------------------------
@@ -283,6 +288,34 @@ class ColorField(QWidget):
             self.colorChanged.emit(self.hex())
 
     # -- edits -------------------------------------------------------------------
+    def _on_hex_typed(self, text: str) -> None:
+        """收下已经打完的颜色；没打完（或打错）就先不说话。
+
+        只在**六位**齐了才认：三位简写 ``#abc`` 在打字过程中是个陷阱——敲到
+        ``#F5D`` 时它刚好能被当成 ``#FF55DD``，于是被提前收下、输入框被改写成
+        展开后的样子，后面几个字就接到它后面去了（2026-10-14 探针里
+        ``#F5D2B8`` 变成了 ``#FF55DD``）。三位简写留给 ``editingFinished``。
+        """
+        if self._busy:
+            return
+        if len(text.strip().lstrip("#")) != 6:
+            return
+        try:
+            normalised = _normalise_hex(text)
+        except ValueError:
+            return
+        if normalised != self.hex():
+            self._set(normalised, announce=True)
+
+    def commitPending(self) -> None:
+        """把输入框里打完的东西立刻收进来。
+
+        给「点确认时焦点还没离开输入框」这种情况用：读值的一方先叫一声，免得读到
+        一个还没提交的空值（1.6.27 的 bug：打完整 hex 直接点确认没有反应）。
+        """
+        if self._hex.text().strip():
+            self._on_hex_edited()
+
     def _on_hex_edited(self) -> None:
         if self._busy:
             return
