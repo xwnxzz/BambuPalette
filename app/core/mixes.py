@@ -462,7 +462,13 @@ class MixCatalog:
             for filament_id in gone:
                 self._by_id.pop(filament_id, None)
 
-        existing = list(self._filaments)
+        # Only the spools that survive are the *other* half of the new pairs.
+        # Taking ``self._filaments`` here would pair the newcomer with the spools
+        # that just left — which is exactly what a material switch does: the 42
+        # spools of the old material are gone, and pairing the new material's one
+        # spool with all of them resurrects their 1053 recipes, so 「全部颜色」
+        # keeps showing the old material's mixes (m10318 item 1).
+        existing = [f for f in self._filaments if f.id not in gone]
         added = [f for f in filaments if f.id not in self._by_id]
         self._filaments = filaments
         for filament in added:

@@ -1327,6 +1327,8 @@ def main() -> int:
             Filament(name="B-PETG", brand="大简", material_type="PETG HF", color_hex="#C52A36"),
             Filament(name="C-PLA", brand="b", material_type="PLA", color_hex="#2C2A2C"),
             Filament(name="D-PLA", brand="b", material_type="PLA", color_hex="#FF6C2B"),
+            # 只有一卷的材料：切过来以后两种料的混色必须一个都不剩 (m10318 item 1).
+            Filament(name="E-ABS", brand="b", material_type="ABS", color_hex="#101010"),
         ]
     )
     material_window = MainWindow(library=material_mix, auto_triples=False)
@@ -1336,7 +1338,7 @@ def main() -> int:
     picker = material_window._material_combo
     check(
         [picker.itemText(index) for index in range(picker.count())]
-        == ["PETG HF（2）", "PLA（2）"],
+        == ["PETG HF（2）", "PLA（2）", "ABS（1）"],
         "the 材质 picker lists one entry per material, with its spool count",
     )
     check(
@@ -1384,6 +1386,44 @@ def main() -> int:
     check(
         "现在按 PLA 配色" in material_window._status.text(),
         f"the status line says which material is in force, got {material_window._status.text()[:50]!r}",
+    )
+
+    # 换到只有一卷的材质：两色表要归零，「全部颜色」只剩这一卷的本色 (m10318 item 1).
+    # sync() 曾经拿「旧的那批卷子」当新卷子的另一半，于是切过去的每一次都留下一对
+    # 幽灵配方（用户库里是 42 卷：切到 1 卷的 PETG 后还剩 942 个颜色）。
+    picker.setCurrentIndex(picker.findData("ABS"))
+    app.processEvents()
+    single = material_window
+    check(
+        single._catalog is not None
+        and single._catalog.pair_count == 0
+        and single._catalog.recipe_count == 0,
+        "a one-spool material leaves no pair behind, got "
+        f"{single._catalog.pair_count if single._catalog else '—'} pairs / "
+        f"{single._catalog.recipe_count if single._catalog else '—'} recipes",
+    )
+    check(
+        len(single._combined) == 1,
+        f"全部颜色 holds the spool itself and nothing else, got {len(single._combined)}",
+    )
+    check(
+        len(single._recipes) == 1,
+        f"the grid draws exactly one cell for a one-spool material, got {len(single._recipes)}",
+    )
+    check(
+        "去重后共 1 个颜色" in single._status.text(),
+        f"the bottom line counts one colour, got {single._status.text()[:80]!r}",
+    )
+    picker.setCurrentIndex(picker.findData("PETG HF"))
+    app.processEvents()
+    check(
+        single._catalog.pair_count == 1 and single._catalog.recipe_count == 81,
+        "switching back rebuilds the surviving material's own pairs, got "
+        f"{single._catalog.pair_count} pairs / {single._catalog.recipe_count} recipes",
+    )
+    check(
+        len(single._combined) == 83,
+        f"switching back cannot resurrect the ABS spool, got {len(single._combined)} colours",
     )
     material_window.close()
     app.processEvents()
@@ -3150,6 +3190,28 @@ def main() -> int:
                 all(option.spools for option in page._plans),
                 "补出来的方案都说着自己要用哪几卷",
             )
+            # m10318 item 2: the row that came out of the file carries numbers from the
+            # moment it was saved, so it says so on the row itself — otherwise an
+            # upgrade looks like "the match still has not changed".
+            check(
+                page._plans[0].from_file
+                and all(not option.from_file for option in page._plans[1:]),
+                "只有文件里那一套被标成「从工程里读的」",
+            )
+            rows = [
+                page._plan_rows_layout.itemAt(index).widget()
+                for index in range(page._plan_rows_layout.count())
+            ]
+            texts = [
+                child.text()
+                for row in rows
+                for child in row.findChildren(_picture_page.QLabel)
+                if "从工程里读的那套" in child.text()
+            ]
+            check(
+                len(texts) == 1 and "从工程里读的那套" in texts[0],
+                f"那一行自己写着是从工程里读的（{texts}）",
+            )
             _StubMessageBox.answer = "清空"
             page._project_path = None
             page._dirty = False
@@ -3161,6 +3223,10 @@ def main() -> int:
             check(
                 len(page._plans) == 1 and page._plan_key == page._plans[0].key,
                 f"an exactly printable picture offers one plan, got {len(page._plans)}",
+            )
+            check(
+                all(not option.from_file for option in page._plans),
+                "重新匹配之后就没有「从工程里读的」那一行了",
             )
 
             # --- 筛选耗材 / 按当前色块重新匹配 (1.6.13 #3/#4) --------------------

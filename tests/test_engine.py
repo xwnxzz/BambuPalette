@@ -864,6 +864,76 @@ class CatalogTests(unittest.TestCase):
         catalog.sync(library)
         self.assertEqual(catalog.recipe_count, expected_recipe_count(2))
 
+    def test_sync_on_a_material_switch_leaves_no_phantom_pairs(self):
+        """换材质 = 一整批卷子走人、另一批进来，留下来的不能和新卷子配成对 (m10318 item 1).
+
+        ``sync`` used to build the newcomer's pairs against ``self._filaments``,
+        which still held the spools that had just left.  Switching to a material
+        with a single spool therefore produced one phantom pair per departure —
+        13 pairs and 942 colours on 「全部颜色」 for a library that should have
+        shown one colour.
+        """
+        library = self._library(6)
+        catalog = MixCatalog(library.visible).build()
+        self.assertEqual(catalog.recipe_count, expected_recipe_count(6))
+
+        for filament in list(library):
+            library.remove(filament.id)
+        library.create(
+            brand="大简", material_type="PETG", color_hex="#000000", name="PETG 黑"
+        )
+        library.material = "PETG"
+        catalog.sync(library.visible)
+
+        self.assertEqual([f.material_type for f in library.visible], ["PETG"])
+        self.assertEqual(catalog.recipe_count, 0)
+        self.assertEqual(catalog.pair_count, 0)
+        self.assertEqual(catalog.colour_count, 0)
+        self.assertEqual([f.id for f in catalog.filaments], [library[0].id])
+
+    def test_sync_rebuilds_every_pair_after_a_material_switch_back(self):
+        """来回切材质要回到原来那张表，不能多出上一次的半成品."""
+
+        def two_materials() -> FilamentLibrary:
+            library = FilamentLibrary()
+            for index in range(4):
+                library.create(
+                    brand="大简",
+                    material_type="PLA Basic",
+                    color_hex=PALETTE[index],
+                    name=f"PLA {index + 1}",
+                )
+            for index in range(3):
+                library.create(
+                    brand="大简",
+                    material_type="PETG",
+                    color_hex=PALETTE[index + 4],
+                    name=f"PETG {index + 1}",
+                )
+            library.material = "PLA Basic"
+            return library
+
+        library = two_materials()
+        catalog = MixCatalog(library.visible).build()
+        baseline = catalog.recipe_count
+        self.assertEqual(baseline, expected_recipe_count(4))
+
+        library.material = "PETG"
+        catalog.sync(library.visible)
+        self.assertEqual(catalog.recipe_count, expected_recipe_count(3))
+
+        library.material = "PLA Basic"
+        catalog.sync(library.visible)
+
+        rebuilt = MixCatalog(library.visible).build()
+        self.assertEqual(catalog.recipe_count, baseline)
+        self.assertEqual(catalog.pair_count, rebuilt.pair_count)
+        self.assertEqual(
+            sorted((m.a_id, m.b_id, m.percent_a, m.color_hex) for m in catalog.recipes),
+            sorted((m.a_id, m.b_id, m.percent_a, m.color_hex) for m in rebuilt.recipes),
+        )
+
+
 
 class MergeColourTests(unittest.TestCase):
     """「如果混色中出现了完全相同的颜色，则合并成同一个颜色」."""

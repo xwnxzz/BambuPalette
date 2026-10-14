@@ -480,6 +480,8 @@ def run_selftest(*, report_path: Path | None = None) -> int:
                 ),
                 _SelftestFilament(name="C-PLA", brand="b", material_type="PLA", color_hex="#2C2A2C"),
                 _SelftestFilament(name="D-PLA", brand="b", material_type="PLA", color_hex="#FF6C2B"),
+                # 只有一卷的材料（m10318 item 1）：切过来时两种料的混色必须一个不剩。
+                _SelftestFilament(name="E-ABS", brand="b", material_type="ABS", color_hex="#101010"),
             ]
         ),
         auto_triples=False,
@@ -490,7 +492,7 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     material_combo = material_window._material_combo
     labels = [material_combo.itemText(index) for index in range(material_combo.count())]
     check(
-        labels == ["PETG HF（2）", "PLA（2）"],
+        labels == ["PETG HF（2）", "PLA（2）", "ABS（1）"],
         f"材质下拉按种类列出库里的耗材和卷数（{labels}）",
     )
     check(
@@ -557,9 +559,37 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         "#F5D2B8" in _grid_hexes() and "#2C2A2C" not in _grid_hexes(),
         "切回去 PETG 的颜色回来、PLA 的走开",
     )
+
+    # 只有一卷的材质：两色表归零，「全部颜色」只剩这一卷的本色（m10318 item 1）。
+    material_combo.setCurrentIndex(material_combo.findData("ABS"))
+    app.processEvents()
+    pair_count = material_window._catalog.pair_count if material_window._catalog else -1
+    recipe_count = material_window._catalog.recipe_count if material_window._catalog else -1
+    check(
+        pair_count == 0 and recipe_count == 0,
+        f"切到只有一卷的材质时没有留下任何配方对（{pair_count} 对 / {recipe_count} 条）",
+    )
+    combined = len(material_window._combined) if material_window._combined is not None else -1
+    check(
+        combined == 1 and len(material_window._recipes) == 1,
+        f"「全部颜色」只剩这一卷的黑色（{combined} 个颜色 / {len(material_window._recipes)} 格）",
+    )
+    check(
+        "去重后共 1 个颜色" in material_window._status.text(),
+        f"底栏的去重颜色数跟着归一（{material_window._status.text()[:70]!r}）",
+    )
+    material_combo.setCurrentIndex(material_combo.findData("PLA"))
+    app.processEvents()
+    check(
+        sorted(f.name for f in material_window.library.visible) == ["C-PLA", "D-PLA"]
+        and material_window._catalog.pair_count == 1
+        and material_window._catalog.recipe_count == 81,
+        "切回两种料的材质时，它自己的 81 条配方原样回来，不多不少",
+    )
+
     remembered = _material_settings().get("material")
     check(
-        remembered == "PETG HF",
+        remembered == "PLA",
         f"选的材质记住了，下次开窗就用它（{remembered!r}）",
     )
     material_window.close()
@@ -1851,6 +1881,29 @@ def run_selftest(*, report_path: Path | None = None) -> int:
             )
             page._on_save_project()
             check(not page._dirty, "重开工程再保存一次不会失败")
+            # m10318 第 2 条：文件里那一套方案的数字是存档那一刻的，界面上要写明它
+            # 不是照现在的规则重算的，否则升级了看着像「匹配没改」。
+            from PySide6.QtWidgets import QLabel as _RowLabel  # noqa: PLC0415
+
+            marked = [
+                child.text()
+                for index in range(page._plan_rows_layout.count())
+                for row in (page._plan_rows_layout.itemAt(index).widget(),)
+                for child in row.findChildren(_RowLabel)
+                if "从工程里读的那套" in child.text()
+            ]
+            check(
+                bool(page._plans) and page._plans[0].from_file,
+                "打开工程时文件里那一套被标成「从工程里读的」",
+            )
+            check(
+                len(marked) == 1,
+                f"方案表里正好一行写着「从工程里读的那套」（{len(marked)} 行）",
+            )
+            check(
+                all(not option.from_file for option in page._plans[1:]),
+                "同一批色块现算出来的那几行没有这个标记",
+            )
         page._project_path = path_before
         page._restore(before_round_trip)
         page._set_pick_mode(page._mode, save=False)

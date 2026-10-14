@@ -2087,6 +2087,7 @@ class PicturePage(QWidget):
             title=plan_caption(state.plan)[0],
             note=plan_caption(state.plan)[1],
             result=state.base,
+            from_file=True,
         )
         self._plans = [saved]
         self._plan_key = state.plan
@@ -2597,6 +2598,16 @@ class PicturePage(QWidget):
                 "「差块」= 图片里有几种颜色打出来偏差超过 ΔE00 5（按图片自己的颜色数算），"
                 "越少越不容易一眼看出偏差。"
             )
+            if option.from_file:
+                # 这一行是打开工程时从文件里读回来的（m10318 第 2 条）：数字是保存
+                # 那一刻的，不会因为升级了匹配规则而变——不写清楚，用户会以为
+                # 「匹配还没改好」。
+                numbers.setText(numbers.text() + " · 从工程里读的那套，按「重新匹配」重算")
+                button.setToolTip(
+                    option.note
+                    + "　这套方案是打开工程时从文件里读出来的，不是照现在这套规则和现在的"
+                    "耗材库重新算的；按「重新匹配」就会重算。"
+                )
             if over:
                 # 这一行是上一次匹配（上限还是别的数）算出来的，现在装了会超。
                 numbers.setText(numbers.text() + f" · 超过现在的上限（{cap} 卷），按「重新匹配」重算")

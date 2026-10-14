@@ -2225,6 +2225,11 @@ class BudgetOption:
     title: str
     note: str
     result: MatchResult
+    # True for the one row 「打开工程」 puts back from the file (m10318 第 2 条): its
+    # palette and its numbers are what was saved, not what the current rules and the
+    # current library would answer.  The row says so, so that an upgrade does not look
+    # like "the match did not change".
+    from_file: bool = False
 
     @property
     def spools(self) -> tuple[str, ...]:
