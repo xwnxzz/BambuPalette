@@ -1607,22 +1607,16 @@ def _budget_fits(
         ).reshape(len(pool), depth)
 
     def _printed(printable: Sequence[int], picked: Sequence[int]) -> list[PaletteEntry]:
-        """The colours a plan prints — one entry per colour, not per block.
+        """The colours a plan prints — one per block, never fewer.
 
-        Two blocks may end up answered with the same entry (one block's shortlist
-        contains the winner of another).  They are then a single printed colour fed
-        by two regions, which is exactly how the page reads a 合并 the user made by
-        hand, so the answer is one row and not two identical ones.
+        Two blocks may come out with the same entry (one block's shortlist contains
+        the winner of another).  They keep their own entry anyway: 「色块优先」 means
+        the blocks are the user's own decision, so a match does not fold two of them
+        into one behind their back (m11985 「保留所有色块」).  The two rows then print
+        the same colour, which is plain to see, and 「合并」 is there for the user to
+        take that decision themselves.
         """
-        colours: list[PaletteEntry] = []
-        seen: set[str] = set()
-        for rank, position in enumerate(printable):
-            entry = options[position][picked[rank]]
-            if entry.key in seen:
-                continue
-            seen.add(entry.key)
-            colours.append(entry)
-        return colours
+        return [options[position][picked[rank]] for rank, position in enumerate(printable)]
 
     def _score(choice: Sequence[str]) -> tuple[tuple[float, ...], list[int], list[int]]:
         """How the picture reads under ``choice``, what fits, and printed with what.
@@ -1647,6 +1641,9 @@ def _budget_fits(
                 picked.append(best[1])
         if not printable:
             return (float("inf"),), [], []
+        # One colour per block: the same entry may be picked twice (two blocks
+        # answered with one recipe), and each still keeps its own row and its own
+        # region — the blocks are the user's, see `_printed`.
         rank_of = {position: rank for rank, position in enumerate(printable)}
         values = np.empty(len(pool), dtype=np.float64)
         for position in range(len(pool)):
@@ -1659,7 +1656,15 @@ def _budget_fits(
                 for other in range(len(printable))
             )
         total = float(weights.sum()) or 1.0
-        return objective(values, weights / total), printable, picked
+        # 装进上限的代价排在最前面（m11985）：先比「有多少色块被涂成别人的颜色」，
+        # 再比画面数字。给一个色块换它的第二选择是可以接受的，把它整个变成另一个
+        # 色块的颜色不是 —— 所以「保住所有色块」永远赢过「平均 ΔE00 更小」。
+        folded_blocks = len(pool) - len(printable)
+        return (
+            (float(folded_blocks), *objective(values, weights / total)),
+            printable,
+            picked,
+        )
 
     def _walk(
         available: Sequence[str], width: int
@@ -1741,11 +1746,9 @@ def _budget_fits(
     def _build(printable: list[int], picked: list[int]) -> _Fit:
         """Print ``printable`` — each with the candidate ``picked`` chose — fold the rest."""
         colours = _printed(printable, picked)
-        order = {colour.key: rank for rank, colour in enumerate(colours)}
-        ranks = {
-            position: order[options[position][picked[rank]].key]
-            for rank, position in enumerate(printable)
-        }
+        # 每个色块一个条目：同一个配方被两个色块选中时，两行都留着，各自有自己的区域和
+        # 像素数；哪两行该并成一行由用户按「合并」决定。
+        ranks = {position: rank for rank, position in enumerate(printable)}
         remap = np.full(len(pool), -1, dtype=_INDEX_DTYPE)
         for position in range(len(pool)):
             if position in ranks:
@@ -2254,56 +2257,6 @@ class BudgetOption:
         return match_fidelity_report(self.result)[2]
 
 
-def _collapse(prepared: _Prepared) -> _Prepared:
-    """Fold blocks that ended up with the same colour into one.
-
-    Two blocks can come out identical: 「合并」 folds one into another, or the
-    palette answers two regions with the very same recipe.  On the plate they are
-    one colour and one row, and — the reason this matters here — one roll
-    requirement instead of two, which is what lets a small 「耗材上限」 go further.
-    The surviving block is the largest one and keeps its own picture colour,
-    which is the rule 合并 follows.
-    """
-    entries = list(prepared.kept)
-    groups: dict[str, list[int]] = {}
-    order: list[str] = []
-    for position, entry in enumerate(entries):
-        if entry.key not in groups:
-            groups[entry.key] = []
-            order.append(entry.key)
-        groups[entry.key].append(position)
-    if len(order) == len(entries):
-        return prepared
-    rank = {key: index for index, key in enumerate(order)}
-    remap = np.array([rank[entry.key] for entry in entries], dtype=_INDEX_DTYPE)
-    folded = np.where(
-        prepared.indices >= 0, remap[np.clip(prepared.indices, 0, None)], -1
-    ).astype(_INDEX_DTYPE)
-    survivors = [groups[key][0] for key in order]
-    kept, counts, final, sources = _renumber_sources(
-        [entries[position] for position in survivors], folded
-    )
-    pictures = None
-    if prepared.pictures is not None:
-        pictures = np.asarray(
-            [prepared.pictures[survivors[int(source)]] for source in sources],
-            dtype=np.uint8,
-        )
-    alternatives = None
-    if prepared.alternatives is not None:
-        alternatives = [
-            list(prepared.alternatives[survivors[int(source)]]) for source in sources
-        ]
-    return replace(
-        prepared,
-        kept=kept,
-        counts=counts,
-        indices=final,
-        pictures=pictures,
-        alternatives=alternatives,
-    )
-
-
 def _with_required(
     prepared: _Prepared,
     require: frozenset[str],
@@ -2651,7 +2604,9 @@ def match_options(
     if banned:
         _report(progress, "换掉「不要用」的耗材", 0.87)
         prepared = _without_banned(prepared, banned, palette)
-    prepared = _collapse(prepared)
+    # No `_collapse` here either — see the note below about the pig: a fresh import
+    # keeps every block it found, and lets 「耗材上限」 answer each of them with a
+    # cheaper colour instead of folding any of them away (m11985 「保留所有色块」).
     # 「耗材上限」 folds away whatever the blocks' own colours cost too many rolls,
     # and on a fresh import that fold used to eat the picture: the reporter's pig
     # (512×512, 颜色数量 32, 抖动关) has 12 blocks and came back as TWO colours —
@@ -2838,7 +2793,10 @@ def rematch_options(
         name=result.source,
         pictures=targets,
     )
-    prepared = _collapse(prepared)
+    # No `_collapse` here any more: the blocks are the user's own decision, so
+    # 「按当前色块重新匹配」 never folds two of them into one behind their back
+    # (m11985 「保留所有色块」).  Two blocks may still come out with the same colour;
+    # they stay two rows, and 「合并」 is the user's own call.
     pinned_keys = {entry.key for entry in choices.values()}
     held = frozenset(
         position

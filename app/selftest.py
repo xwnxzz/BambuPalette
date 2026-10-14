@@ -2319,10 +2319,20 @@ def run_selftest(*, report_path: Path | None = None) -> int:
             0 < len(page._base.palette) <= keep_count - 1,
             f"色块不会变多（{len(page._base.palette)} 块，删除前 {keep_count} 块）",
         )
+        # m11985: 色块是用户自己的决定，一次按下不许把两块悄悄并成一块 —— 再按一次，
+        # 颜色和行数都必须原样。用户的猪第二次按下把眼睛印成皮肤色，就是「合成一块 +
+        # 目标色取并集均值」造成的；这条守着它不再回来。
+        after_first = [entry.key for entry in page._base.palette]
+        page._on_rematch_blocks()
+        app.processEvents()
         check(
-            len({entry.key for entry in page._base.palette}) == len(page._base.palette),
-            "同一卷不会在两块里重复出现（两块落到同一卷上会合成一块）",
+            [entry.key for entry in page._base.palette] == after_first,
+            f"再按一次手里的色块不变（{len(after_first)} 块原样）",
         )
+        # 多按的这一下只为验证上面那条，退回去，后面几步的撤销节奏（按一次 → 撤销 →
+        # 重做）才和原来一样。
+        page._undo()
+        app.processEvents()
         check(
             page._base.total_pixels - page._base.printed_pixels == unpainted,
             "被删掉的色块没有回来（不打印的像素数没变）",

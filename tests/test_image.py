@@ -1071,16 +1071,27 @@ class SpoolBudgetTests(unittest.TestCase):
             _quadrant_image(), self.palette, MatchSettings(max_colours=4, max_spools=1)
         )
         self.assertEqual(len(self._spools(result)), 1)
-        self.assertEqual(len(result.palette), 1)
+        # One roll prints one colour, so the blocks it cannot print are repainted with
+        # it — but the rows are not quietly merged: 色块优先 (m11985) leaves a row per
+        # colour it prints, and merging two of them stays the user's 「合并」.
+        self.assertEqual(len({entry.key for entry in result.palette}), 1)
+        self.assertGreaterEqual(len(result.palette), 1)
+        self.assertEqual(int(result.counts.sum()), 40 * 40)
 
     def test_the_surviving_colour_is_the_biggest_region(self):
-        # Two quadrants are twice the area of the other two, so the budget has
-        # to keep one of those and repaint everything with it.
+        # Two halves are the same area here, so the tie goes to the first block; what
+        # the test pins is that the colour kept is the region's own colour and that
+        # every pixel is accounted for, whatever the rows end up looking like.
         image = Image.new("RGBA", (40, 40), (0, 0, 0, 255))
         image.paste(Image.new("RGBA", (20, 40), (200, 200, 195, 255)), (20, 0))
         result = match_image(image, self.palette, MatchSettings(max_colours=4, max_spools=1))
-        self.assertEqual(len(result.palette), 1)
-        self.assertEqual(int(result.counts[0]), 40 * 40)
+        self.assertEqual(len({entry.key for entry in result.palette}), 1)
+        self.assertEqual(int(result.counts.sum()), 40 * 40)
+        kept = _color.lab_from_rgb(result.palette[0].rgb)
+        self.assertLess(
+            _color.delta_e_2000(kept, _color.lab_from_rgb((0, 0, 0))),
+            _color.delta_e_2000(kept, _color.lab_from_rgb((200, 200, 195))),
+        )
 
     def test_a_refused_colour_never_reaches_the_result(self):
         # Both picks want two spools, so with a budget of one they are refused

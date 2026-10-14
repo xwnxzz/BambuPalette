@@ -2493,6 +2493,16 @@ def main() -> int:
                 "重算之后每一行的差块都在图片颜色数之内："
                 f"{[(option.key, option.defects) for option in page._plans]}",
             )
+            # m11985：色块是用户自己的决定，再按一次不许把两块悄悄并成一块。
+            keys_once = [entry.key for entry in page._base.palette]
+            page._on_rematch_blocks()
+            app.processEvents()
+            check(
+                [entry.key for entry in page._base.palette] == keys_once,
+                f"再按一次手里的色块不变（{len(keys_once)} 块原样）",
+            )
+            page._undo()
+            app.processEvents()
             page._undo()
             app.processEvents()
             check(
