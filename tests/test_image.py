@@ -1058,7 +1058,13 @@ class SpoolBudgetTests(unittest.TestCase):
             _quadrant_image(), self.palette, MatchSettings(max_colours=4, max_spools=2)
         )
         self.assertEqual(len(self._spools(result)), 2)
-        self.assertEqual(len(result.palette), 2)
+        # Two rolls can still print all four blocks: a two-filament mix is a third
+        # colour and a second mix a fourth.  「耗材上限」 says how many rolls to load,
+        # not how many colours the picture may keep — before `_with_alternatives`
+        # ran on a fresh match (1.6.32) this came back as two colours and the other
+        # two blocks were repainted with whatever survived: the reporter's pig
+        # returned as two colours at 平均 ΔE00 22.36 with 差块 9 on 上限 4.
+        self.assertEqual(len(result.palette), 4)
 
     def test_a_budget_of_one_leaves_one_colour(self):
         result = match_image(

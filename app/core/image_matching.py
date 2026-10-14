@@ -2141,9 +2141,12 @@ def match_image(
     """Reduce ``source`` to printable colours drawn from ``palette``.
 
     The default 方案; :func:`match_options` offers the alternatives the page
-    shows, and its first entry is this same answer.
+    shows, and its first entry is this same answer — ``_with_alternatives`` has
+    to be applied on both paths or the two would disagree the moment
+    「耗材上限」 is tighter than the picture's colour count.
     """
     prepared = _prepare(source, palette, settings, progress)
+    prepared = _with_alternatives(prepared, palette, band=(0.86, 0.90), progress=progress)
     result = _plan(prepared, prepared.config.max_spools, _budget_objective, progress)
     _report(progress, "完成", 1.0)
     return result
@@ -2572,7 +2575,7 @@ def _offer_options(
     pool: list[MatchResult] = []
     done = 0
     for key, title, note, objective, count in _PLAN_SPECS:
-        _report(progress, f"试着搭配耗材（{title}）", 0.88 + 0.1 * done / total)
+        _report(progress, f"试着搭配耗材（{title}）", 0.90 + 0.1 * done / total)
         found = _plans(prepared, cap, objective, limit=count, require=require, avoid=avoid)
         done += len(found)
         for result in found:
@@ -2649,6 +2652,16 @@ def match_options(
         _report(progress, "换掉「不要用」的耗材", 0.87)
         prepared = _without_banned(prepared, banned, palette)
     prepared = _collapse(prepared)
+    # 「耗材上限」 folds away whatever the blocks' own colours cost too many rolls,
+    # and on a fresh import that fold used to eat the picture: the reporter's pig
+    # (512×512, 颜色数量 32, 抖动关) has 12 blocks and came back as TWO colours —
+    # skin 93.8 % printed #EC8D97 and the eyes/brows/nose folded into one muddy
+    # 6.2 % — 平均 ΔE00 22.36 · 最差 33.62 · 差块 9 at 上限 4, while 上限 8 gave 1.13
+    # and 上限 16 gave 0.62.  The blocks are the picture, and four rolls can print
+    # all twelve of them once a block may answer with a cheaper colour that shares
+    # a roll with its neighbours.  「按当前色块重新匹配」 has done this since
+    # :func:`_with_alternatives` was written; a fresh match has the same right.
+    prepared = _with_alternatives(prepared, palette, band=(0.86, 0.90), progress=progress)
     return _offer_options(prepared, require=wanted, avoid=banned, progress=progress)
 
 
@@ -2657,6 +2670,7 @@ def _with_alternatives(
     palette: Sequence[PaletteEntry],
     *,
     locked: frozenset[int] = frozenset(),
+    band: tuple[float, float] = (0.62, 0.86),
     progress: ProgressFn | None = None,
 ) -> _Prepared:
     """Give every block of a re-match the other colours it could be printed with.
@@ -2676,7 +2690,19 @@ def _with_alternatives(
     search can then spend its rolls where they buy the most and still print every
     block: the pink takes a mix that shares a roll with the skin, the blacks take
     one that shares a roll with the reds, and all six blocks fit in four rolls.
+
+    ``band`` is the stretch of the progress bar this step may use.  「按当前色块重新
+    匹配」 reaches here mid-way (``_prepare`` has just reported 0.55) and uses the
+    default; a fresh match reaches here after ``_prepare``'s 0.85 and passes its own
+    narrow stretch, because a bar that jumps back is a bug of its own.
     """
+    low, high = band
+    span = max(0.0, high - low)
+
+    def _banded(done: float) -> float:
+        """Where in ``band`` a ``0..1`` slice of this step sits."""
+        return low + span * done
+
     if len(prepared.kept) < 2:
         return prepared
     #: The rolls the blocks ask for, largest block first: the block whose colour is
@@ -2716,7 +2742,7 @@ def _with_alternatives(
     for position, entry in enumerate(prepared.kept):
         if position in locked:
             alternatives.append([entry])
-            _report(progress, "给每个色块找可替换的颜色", 0.62 + 0.24 * (position + 1) / total)
+            _report(progress, "给每个色块找可替换的颜色", _banded((position + 1) / total))
             continue
         scored: list[tuple[float, int]] = []
         for step, key in enumerate(roll_sets):
@@ -2733,13 +2759,13 @@ def _with_alternatives(
                 _report(
                     progress,
                     "给每个色块找可替换的颜色",
-                    0.62 + 0.24 * (position + (step + 1) / len(roll_sets)) / total,
+                    _banded((position + (step + 1) / len(roll_sets)) / total),
                 )
         scored.sort(key=lambda item: item[0])
         near = [palette[index] for _value, index in scored[:_REMATCH_SHORTLIST]]
         rest = [candidate for candidate in near if candidate.key != entry.key]
         alternatives.append([entry, *rest])
-        _report(progress, "给每个色块找可替换的颜色", 0.62 + 0.24 * (position + 1) / total)
+        _report(progress, "给每个色块找可替换的颜色", _banded((position + 1) / total))
     return replace(prepared, alternatives=alternatives)
 
 
