@@ -17,6 +17,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
+import traceback
 
 import numpy as np
 from PIL import Image
@@ -152,10 +153,10 @@ LIST_TITLE_BLOCK = "图片上色块的颜色"
 #: 导出时圆滑色块的开关（m01647）。默认勾上，就在两个「生成」按钮左边。
 SMOOTH_LABEL = "圆滑色块"
 SMOOTH_TIP = (
-    "勾上之后，导出的 3MF/OBJ 会在细一档的栅格上重新分类色块，斜着走的边界不再是"
+    "勾上之后，预览和导出的 3MF/OBJ 都在细一档的栅格上重新分类色块，斜着走的边界不再是"
     "一格一格的台阶（默认细到图片像素的四分之一：150 mm 宽、512 像素的图约 0.07 mm 一格，"
-    "颜色多时退到二分之一，都比喷嘴细），打出来是圆的。\n"
-    "只影响导出，预览和「原图」不变；不勾就按 1.6.21 的样子导出。"
+    "颜色多时退到二分之一，都比喷嘴细），看起来、打出来都是圆的。\n"
+    "不勾就按匹配栅格那一格一格的方块画，也按 1.6.21 的样子导出——用色块工具点格子时清楚一些。"
 )
 
 #: 图片印在哪一面（m02289 item 2）。默认底面：图片贴着打印板，顶面是一整片底板色。
@@ -216,8 +217,9 @@ PAGE_HELP = (
     "地方就是一格一格的台阶（150 mm 宽、512 像素的图约 0.29 mm 一级），在 Bambu Studio 里放大看"
     "是锯齿。勾上之后导出时会在细一档的栅格上重新分类，边界落在格子之间（默认细到图片像素的"
     "四分之一，约 0.07 mm，颜色多时退到二分之一，都比喷嘴细），打出来"
-    "是圆的；同一个开关也写进 .bpproj，所以存过的工程下次打开还是上次那个样子。这个开关只影响"
-    "导出的 3MF/OBJ——预览和「原图」画的还是匹配栅格，不勾就照 1.6.21 的样子导出。\n"
+    "是圆的；同一个开关也写进 .bpproj，所以存过的工程下次打开还是上次那个样子。1.6.26 起这个勾"
+    "也管预览：勾着的时候「预览」和存进工程的「预览.png」画的就是导出用的细格，边界是连续的；"
+    "不勾才是一块块的原始格子（用色块工具点格子时清楚一些），导出也照 1.6.21 的样子。\n"
     f"· 「{IMAGE_SIDE_LABEL}」选图片印在模型的哪一面（1.6.23 起）：{IMAGE_SIDE_BOTTOM}（默认）"
     f"是图片朝下贴着打印板、顶面一整片底板色，打出来顶面平整；{IMAGE_SIDE_TOP} 是图片朝上，"
     "也就是 1.6.22 及以前的样子。两面都是同一块闭合实体上下对调，尺寸、厚度、体积都不变；"
@@ -393,6 +395,13 @@ class PictureView(QWidget):
         self._result: MatchResult | None = None
         self._source: QImage | None = None
         self._matched: QImage | None = None
+        # 预览是按「圆滑色块」画还是按原始格子画（m05557 item 3）。默认圆滑，
+        # 和导出侧 PlateSettings.smooth_edges 的默认值一致。
+        self._smooth = True
+        # 两种画法各留一份，来回勾「圆滑色块」就不必重算：细格那一版要一秒多
+        # （512 像素、8 色约 1.2–1.5 s），勾一次卡一次是不能接受的。
+        self._matched_cache: dict[bool, QImage] = {}
+        self._matched_for: int | None = None
         self._highlight: QPixmap | None = None
         self._selected = -1
         self._show_matched = True
@@ -501,15 +510,33 @@ class PictureView(QWidget):
     def result(self) -> MatchResult | None:
         return self._result
 
+    def setSmooth(self, smooth: bool) -> None:
+        """Draw the picture in the block borders of the exported plate, or in blocks.
+
+        1.6.26 (m05557 item 3): 「圆滑色块」 used to change nothing on screen —
+        it only reached ``PlateSettings`` at export time — so the one place the
+        user could see the difference was the slicer, after a round trip.  Now
+        the box drives the preview too, and the picture is rebuilt from the same
+        refined grid the plate is cut from.
+        """
+        smooth = bool(smooth)
+        if smooth == self._smooth:
+            return
+        self._smooth = smooth
+        if self._result is not None:
+            self._matched = self._build_matched(self._result)
+        self.update()
+
     def _build_matched(self, result: MatchResult) -> QImage:
-        height, width = result.indices.shape
-        canvas = np.zeros((height, width, 4), dtype=np.uint8)
-        for index, entry in enumerate(result.palette):
-            mask = result.indices == index
-            if not mask.any():
-                continue
-            canvas[mask] = (*entry.rgb, 255)
-        return _to_qimage(Image.fromarray(canvas, "RGBA"))
+        if self._matched_for != id(result):
+            self._matched_cache = {}
+            self._matched_for = id(result)
+        cached = self._matched_cache.get(self._smooth)
+        if cached is not None:
+            return cached
+        image = _to_qimage(render_preview(result, smooth=self._smooth))
+        self._matched_cache[self._smooth] = image
+        return image
 
     # -- geometry ---------------------------------------------------------
     def _target_rect(self) -> QRectF:
@@ -679,7 +706,11 @@ class PictureView(QWidget):
             painter.end()
             return
         rect = self._target_rect()
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+        # 圆滑色块开着就平滑缩放：放大的边界是连续的，而不是一格一格的锯齿
+        # （原始格子是给色块工具看的，那时保持锐利反而更好点）。
+        painter.setRenderHint(
+            QPainter.RenderHint.SmoothPixmapTransform, bool(self._smooth)
+        )
         painter.drawImage(rect, base)
         overlay = self._dim_pixmap()
         if overlay is not None:
@@ -1488,9 +1519,12 @@ class PicturePage(QWidget):
 
         # 导出时圆滑色块 (1.6.22): 匹配栅格上的色块边界是一格一格的台阶，在 Bambu
         # Studio 里放大看就是锯齿。 默认勾上；不勾就照 1.6.21 的样子导出。
+        # 1.6.26 (m05557 item 3): 这个勾现在也管预览——勾着的时候预览按导出用的
+        # 细格画，边界是连续的；不勾还是原始格子，方便用色块工具点格子。
         self._smooth_box = QCheckBox(SMOOTH_LABEL)
         self._smooth_box.setChecked(True)
         self._smooth_box.setToolTip(SMOOTH_TIP)
+        self._smooth_box.toggled.connect(self._on_smooth_toggled)
 
         # 图片印在哪一面 (1.6.23): 默认底面，和 1.6.22 及以前的导出上下对调。
         self._side_combo = QComboBox()
@@ -2054,10 +2088,25 @@ class PicturePage(QWidget):
         self._plan_key = state.plan
         # 色块级的改动（哪几块被删掉 / 合并 / 换成了什么）跟删除、合并、更换一起存，
         # 打开工程要把它们摆回同样的顺序，预览才是保存时的那张 (m02366 item 3).
-        self._block_edits = [
-            BlockPaint(mask=np.asarray(mask, dtype=bool), entry=entry)
-            for mask, entry in state.block_paints
-        ]
+        #
+        # 1.6.26：文件里每一步是一个字典 ``{"mask": …, "entry": …}``（见
+        # ``project._paints_from_json``），内存里的 ``ProjectState.block_paints``
+        # 也是这么放的。原先这里写的是 ``for mask, entry in state.block_paints``，
+        # 解包的其实是字典自己的两个键名，于是 ``entry`` 变成字符串 ``"entry"``、
+        # ``mask`` 变成字符串 ``"mask"``：打开带色块改动的工程时毫无反应（
+        # ``np.asarray("mask", dtype=bool)`` 只是一格 True），一直撑到保存工程时
+        # ``entry_to_json("entry")`` 才炸成「'str' object has no attribute 'key'」
+        # ——用户看到的就是「打开工程好好的，一保存就失败」。两种形状都认。
+        self._block_edits = []
+        for paint in state.block_paints:
+            mask, entry = (
+                (paint.get("mask"), paint.get("entry"))
+                if isinstance(paint, dict)
+                else (paint[0], paint[1])
+            )
+            self._block_edits.append(
+                BlockPaint(mask=np.asarray(mask, dtype=bool), entry=entry)
+            )
         self._refresh_plans()
         self._stale = False
         self._apply_edits()
@@ -2135,7 +2184,9 @@ class PicturePage(QWidget):
                 plate=self._plate_settings(),
                 library=self._library,
                 version=__version__,
-                preview=render_preview(self._result),
+                preview=render_preview(
+                self._result, smooth=bool(self._smooth_box.isChecked())
+            ),
                 plan=self._plan_key,
                 # 色块级的删除 / 合并 / 更换颜色 (m02366 item 3)：整块一起改，改的是像素
                 # 而不是「哪一种颜色」，所以文件里存的是掩码，见 save_project.
@@ -2145,7 +2196,9 @@ class PicturePage(QWidget):
             )
         except Exception as error:
             QApplication.restoreOverrideCursor()
-            QMessageBox.warning(self, "保存工程失败", str(error))
+            log = self._log_save_failure(error)
+            detail = f"\n\n详细调用栈已写到 {log}" if log is not None else ""
+            QMessageBox.warning(self, "保存工程失败", f"{error}{detail}")
             return
         QApplication.restoreOverrideCursor()
         self._project_path = written
@@ -2159,6 +2212,37 @@ class PicturePage(QWidget):
             f"原图 + 预览 + {len(self._result.palette)} 种颜色 + {spools} 卷耗材"
             f"{blocks}。下次「打开工程」就回到这一步。"
         )
+
+    def _log_save_failure(self, error: BaseException) -> Path | None:
+        """Write the failure and its stack next to the user's data, and say where.
+
+        The message box alone told nobody anything actionable: the traceback lived
+        in a dialog that vanishes with the click, which is why 「还能保存失败？」
+        was unanswerable the first time it happened (1.6.26).  The file is appended
+        to, not overwritten, so a repeat keeps the earlier evidence.
+        """
+        try:
+            folder = paths.data_dir() / "logs"
+            folder.mkdir(parents=True, exist_ok=True)
+            target = folder / "保存失败.log"
+            stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            detail = "".join(
+                traceback.format_exception(type(error), error, error.__traceback__)
+            )
+            if error.__traceback__ is None:
+                # 没有栈的异常（在别处造好再转手过来的）也要留下位置：日志里只剩
+                # 一句话的话，下次还是查不出是在哪儿报的。
+                detail += "".join(traceback.format_stack())
+            with target.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    f"[{stamp}] 保存工程失败：{error}\n"
+                    # 用传进来的这个异常对象，不用 traceback.format_exc()：后者只认
+                    # 「正在处理的那一个」，从 except 外面调它就会写成 NoneType: None。
+                    f"{detail}\n"
+                )
+            return target
+        except Exception:  # pragma: no cover - 记日志再失败也不能盖掉原来的错
+            return None
 
     def _confirm_discard(self, action: str) -> bool:
         """Ask before edits that are not in the project file yet are lost."""
@@ -3695,6 +3779,15 @@ class PicturePage(QWidget):
             smooth_edges=bool(self._smooth_box.isChecked()),
             image_on_bottom=bool(self._side_combo.currentData()),
         ).clamped()
+
+    def _on_smooth_toggled(self, checked: bool) -> None:
+        """「圆滑色块」同时管预览 (1.6.26, m05557 item 3)。
+
+        以前这个勾只进 ``PlateSettings``，也就是只在导出时才起作用：用户在界面上
+        勾来勾去，看到的还是原始格子，只有在 Bambu Studio 里才看得出差别。 现在
+        预览也照导出用的细格画，勾上就是连续边界、取消就是一块块。
+        """
+        self._view.setSmooth(bool(checked))
 
     def buildPlate(self) -> PlateModel:
         if self._result is None:

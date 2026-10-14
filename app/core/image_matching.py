@@ -157,11 +157,13 @@ def build_palette(
     ingredients, so without this the hidden spool's own colour would still be
     offered as a printable colour, which is the one thing 「隐藏」 promises not
     to happen.
+
+    ``visible`` also carries the 材质 filter (m05557 item 1): switching the
+    材质 picker must move every colour on every page, and this palette is where
+    「全部颜色」 and the 色块 colour picker read theirs from.
     """
     entries: list[PaletteEntry] = []
-    for filament in library:
-        if filament.hidden:
-            continue
+    for filament in library.visible:
         entries.append(
             PaletteEntry(
                 key=f"filament:{filament.id}",
@@ -181,6 +183,12 @@ def build_palette(
             a = library.get(recipe.a_id)
             b = library.get(recipe.b_id)
             if a is None or b is None:
+                continue
+            # 配方表是照 visible 建的，但手里的这份可能是上一轮的（切换材质后还
+            # 没重建）：宁可少给一个颜色，也别给一个打印不出来的颜色。
+            if a.hidden or b.hidden:
+                continue
+            if not library.accepts(a) or not library.accepts(b):
                 continue
             entries.append(
                 PaletteEntry(

@@ -42,6 +42,7 @@ from ..core import paths, settings
 from ..core.engines import DEFAULT_ENGINE, ENGINE_CHOICES, get_engine
 from ..core.image_matching import plan_help
 from ..core.library import (
+    ANY_MATERIAL,
     COMMON_BRANDS,
     COMMON_MATERIAL_TYPES,
     Filament,
@@ -103,7 +104,13 @@ class MainWindow(QMainWindow):
         auto_triples: bool = True,
     ) -> None:
         super().__init__(parent)
+        loaded_from_disk = library is None
         self.library = library if library is not None else self._load_library()
+        if loaded_from_disk:
+            # 上次用的耗材种类 (m05557 item 1). 只有从磁盘读出来的档案才认这条
+            # 记忆——调用方自己造一份库（测试、工具）时，它给的 material 就是
+            # 它要的，不被磁盘上的偏好覆盖。
+            self.library.material = self._remembered_material()
         self._catalog: MixCatalog | None = None
         self._recipes: list = []
         self._pair_filter: tuple[str, str] | None = None
@@ -153,6 +160,20 @@ class MainWindow(QMainWindow):
         except LibraryError as exc:
             QTimer.singleShot(0, lambda: QMessageBox.warning(self, "读取耗材档案失败", str(exc)))
             return FilamentLibrary()
+
+    def _remembered_material(self) -> str:
+        """The 耗材种类 to start on: 上次选的那个，否则卷数最多的那一种.
+
+        「切换材质后全部颜色跟着耗材颜色变化」只有在下拉显示的和实际用来配色
+        的是同一种时才成立，所以记忆里的那种已经不在了（删了、藏了、改了种类）
+        就落回库里最多的那一种，而不是留着一个查不到的字符串 (m05557 item 1).
+        """
+        names = self.library.materials()
+        remembered = str(settings.load_settings().get("material") or "").strip()
+        folded = {name.casefold(): name for name in names}
+        if remembered and remembered.casefold() in folded:
+            return folded[remembered.casefold()]
+        return names[0] if names else ANY_MATERIAL
 
     def _build_ui(self) -> None:
         title = QLabel("BambuPalette")
@@ -379,6 +400,27 @@ class MainWindow(QMainWindow):
         self._clear_button.clicked.connect(self._on_clear_library)
         self._clear_button.setEnabled(False)
 
+        # 材质切换 (m05557 item 1): 两种塑料不能混进同一根喷嘴，所以配色只能认一
+        # 个耗材种类。它和「清空耗材库」同在最上面一行，因为它管的是整库的颜色而
+        # 不是某一卷：切换之后 混色 / 全部颜色 / 三色表 和「图像转换」页的匹配都
+        # 只从这个种类的耗材里取色（见 FilamentLibrary.visible）。
+        self._material_combo = QComboBox()
+        self._material_combo.setToolTip(
+            "按耗材种类配色：切换以后，全部颜色都只从这一种的耗材里取。"
+        )
+        self._material_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToContents
+        )
+        self._material_combo.currentIndexChanged.connect(self._on_material_changed)
+        self._material_guard = False
+        material_row = QWidget()
+        material_layout = QHBoxLayout(material_row)
+        material_layout.setContentsMargins(0, 0, 0, 0)
+        material_layout.setSpacing(6)
+        material_layout.addWidget(QLabel("材质"))
+        material_layout.addWidget(self._material_combo)
+        material_layout.addWidget(self._clear_button)
+
         row_one = QHBoxLayout()
         row_one.setSpacing(6)
         row_one.addWidget(self._edit_button)
@@ -415,7 +457,7 @@ class MainWindow(QMainWindow):
         self._backspace_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         self._backspace_shortcut.activated.connect(self._on_delete)
 
-        return self._wrap(panel, "我的耗材", self._clear_button)
+        return self._wrap(panel, "我的耗材", material_row)
 
     def _build_grid_panel(self) -> QWidget:
         self._grid = MixGrid()
@@ -469,18 +511,20 @@ class MainWindow(QMainWindow):
             if filament.display_name.strip().casefold() == filament.color_hex.casefold():
                 red, green, blue = filament.rgb
                 detail = f"RGB {red}, {green}, {blue}"
+            # 行留着但灰掉：这种卷只是现在不参与配色，不是被删掉了 (m05557 item 1)。
+            if filament.hidden:
+                suffix = "（已隐藏）"
+            elif not self.library.accepts(filament):
+                suffix = f"（{filament.material_type or '未填种类'}，现在不配色）"
+            else:
+                suffix = ""
             item = QListWidgetItem(
                 swatch_icon(filament.color_hex, 28, 28),
-                (
-                    f"{filament.display_name}   {detail}   （已隐藏）"
-                    if filament.hidden
-                    else f"{filament.display_name}   {detail}"
-                ),
+                f"{filament.display_name}   {detail}" + (f"   {suffix}" if suffix else ""),
             )
             item.setData(Qt.ItemDataRole.UserRole, filament.id)
-            if filament.hidden:
-                # 行留着（不然没法把它放回来），但灰掉，让「这卷现在不算数」一眼
-                # 看得出来。
+            if filament.hidden or not self.library.accepts(filament):
+                # 灰掉，让「这卷现在不算数」一眼看得出来。
                 item.setForeground(QBrush(QColor(theme.TEXT_FAINT)))
             if not filament.hidden and self._pair_filter and filament.id in self._pair_filter:
                 font = item.font()
@@ -493,8 +537,57 @@ class MainWindow(QMainWindow):
         self._library_hint.setVisible(not has_any)
         self._list.setVisible(has_any)
         self._clear_button.setEnabled(has_any)
+        self._refresh_material_combo()
         self._rebuild_catalog()
         self._save_library()
+
+    def _refresh_material_combo(self) -> None:
+        """Fill the 材质 picker from the library, keeping the current choice.
+
+        The counts ride in the label because 「PETG HF（3）」 answers the question
+        the switch is about — how many spools of that material will actually be
+        spent — without opening anything (m05557 item 1).
+        """
+        names = self.library.materials()
+        self._material_guard = True
+        try:
+            self._material_combo.clear()
+            if not names:
+                self._material_combo.addItem("—", ANY_MATERIAL)
+                self._material_combo.setEnabled(False)
+                return
+            self._material_combo.setEnabled(True)
+            counts: dict[str, int] = {}
+            for filament in self.library:
+                if not filament.hidden:
+                    key = (filament.material_type or "").strip()
+                    counts[key] = counts.get(key, 0) + 1
+            for name in names:
+                self._material_combo.addItem(f"{name}（{counts.get(name, 0)}）", name)
+            index = self._material_combo.findData(self.library.material)
+            if index < 0:
+                index = 0
+                self.library.material = self._material_combo.itemData(0) or ANY_MATERIAL
+            self._material_combo.setCurrentIndex(index)
+        finally:
+            self._material_guard = False
+
+    def _on_material_changed(self, index: int) -> None:
+        """切换材质 = 换一份耗材清单，所有颜色跟着重来一遍 (m05557 item 1).
+
+        Nothing else has to know: the catalogues, the triples table and the
+        picture page are all built from ``library.visible``, so moving that one
+        line moves every colour on every page.
+        """
+        if self._material_guard or index < 0:
+            return
+        material = self._material_combo.itemData(index) or ANY_MATERIAL
+        if material == self.library.material:
+            return
+        self.library.material = material
+        settings.save_settings({"material": material})
+        self._refresh_material_combo()
+        self._reload_library()
 
     def _save_library(self) -> None:
         try:
@@ -1182,6 +1275,14 @@ class MainWindow(QMainWindow):
             # 藏起来的料不在这条统计里，就得说出来，否则「耗材本色只有 40 种」
             # 会像是丢了一卷。
             note += f" · 另有 {hidden} 卷已隐藏（不参与混色）"
+        other_material = self.library.other_material_count
+        if other_material:
+            # 别的材质的卷同样不在这条统计里：不说出来，「耗材本色只有 4 种」
+            # 会像是库里少了十几卷。切换材质它们就回来 (m05557 item 1)。
+            note += (
+                f" · 现在按 {self.library.material} 配色，"
+                f"另有 {other_material} 卷是别的材质"
+            )
         note += f" · 去重后共 {everything:,} 个颜色"
         if self._pair_filter is not None:
             note += " · 已筛选"

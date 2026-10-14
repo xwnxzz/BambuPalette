@@ -33,6 +33,10 @@ from . import paths
 
 LIBRARY_FORMAT_VERSION = 2
 
+#: ``FilamentLibrary.material`` 取这个值 = 不过滤材质（库里还没有耗材、或者调用方
+#: 根本不关心材质时都是它）。
+ANY_MATERIAL = ""
+
 #: Suggested 耗材种类 values offered by the UI combo box.
 COMMON_MATERIAL_TYPES = (
     "PLA",
@@ -218,11 +222,26 @@ class LibraryError(RuntimeError):
 
 
 class FilamentLibrary:
-    """Ordered collection of :class:`Filament` records with JSON persistence."""
+    """Ordered collection of :class:`Filament` records with JSON persistence.
 
-    def __init__(self, filaments: Iterable[Filament] | None = None) -> None:
+    Besides the spools themselves the library carries the one piece of state
+    the whole app shares: :attr:`material`, the 耗材种类 the colours are
+    currently being drawn from.  Two different plastics cannot be blended into
+    one extruder — the printer would be asked to print a mixture that does not
+    exist — so the list every catalogue is built from (:attr:`visible`) is
+    filtered by it, and switching it in the 「我的耗材」 panel is what makes every
+    colour on every page follow that material (m05557 item 1).
+    """
+
+    def __init__(
+        self,
+        filaments: Iterable[Filament] | None = None,
+        *,
+        material: str = ANY_MATERIAL,
+    ) -> None:
         self._filaments: list[Filament] = list(filaments or [])
         self._index: dict[str, Filament] = {f.id: f for f in self._filaments}
+        self._material = str(material or "").strip()
 
     # -- container protocol -------------------------------------------------------
     def __len__(self) -> int:
@@ -245,8 +264,28 @@ class FilamentLibrary:
         return list(self._filaments)
 
     @property
+    def material(self) -> str:
+        """The 耗材种类 the colours come from (``""`` = every material)."""
+        return self._material
+
+    @material.setter
+    def material(self, value: str) -> None:
+        self._material = str(value or "").strip()
+
+    def accepts(self, filament: Filament) -> bool:
+        """Whether this spool is part of the current material's list.
+
+        ``ANY_MATERIAL`` accepts everything, which is what every library built
+        without a material gets — so nothing that does not care about the
+        switch (tests, the exporter, a project being opened) changes behaviour.
+        """
+        if not self._material:
+            return True
+        return filament.material_type.casefold() == self._material.casefold()
+
+    @property
     def visible(self) -> list[Filament]:
-        """The spools that may take part in mixing — everything not hidden.
+        """The spools that may take part in mixing — not hidden, right material.
 
         Every catalogue is built from this list rather than from
         :attr:`filaments`, which is what makes 「隐藏」 mean the same thing on
@@ -255,12 +294,43 @@ class FilamentLibrary:
         can be produced.  Filtering once here beats filtering in the matcher,
         the grid, 「全部颜色」 and the exporter separately, where the four could
         drift apart.
+
+        :attr:`material` rides the same list, for the same reason: 「PETG 不能
+        和 PLA 混色」 is a rule about ingredients, and the one place that decides
+        what an ingredient is answers it for the matcher, the mixes, the triples
+        and the 3MF exporter at once (m05557 item 1).
         """
-        return [filament for filament in self._filaments if not filament.hidden]
+        return [
+            filament
+            for filament in self._filaments
+            if not filament.hidden and self.accepts(filament)
+        ]
 
     @property
     def hidden_count(self) -> int:
         return sum(1 for filament in self._filaments if filament.hidden)
+
+    @property
+    def other_material_count(self) -> int:
+        """Spools that are usable but are another 耗材种类 (they come back on switch)."""
+        return sum(
+            1 for filament in self._filaments if not filament.hidden and not self.accepts(filament)
+        )
+
+    def materials(self) -> list[str]:
+        """Every 耗材种类 in the library, most spools first, ties alphabetically.
+
+        Hidden spools do not count — a material whose every spool is hidden is
+        not a material the user can switch to and get colours out of.
+        """
+        counts: dict[str, int] = {}
+        for filament in self._filaments:
+            if filament.hidden:
+                continue
+            name = (filament.material_type or "").strip()
+            if name:
+                counts[name] = counts.get(name, 0) + 1
+        return sorted(counts, key=lambda name: (-counts[name], name.casefold()))
 
     def get(self, filament_id: str) -> Filament | None:
         return self._index.get(filament_id)

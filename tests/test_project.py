@@ -50,7 +50,7 @@ from app.core.project import (  # noqa: E402
     save_project,
     spool_list,
 )
-from app.mesh.plate import PlateSettings  # noqa: E402
+from app.mesh.plate import PlateSettings, smooth_factor  # noqa: E402
 from app.spectral import color as _color  # noqa: E402
 
 SPOOLS = (
@@ -304,8 +304,7 @@ class ProjectRoundTripTests(unittest.TestCase):
         self.assertEqual(preview.getpixel((1, 0))[:3], base.palette[0].rgb)
 
         rows = colour_list(base)
-        self.assertEqual(len(rows), len(base.palette))
-        # The shares are rounded to six decimals to keep the JSON readable, so
+        self.assertEqual(len(rows), len(base.palette))        # The shares are rounded to six decimals to keep the JSON readable, so
         # three of them cannot be expected to add up to exactly 1.0.
         self.assertAlmostEqual(sum(row["share_of_pixels"] for row in rows), 1.0, delta=1e-4)
         self.assertEqual(rows[0]["hex"], base.palette[0].color_hex)
@@ -329,6 +328,30 @@ class ProjectRoundTripTests(unittest.TestCase):
         ):
             self.assertGreater(shares[parent], 0.0)
             self.assertGreaterEqual(percent, 0)
+
+    def test_the_smoothed_preview_is_the_grid_the_plate_is_cut_from(self):
+        """圆滑色块 also decides what 预览.png looks like (m05557 item 3).
+
+        The panel and the saved preview used to show the raw match grid — the
+        one-cell staircase — while the plate was cut from the refined grid, so
+        the only place the box did anything was inside Bambu Studio.
+        """
+        library = _library()
+        base = _base_match(library)
+        raw = render_preview(base)
+        smooth = render_preview(base, smooth=True)
+        steps = smooth_factor(*base.indices.shape, colours=len(base.palette))
+        self.assertEqual(smooth.size, (raw.width * steps, raw.height * steps))
+        # Same picture, finer lattice: the colours are the ones the match chose,
+        # every pixel is one of them, and the alpha the raw grid had is kept.
+        allowed = {(*entry.rgb, 255) for entry in base.palette}
+        allowed.add((0, 0, 0, 0))
+        pixels = np.asarray(smooth.convert("RGBA")).reshape(-1, 4)
+        self.assertTrue({tuple(int(v) for v in row) for row in pixels} <= allowed)
+        self.assertEqual(
+            smooth.getpixel((0, 0))[3],
+            0 if raw.getpixel((0, 0))[3] == 0 else 255,
+        )
 
     def test_spools_this_machine_no_longer_has_are_marked_not_invented(self):
         library = _library()

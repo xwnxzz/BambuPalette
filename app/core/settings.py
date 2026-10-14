@@ -1,10 +1,11 @@
 """Persisted user preferences.
 
-Two things are remembered: which mixing engine the user picked, and how a click
-in 「预览」 chooses a colour.  The Bambu 2.8 pigment engine is the shipped default
-because it reproduces what the user's installed Bambu Studio paints; the legacy
-sRGB engine and the Kubelka-Munk spectral engine are first-class choices, so the
-selection is remembered instead of resetting on every launch.
+Three things are remembered: which mixing engine the user picked, how a click
+in 「预览」 chooses a colour, and which 耗材种类 the library is currently filtered
+to.  The Bambu 2.8 pigment engine is the shipped default because it reproduces
+what the user's installed Bambu Studio paints; the legacy sRGB engine and the
+Kubelka-Munk spectral engine are first-class choices, so the selection is
+remembered instead of resetting on every launch.
 
 ``version`` exists because the meaning of the default moved once already: before
 build 02.08 the id ``"bambu"`` named the sRGB average and was also the shipped
@@ -26,6 +27,7 @@ __all__ = [
     "load_settings",
     "save_settings",
     "DEFAULT_SETTINGS",
+    "DEFAULT_MATERIAL",
     "SETTINGS_VERSION",
     "PICK_COLOUR",
     "PICK_EDGE",
@@ -49,8 +51,14 @@ DEFAULT_PICK_MODE = PICK_COLOUR
 DEFAULT_SETTINGS: dict = {
     "engine": DEFAULT_ENGINE,
     "pick_mode": DEFAULT_PICK_MODE,
+    "material": "",
     "version": SETTINGS_VERSION,
 }
+
+#: 上次按哪种耗材配色 (m05557 item 1). 空串＝不按材质过滤，和库层的
+#: ``library.ANY_MATERIAL`` 是同一个哨兵；settings 这层只认字符串，不去 import
+#: 库（那会把 numpy/光谱那一摞拖进来），所以这个字面量在这儿再写一遍。
+DEFAULT_MATERIAL = ""
 
 #: Engine ids that used to be the shipped default.  A pre-version file holding
 #: one of these is migrated to the current default rather than kept.
@@ -90,6 +98,7 @@ def load_settings() -> dict:
         return values
     values["engine"] = _migrate_engine(raw.get("engine"), raw.get("version"))
     values["pick_mode"] = resolve_pick_mode(raw.get("pick_mode"))
+    values["material"] = str(raw.get("material") or "").strip()
     return values
 
 

@@ -41,7 +41,7 @@ from app.core.engines import (  # noqa: E402
     resolve_engine_id,
 )
 from app.core.image_matching import build_palette  # noqa: E402
-from app.core.library import Filament, FilamentLibrary  # noqa: E402
+from app.core.library import ANY_MATERIAL, Filament, FilamentLibrary  # noqa: E402
 from app.core.mixes import (  # noqa: E402
     MIX_RATIOS,
     SORT_CHOICES,
@@ -1264,6 +1264,91 @@ class LibraryPersistenceTests(unittest.TestCase):
         }
         self.assertNotIn(hidden.id, ids)
         self.assertTrue(all(recipe.a_id != hidden.id for recipe in catalog.recipes))
+
+    # ── 材质开关 (m05557 item 1) ────────────────────────────────────────────
+    # 两种塑料不能混进同一根喷嘴，所以配色只认一个耗材种类。作用面和「隐藏」
+    # 一模一样：visible 是全 App（混色表、全部颜色、三色表、图像页匹配、导出）
+    # 唯一的那道过滤，所以这里测住它，也就测住了全部页面。
+
+    def _mixed_library(self) -> FilamentLibrary:
+        library = FilamentLibrary()
+        library.create(name="肤色", brand="大简", material_type="PETG HF", color_hex="#F5D2B8")
+        library.create(name="红", brand="大简", material_type="PETG HF", color_hex="#C52A36")
+        library.create(name="黑", brand="b", material_type="PLA", color_hex="#2C2A2C")
+        library.create(name="橙", brand="b", material_type="PLA", color_hex="#FF6C2B")
+        return library
+
+    def test_a_material_scope_drops_the_other_materials(self):
+        library = self._mixed_library()
+        self.assertEqual(len(library.visible), 4)  # 不设 scope ＝ 全都要
+        library.material = "PETG HF"
+        self.assertEqual([f.name for f in library.visible], ["肤色", "红"])
+        self.assertEqual(library.other_material_count, 2)
+        # 它们不是被删了、也不是被「隐藏」了：切回去就回来。
+        self.assertEqual(library.hidden_count, 0)
+        self.assertIsNotNone(library.get(library[2].id))
+        library.material = "PLA"
+        self.assertEqual([f.name for f in library.visible], ["黑", "橙"])
+        self.assertEqual(library.other_material_count, 2)
+
+    def test_clearing_the_scope_brings_every_spool_back(self):
+        library = self._mixed_library()
+        library.material = "PLA"
+        library.material = ANY_MATERIAL
+        self.assertEqual(len(library.visible), 4)
+        self.assertEqual(library.other_material_count, 0)
+
+    def test_the_scope_ignores_case_and_padding(self):
+        library = FilamentLibrary()
+        library.create(name="肤色", material_type="petg hf", color_hex="#F5D2B8")
+        library.material = "  PETG HF  "
+        self.assertEqual([f.name for f in library.visible], ["肤色"])
+        self.assertTrue(library.accepts(library[0]))
+
+    def test_a_hidden_spool_is_not_another_material(self):
+        # 别把两种「不算数」搞混：隐藏是用户自己按下的，材质是切换带来的。
+        library = self._mixed_library()
+        library.update(library[0].id, hidden=True)
+        library.material = "PETG HF"
+        self.assertEqual([f.name for f in library.visible], ["红"])
+        self.assertEqual(library.hidden_count, 1)
+        self.assertEqual(library.other_material_count, 2)  # 黑、橙
+        self.assertEqual(ANY_MATERIAL, "")
+
+    def test_an_untyped_spool_belongs_to_no_material(self):
+        # 没填种类的卷不敢算进任何一种材质里——「可能不是」正是混错料的原因。
+        library = self._mixed_library()
+        library.create(name="没填", color_hex="#FFD400")
+        self.assertEqual(library.materials(), ["PETG HF", "PLA"])
+        library.material = "PETG HF"
+        self.assertIn("没填", [f.name for f in library if not library.accepts(f)])
+        self.assertNotIn("没填", [f.name for f in library.visible])
+
+    def test_materials_lists_the_biggest_first_and_skips_hidden(self):
+        library = self._mixed_library()
+        library.create(name="橙 2", material_type="PLA", color_hex="#FF8C2B")
+        library.create(name="藏", material_type="ABS", color_hex="#101010", hidden=True)
+        self.assertEqual(library.materials(), ["PLA", "PETG HF"])
+        self.assertEqual(library.material, ANY_MATERIAL)
+
+    def test_the_palette_leaves_the_other_materials_out(self):
+        # 用户看到的那句「切换材质后全部颜色跟着耗材颜色变化」：颜色池就是
+        # build_palette 从这张库里取的那几个。
+        library = self._mixed_library()
+        library.material = "PLA"
+        palette = build_palette(library, None, include_mixes=False)
+        self.assertEqual(sorted(entry.color_hex for entry in palette), ["#2C2A2C", "#FF6C2B"])
+
+    def test_a_mix_never_crosses_materials(self):
+        library = self._mixed_library()
+        library.material = "PETG HF"
+        catalog = MixCatalog(library.visible, MIX_RATIOS).build()
+        petg = {library[0].id, library[1].id}
+        ids = {recipe.a_id for recipe in catalog.recipes} | {
+            recipe.b_id for recipe in catalog.recipes
+        }
+        self.assertTrue(ids)
+        self.assertEqual(ids, petg)
 
 
 if __name__ == "__main__":

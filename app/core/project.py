@@ -33,7 +33,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from ..mesh.plate import PlateSettings
+from ..mesh.plate import PlateSettings, smooth_factor, smooth_indices
 from ..spectral import color as _color
 from .image_matching import (
     MatchResult,
@@ -220,19 +220,30 @@ def entry_from_json(
 # ---------------------------------------------------------------------------
 # 预览 / 清单
 # ---------------------------------------------------------------------------
-def render_preview(result: MatchResult | None) -> Image.Image:
+def render_preview(result: MatchResult | None, *, smooth: bool = False) -> Image.Image:
     """The matched picture as an image: each pixel in its own colour, RGBA.
 
     This is the same picture the preview panel draws, built from the result
     rather than grabbed from a widget, so the file carries what the user sees
     and not whatever the window happened to be sized to.
+
+    ``smooth`` draws it from the refined grid the plate is cut from instead of
+    the match grid itself (m05557 item 3).  The match grid is a one-cell
+    staircase on every angled border; the plate has always been cut from the
+    refined grid, so 预览.png and the panel were the only places still showing
+    the saw.  With the box off the picture is the raw grid, which is what the
+    block tools point at.
     """
     if result is None:
         return Image.new("RGBA", (1, 1), (0, 0, 0, 0))
-    height, width = (int(result.indices.shape[0]), int(result.indices.shape[1]))
+    indices = result.indices
+    if smooth:
+        steps = smooth_factor(*indices.shape, colours=len(result.palette))
+        indices = smooth_indices(indices, factor=steps)
+    height, width = (int(indices.shape[0]), int(indices.shape[1]))
     canvas = np.zeros((height, width, 4), dtype=np.uint8)
     for index, entry in enumerate(result.palette):
-        mask = result.indices == index
+        mask = indices == index
         if mask.any():
             canvas[mask] = (int(entry.rgb[0]), int(entry.rgb[1]), int(entry.rgb[2]), 255)
     return Image.fromarray(canvas, "RGBA")
@@ -297,8 +308,17 @@ def _indices_from_bytes(payload: bytes) -> np.ndarray:
 def _paint_parts(item) -> tuple[np.ndarray | None, PaletteEntry | None]:
     """One 色块级 edit as ``(mask, entry)``; both the tuple and the dict form."""
     if isinstance(item, dict):
-        return item.get("mask"), item.get("entry")
-    mask, entry = item
+        mask, entry = item.get("mask"), item.get("entry")
+    else:
+        mask, entry = item
+    if entry is not None and not hasattr(entry, "key"):
+        # 1.6.26：进到这里说明调用方把「颜色」弄成了别的东西（1.6.25 的
+        # ``_adopt_project`` 就把字典的键名当成了 entry，一路活到 ``entry_to_json``
+        # 才报 ``'str' object has no attribute 'key'``）。不再让那种错误一路飘到
+        # 写文件的中途，就在这里说清楚哪一步坏了。
+        raise ProjectError(
+            f"色块改动里的颜色不是一个颜色对象（收到 {type(entry).__name__}：{entry!r}）。"
+        )
     return mask, entry
 
 

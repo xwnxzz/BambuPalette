@@ -448,6 +448,99 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     check("RGB 0, 0, 0" in row, "the duplicate hex is replaced by the RGB numbers")
     unnamed_window.close()
 
+    # 材质开关 (m05557 item 1)：两种塑料不能混进同一根喷嘴，所以配色只认一个耗
+    # 材种类。切一下，每页的颜色池都得跟着换——库里别的材质的卷还列着，只是灰掉
+    # 了；切回来它们也该原样回来。
+    from .core.settings import load_settings as _material_settings
+
+    material_window = MainWindow(
+        library=FilamentLibrary(
+            [
+                _SelftestFilament(
+                    name="A-PETG", brand="大简", material_type="PETG HF", color_hex="#F5D2B8"
+                ),
+                _SelftestFilament(
+                    name="B-PETG", brand="大简", material_type="PETG HF", color_hex="#C52A36"
+                ),
+                _SelftestFilament(name="C-PLA", brand="b", material_type="PLA", color_hex="#2C2A2C"),
+                _SelftestFilament(name="D-PLA", brand="b", material_type="PLA", color_hex="#FF6C2B"),
+            ]
+        ),
+        auto_triples=False,
+    )
+    material_window.resize(1100, 760)
+    material_window.show()
+    app.processEvents()
+    material_combo = material_window._material_combo
+    labels = [material_combo.itemText(index) for index in range(material_combo.count())]
+    check(
+        labels == ["PETG HF（2）", "PLA（2）"],
+        f"材质下拉按种类列出库里的耗材和卷数（{labels}）",
+    )
+    check(
+        material_window.library.material == "PETG HF",
+        f"没有记忆时先落在卷数最多的那一种（{material_window.library.material!r}）",
+    )
+    check(
+        [f.name for f in material_window.library.visible] == ["A-PETG", "B-PETG"],
+        "默认只有这一种材质的耗材参与配色",
+    )
+
+    def _grid_hexes() -> set[str]:
+        return {recipe.color_hex.upper() for recipe in material_window._recipes}
+
+    check(
+        {"#F5D2B8", "#C52A36"} <= _grid_hexes(),
+        "切换前格子里是 PETG 那两卷的颜色",
+    )
+
+    material_combo.setCurrentIndex(material_combo.findData("PLA"))
+    app.processEvents()
+    check(
+        material_window.library.material == "PLA",
+        f"动一下下拉就换了配色材质（{material_window.library.material!r}）",
+    )
+    check(
+        sorted(f.name for f in material_window.library.visible) == ["C-PLA", "D-PLA"],
+        "切换后只剩 PLA 那两卷参与配色",
+    )
+    check(
+        not ({"#F5D2B8", "#C52A36"} & _grid_hexes()),
+        "切换后 PETG 的颜色一个都不在格子里",
+    )
+    check({"#2C2A2C", "#FF6C2B"} <= _grid_hexes(), "PLA 的两卷本色都在格子里")
+    spilled = [
+        material_window._list.item(index).text()
+        for index in range(2)
+        if "现在不配色" not in material_window._list.item(index).text()
+    ]
+    check(
+        not spilled,
+        f"别的材质的卷还列在库里、只是标着「现在不配色」（{spilled}）",
+    )
+    check(
+        material_window.library.hidden_count == 0,
+        "切换材质不是隐藏：没有一卷被标成已隐藏",
+    )
+    check(
+        material_window._status.text().find("现在按 PLA 配色") >= 0,
+        f"状态栏说明现在按什么配色（{material_window._status.text()[:60]!r}）",
+    )
+
+    material_combo.setCurrentIndex(material_combo.findData("PETG HF"))
+    app.processEvents()
+    check(
+        "#F5D2B8" in _grid_hexes() and "#2C2A2C" not in _grid_hexes(),
+        "切回去 PETG 的颜色回来、PLA 的走开",
+    )
+    remembered = _material_settings().get("material")
+    check(
+        remembered == "PETG HF",
+        f"选的材质记住了，下次开窗就用它（{remembered!r}）",
+    )
+    material_window.close()
+    app.processEvents()
+
     check(
         window._picture_page is not None and window._tabs.count() == 2,
         "both pages are present",
@@ -1603,6 +1696,111 @@ def run_selftest(*, report_path: Path | None = None) -> int:
                 == 255,
                 "Ctrl+Z 把原图也退回去：像素重新不透明、标记消失",
             )
+        # 1.6.26 (m05557 item 2)：「打开工程 → 再保存」这一条路以前是断的。工程文件里
+        # 每一步色块改动是一个字典 ``{"mask": …, "entry": …}``，1.6.25 的
+        # ``_adopt_project`` 却把它当成一对解包，于是 ``entry`` 成了字符串 "entry"、
+        # ``mask`` 成了 "mask"，一路活到保存时才炸成「'str' object has no attribute
+        # 'key'」——用户看到的正是「打开好好的，一保存就失败」。这里整条路走一遍。
+        from .core.project import load_project as _load_project  # noqa: PLC0415
+
+        reopened = scratch / "selftest-reopen.bpproj"
+        page._set_pick_mode(_pp.PICK_EDGE, save=False)
+        app.processEvents()
+        # 这一遍会把「删掉一块」和「打开工程」都做一次，做完必须把页面摆回原样，
+        # 否则后面那些检查看到的就不是它们上一次留下的状态了。
+        before_round_trip = page._snapshot()
+        path_before = page._project_path
+        dirty_before = page._dirty
+        blocks = page._blocks
+        if blocks is not None and blocks.count:
+            page._list.clear_selection()
+            page._on_region_clicked(blocks.order()[0])
+            app.processEvents()
+            page._delete_button.click()
+            app.processEvents()
+            # 删除存的是 entry=None，抓不到「entry 成了字符串」这种坏法；再换一块
+            # 颜色，让文件里真的带着一个颜色对象走一圈。删除会把块重排，块对象和
+            # 编号都换新的，所以要再读一次，否则下面拿到的是旧编号。
+            blocks = page._blocks
+            target = blocks.order()[1] if blocks.count > 1 else blocks.order()[0]
+            current = page.result.palette[blocks.value(target)].key
+            wanted = next(
+                (
+                    entry
+                    for entry in page._candidate_palette()
+                    if entry.key != current
+                ),
+                None,
+            )
+            if wanted is not None:
+                real_picker = _pp.ColourPickerDialog
+                _pp.ColourPickerDialog = lambda *args, **kwargs: _StubDialog(0, wanted)
+                try:
+                    page._list.clear_selection()
+                    page._on_region_clicked(target)
+                    app.processEvents()
+                    page._on_replace()
+                    app.processEvents()
+                finally:
+                    _pp.ColourPickerDialog = real_picker
+        check(bool(page._block_edits), "先造一处色块改动，好跟着走一遍打开→保存")
+        page._project_path = reopened
+        page._on_save_project()
+        check(reopened.is_file() and not page._dirty, "带色块改动的工程能存下来")
+        if reopened.is_file():
+            state = _load_project(reopened, library=page._library)
+            page._adopt_project(state, reopened)
+            app.processEvents()
+            entries = [edit.entry for edit in page._block_edits]
+            check(
+                len(entries) == len(state.block_paints),
+                f"重开工程把 {len(state.block_paints)} 处色块改动都摆回来"
+                f"（现在是 {len(entries)} 处）",
+            )
+            check(
+                all(entry is None or hasattr(entry, "key") for entry in entries),
+                "重开后色块改动里的「颜色」还是颜色对象，不是字符串 "
+                f"（类型：{[type(entry).__name__ for entry in entries]}）",
+            )
+            check(
+                any(entry is not None for entry in entries),
+                "这一遍真的带着一个颜色对象走了一圈（不只是删除留下的 None）",
+            )
+            check(
+                all(
+                    _np.asarray(edit.mask).shape == state.base.indices.shape
+                    for edit in page._block_edits
+                ),
+                "重开后每处色块改动的掩码和图片一样大（不是一格 True）",
+            )
+            page._on_save_project()
+            check(not page._dirty, "重开工程再保存一次不会失败")
+        page._project_path = path_before
+        page._restore(before_round_trip)
+        page._set_pick_mode(page._mode, save=False)
+        page._apply_edits()
+        page._refresh_plans()
+        page._dirty = dirty_before
+        app.processEvents()
+
+        # 保存失败时日志要落在数据目录里：只弹一个框的话，用户报「保存失败」时谁也
+        # 不知道栈在哪（1.6.26）。这里真的 raise 一次再转手给日志，走的就是
+        # ``except Exception as error`` 那条路。
+        try:
+            raise RuntimeError("自检：故意失败，检查日志")
+        except RuntimeError as planned:
+            log_path = page._log_save_failure(planned)
+        check(
+            log_path is not None and log_path.is_file(),
+            f"保存失败会写日志（{log_path}）",
+        )
+        if log_path is not None and log_path.is_file():
+            logged = log_path.read_text(encoding="utf-8")
+            check(
+                "自检：故意失败，检查日志" in logged and "Traceback" in logged,
+                "日志里既有出错的话，也有调用栈",
+            )
+
         # m02316 item 3：「删除」两个字就是全部，键位由 Esc 那条快捷方式负责（Del 仍然
         # 好使，见上）——按钮上挂着「(Del)」反而像按钮名字的一部分。
         check(
@@ -1990,6 +2188,40 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         page._smooth_box.setChecked(True)
         app.processEvents()
         plate = page.buildPlate()
+
+        # 1.6.26 (m05557 item 3)：这个勾现在也管预览。从前它只进 PlateSettings，
+        # 在界面上勾来勾去看到的还是原始格子，唯一能看出差别的地方是 Bambu Studio。
+        page._smooth_box.setChecked(False)
+        app.processEvents()
+        blocky_matched = page._view._matched
+        check(
+            page._view._smooth is False
+            and blocky_matched is not None
+            and blocky_matched.width() == page.result.width,
+            f"取消勾选后预览回到原始格子（{None if blocky_matched is None else blocky_matched.width()} px）",
+        )
+        page._smooth_box.setChecked(True)
+        app.processEvents()
+        round_matched = page._view._matched
+        check(
+            page._view._smooth is True
+            and round_matched is not None
+            and blocky_matched is not None
+            and round_matched.width() > blocky_matched.width(),
+            f"勾上之后预览画的是导出用的细格（{None if round_matched is None else round_matched.width()} px）",
+        )
+        page._smooth_box.setChecked(False)
+        app.processEvents()
+        check(
+            page._view._matched is blocky_matched,
+            "来回勾不会重算细格（第二遍拿的是缓存里那张）",
+        )
+        page._smooth_box.setChecked(True)
+        app.processEvents()
+        check(
+            page._view._matched is round_matched,
+            "勾回来也是缓存那张，图案两次一模一样",
+        )
 
         # 1.6.23 (m02289 item 2)：图片印在哪一面。默认底面：色块层贴着打印板，顶面是
         # 一整片底板色。换一面就是把整块实体在 Z 上照一次镜子，绕序再翻回来，所以

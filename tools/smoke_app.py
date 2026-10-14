@@ -1321,6 +1321,57 @@ def main() -> int:
     check(len(lone_window._recipes) > 0, "the empty-state message is not what a lone spool gets")
     lone_window.close()
 
+    # --- 材质开关 (m05557 item 1) -------------------------------------------------
+    # 两种塑料不能混进同一根喷嘴：切换材质＝换一份配色清单，Every page follows.
+    material_mix = FilamentLibrary(
+        [
+            Filament(name="A-PETG", brand="大简", material_type="PETG HF", color_hex="#F5D2B8"),
+            Filament(name="B-PETG", brand="大简", material_type="PETG HF", color_hex="#C52A36"),
+            Filament(name="C-PLA", brand="b", material_type="PLA", color_hex="#2C2A2C"),
+            Filament(name="D-PLA", brand="b", material_type="PLA", color_hex="#FF6C2B"),
+        ]
+    )
+    material_window = MainWindow(library=material_mix, auto_triples=False)
+    material_window.resize(1200, 800)
+    material_window.show()
+    app.processEvents()
+    picker = material_window._material_combo
+    check(
+        [picker.itemText(index) for index in range(picker.count())]
+        == ["PETG HF（2）", "PLA（2）"],
+        "the 材质 picker lists one entry per material, with its spool count",
+    )
+    check(
+        material_window.library.material == "PETG HF",
+        f"the picker starts on the biggest material, got {material_window.library.material!r}",
+    )
+    petg_hexes = {recipe.color_hex.upper() for recipe in material_window._recipes}
+    check({"#F5D2B8", "#C52A36"} <= petg_hexes, "PETG's two spools colour the grid to start")
+
+    picker.setCurrentIndex(picker.findData("PLA"))
+    app.processEvents()
+    pla_hexes = {recipe.color_hex.upper() for recipe in material_window._recipes}
+    check(
+        material_window.library.material == "PLA" and len(material_window.library.visible) == 2,
+        "choosing 材质 PLA switches the spool list the colours come from",
+    )
+    check(
+        not ({"#F5D2B8", "#C52A36"} & pla_hexes) and {"#2C2A2C", "#FF6C2B"} <= pla_hexes,
+        f"every PETG colour left the grid and PLA's arrived, got {sorted(pla_hexes)[:4]}",
+    )
+    stray = [row for row in (material_window._list.item(i).text() for i in range(2)) if "现在不配色" not in row]
+    check(not stray, f"the other material's spools stay listed, greyed out ({stray})")
+    check(
+        material_window.library.hidden_count == 0,
+        "switching 材质 never hides a spool (hiding is the user's own act)",
+    )
+    check(
+        "现在按 PLA 配色" in material_window._status.text(),
+        f"the status line says which material is in force, got {material_window._status.text()[:50]!r}",
+    )
+    material_window.close()
+    app.processEvents()
+
     # --- the launcher defers the first catalogue build ---------------------------
     # 41 spools is 66,420 recipes and ~3 s; doing that inside __init__ made the
     # window take 4.4 s to appear.  The real launcher passes defer_build=True.
@@ -1706,6 +1757,32 @@ def main() -> int:
             page._smooth_box.setChecked(True)
             app.processEvents()
             plate = page.buildPlate()
+
+            # --- 1.6.26 (m05557 item 3): the box drives the preview too --------
+            # It used to reach PlateSettings only, so the one place it changed
+            # anything was inside Bambu Studio, after a round trip.
+            page._smooth_box.setChecked(False)
+            app.processEvents()
+            blocky = page._view._matched
+            check(
+                page._view._smooth is False and blocky is not None and blocky.width() == result.width,
+                f"unchecking the box puts the preview back on the raw grid ({None if blocky is None else blocky.width()} px)",
+            )
+            page._smooth_box.setChecked(True)
+            app.processEvents()
+            rounded = page._view._matched
+            check(
+                page._view._smooth is True
+                and rounded is not None
+                and blocky is not None
+                and rounded.width() > blocky.width(),
+                f"checking it draws the refined grid the plate is cut from ({None if rounded is None else rounded.width()} px)",
+            )
+            page._smooth_box.setChecked(False)
+            app.processEvents()
+            check(page._view._matched is blocky, "toggling back reuses the cached picture")
+            page._smooth_box.setChecked(True)
+            app.processEvents()
 
             # --- 1.6.23 (m02289 item 2): 图片位置 底面 / 顶面 -------------------
             from app.mesh.plate import signed_volume as _signed_volume
@@ -3159,6 +3236,20 @@ def main() -> int:
             check(page._dirty is False, "saving clears the unsaved flag")
             check("已保存工程" in page._status.text(), f"saving says so: {page._status.text()!r}")
 
+            # 1.6.26 (m05557 item 3): 预览.png is the picture the user is looking at.
+            # With the box on that is the refined grid the plate is cut from, not the
+            # raw match grid — the file and the panel used to disagree with the slicer.
+            with zipfile.ZipFile(project) as package:
+                from PIL import Image as _SavedPreview
+                import io
+
+                saved_preview = _SavedPreview.open(io.BytesIO(package.read("预览.png")))
+            check(
+                page._smooth_box.isChecked()
+                and saved_preview.width == page._view._matched.width(),
+                f"预览.png matches the panel ({saved_preview.width} px vs {page._view._matched.width()} px)",
+            )
+
             # 1.6.22 (m01647): the 圆滑色块 tick travels with the project.
             # 1.6.23 (m02289 item 2): so does 图片位置.
             page._smooth_box.setChecked(False)
@@ -3245,6 +3336,85 @@ def main() -> int:
             )
             _picture_page.QFileDialog = original_dialog
             _picture_page.QMessageBox = original_box
+
+            # 1.6.26 (m05557 item 2): a project carrying 色块级的改动 has to survive
+            # 「打开 → 再保存」.  1.6.25 read one step of that file
+            # ({"mask": …, "entry": …}) as a pair, so the colour came back as the
+            # string "entry" and the save died with "'str' object has no attribute
+            # 'key'" — which is the 保存工程失败 the user hit.
+            block_project = TEMP / "block-edits.bpproj"
+            page._set_pick_mode(_picture_page.PICK_EDGE, save=False)
+            app.processEvents()
+            blocks = page._blocks
+            wanted = None
+            if blocks is not None and blocks.count:
+                # 「删除」 leaves the file with entry=None, which cannot show the bug
+                # (it needs a colour object); 「更换颜色」 is what puts one in there.
+                page._list.clear_selection()
+                page._on_region_clicked(blocks.order()[0])
+                app.processEvents()
+                page._delete_button.click()
+                app.processEvents()
+                # 删除会把块重排，块对象和编号都换新的——必须再读一次，否则下面的
+                # 编号在新块表里根本不存在，_picked_blocks() 只会空着手回来。
+                blocks = page._blocks
+                target = blocks.order()[0]
+                wanted = next(
+                    (
+                        entry
+                        for entry in page._candidate_palette()
+                        if entry.key != page.result.palette[blocks.value(target)].key
+                    ),
+                    None,
+                )
+                page._list.clear_selection()
+                page._on_region_clicked(target)
+                app.processEvents()
+                check(
+                    bool(page._picked_blocks()[0]),
+                    f"there is a block picked to recolour ({target})",
+                )
+                check(wanted is not None, "… and another colour to replace it with")
+                if wanted is not None and page._picked_blocks()[0]:
+                    real_picker = _picture_page.ColourPickerDialog
+                    _picture_page.ColourPickerDialog = (
+                        lambda *args, **kwargs: _StubDialog(0, wanted)
+                    )
+                    try:
+                        page._on_replace()
+                        app.processEvents()
+                    finally:
+                        _picture_page.ColourPickerDialog = real_picker
+            check(
+                bool(page._block_edits),
+                f"a 色块级的改动 is in place ({len(page._block_edits)})",
+            )
+            page._project_path = block_project
+            page._on_save_project()
+            app.processEvents()
+            check(
+                block_project.is_file() and page._dirty is False,
+                "a project with 色块级的改动 saves",
+            )
+            from app.core.project import load_project as _load_project  # noqa: PLC0415
+
+            state = _load_project(block_project, library=library)
+            page._adopt_project(state, block_project)
+            app.processEvents()
+            entries = [edit.entry for edit in page._block_edits]
+            check(
+                len(entries) == len(state.block_paints)
+                and all(entry is None or hasattr(entry, "key") for entry in entries),
+                "opening it back keeps those colours as colours: "
+                f"{[type(entry).__name__ for entry in entries]}",
+            )
+            check(
+                any(entry is not None for entry in entries),
+                "… and one of them is a real colour object, not only a delete",
+            )
+            page._on_save_project()
+            app.processEvents()
+            check(page._dirty is False, "saving the reopened project works again")
 
             # --- no menu bar left, and 帮助 is a button (m08102 item 6, renamed
             # by m01885 item 5; m01885 items 6/8 moved the explanations into it) ---
@@ -3409,4 +3579,16 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    _code = main()
+    # Same reason as app/selftest.py: once a window has adopted a project,
+    # letting the interpreter tear Qt down afterwards exits with 0xC0000409
+    # (STATUS_STACK_BUFFER_OVERRUN) on a good share of runs.  That happens
+    # *after* the verdict is printed — and a harness that says "SMOKE OK" and
+    # then dies is worse than no harness — so this path leaves through the
+    # front door.
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:  # pragma: no cover - no streams in a windowed build
+        pass
+    os._exit(_code)
