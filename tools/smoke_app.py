@@ -2346,6 +2346,13 @@ def main() -> int:
                 "Del" in _picture_page.PAGE_HELP,
                 "「删除」不再叫 (Del)，但帮助里还写着 Del 就是删除",
             )
+            # m14360: 用户问「为什么预览的色块大小形状和原图的不一样」——帮助里得说清楚
+            # 这是「颜色数量」压缩 + 「圆滑色块」细格叠加的正常结果，以及怎么看到原始格子。
+            check(
+                "形状跟原图对不上" in _picture_page.PAGE_HELP
+                and "取消这个勾" in _picture_page.PAGE_HELP,
+                "帮助里说明了预览色块的形状为什么和原图对不上、怎么切回原始格子（m14360）",
+            )
 
             page._on_delete_colours()
             app.processEvents()
