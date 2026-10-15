@@ -1713,6 +1713,22 @@ def run_selftest(*, report_path: Path | None = None) -> int:
             page._view._pick_index(lonely, 3, 2) == 0,
             "按色块边缘选择：点在旁边的空白上选中最近的那一块",
         )
+        # m13246 item 1：圆滑色块把小斑点画得比它的像素大，点在画出来的斑点上时
+        # 脚下那一块往往是大笔画。3 像素内有比脚下更小的块，就听小块的。
+        speck = np.full((5, 5), -1, dtype=np.int32)
+        speck[0:5, 0:4] = 0
+        speck[2, 2] = 1
+        speck_sizes = np.asarray([24, 1], dtype=np.int64)
+        page._view.setBlockLabels(speck, speck_sizes)
+        check(
+            page._view._pick_index(lonely, 3, 2) == 1,
+            "脚下是大笔画、1 像素外有小块：听小块的（m13246 item 1）",
+        )
+        check(
+            page._view._pick_index(lonely, 2, 2) == 1,
+            "点在斑点本身上也选中小块（m13246 item 1）",
+        )
+        page._view.setBlockLabels(None)
         page._set_pick_mode(_pp.PICK_COLOUR, save=False)
 
         # 1.6.17 (m02366 item 2/3)：切到「按色块边缘选择」之后，列表一行是一块，
@@ -2356,6 +2372,39 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         app.processEvents()
         check(bool(page._deleted), "先真的删掉一种颜色")
         unpainted = page.result.total_pixels - page.result.printed_pixels
+        # m13246 item 2：「颜色数量」是用户给的硬上限，「按当前色块重新匹配」也得守。
+        # 收口只换「这些像素打印成什么卷」：打印的像素一个不少，色块的像素也都在，
+        # 变的是顶着同一种打印色的几个位子被并成了一种。
+        live_keys = {entry.key for entry in page._base.palette}
+        if len(live_keys) > 3:
+            count_box = page._colour_count
+            was_count = count_box.value()
+            # 拿「用户看到的那张结果」的打印像素数做基准：`_base` 是没算删改的原始匹配，
+            # 而收口以后新的 `_base` 已经把删掉的那一块算进去了，两边不可比。
+            painted_before = int((page._result.indices >= 0).sum())
+            count_box.setValue(3)
+            page._on_rematch_blocks()
+            app.processEvents()
+            capped = {entry.key for entry in page._base.palette}
+            check(
+                len(capped) <= 3,
+                f"颜色数量收到 3 以后再重匹配，打印色不超过 3 种，got {len(capped)}",
+            )
+            # 收口会把顶着同一种打印色的几个位子并成一个（palette 条数因此会少），
+            # 真正不能变的是「打印出来的像素一个不少」（m13246 item 2）。
+            after_painted = int((page._result.indices >= 0).sum())
+            check(
+                after_painted == painted_before,
+                f"收口以后打印的像素一个不少（{painted_before} → {after_painted} 个）",
+            )
+            count_box.setValue(was_count)
+            page._undo()
+            app.processEvents()
+        else:
+            check(
+                True,
+                f"样张的打印色本来就在 3 种以内（{len(live_keys)} 种），跳过收口检查",
+            )
         # m01411 item 1: 这一次把整张匹配都换掉（新的 _base、新的方案表），所以它必须
         # 进历史——用户按了它、不喜欢结果，Ctrl+Z 得能回到按之前。
         before_plans = [option.key for option in page._plans]

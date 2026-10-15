@@ -2052,6 +2052,130 @@ def _identity_fit(prepared: _Prepared) -> _Fit:
     )
 
 
+def _nearest_slot(
+    entries: list[PaletteEntry], kept_slots: list[int], position: int
+) -> int:
+    """``kept_slots`` 里离第 ``position`` 种颜色最近的那一个，返回它在其中的序号。
+
+    序号（0..len-1）而不是原来的位子：折叠后的下标要指着「留下来的几种」，
+    拿元位子去当新下标会越界。
+    """
+    if not kept_slots:
+        return 0
+    lab = np.asarray(entries[position].lab, dtype=np.float64)
+    best_index = 0
+    best_gap = float(
+        _color.delta_e_2000(lab, np.asarray(entries[kept_slots[0]].lab, dtype=np.float64))
+    )
+    for index, slot in enumerate(kept_slots):
+        gap = float(
+            _color.delta_e_2000(lab, np.asarray(entries[slot].lab, dtype=np.float64))
+        )
+        if gap < best_gap:
+            best_index, best_gap = index, gap
+    return best_index
+
+
+def _blend_regions(
+    means: np.ndarray, counts: np.ndarray, slot_target: dict[int, int], groups: int
+) -> np.ndarray:
+    """按像素量把并进来的那几种颜色的「图里本色」混到一起。
+
+    折叠以后每一行仍然要报出「这块像素本来是什么颜色」，所以均值也得跟着并，
+    不然详情窗口里那一格会退成其中一种的颜色。
+    """
+    out = np.zeros((groups, 3), dtype=np.float64)
+    weight = np.zeros(groups, dtype=np.float64)
+    for position, target in slot_target.items():
+        amount = float(counts[position]) if 0 <= position < len(counts) else 0.0
+        out[target] += np.asarray(means[position], dtype=np.float64) * amount
+        weight[target] += amount
+    return out / np.maximum(weight, 1.0)[:, None]
+
+
+def _fold_to_colour_cap(
+    result: MatchResult, cap: int, *, require: frozenset[str] = frozenset()
+) -> MatchResult:
+    """把「打印出来的颜色种数」收进 ``cap`` 以内（m13246 item 2）。
+
+    「颜色数量」是用户给这台机器的硬上限。「按当前色块重新匹配」那条路的目标色是现有
+    色块自己的颜色，一个色块一种，色块一多就突破上限——量化那一步才读 ``max_colours``，
+    重匹配根本不走量化。所以在这里收口：超了就从最少见的那些颜色开始，逐一并进离它
+    最近的那种留下来的颜色（ΔE00 最小）。像素一个不少、色块还在，变的只是它们打印成
+    什么；筛选里点名要的耗材从一开始就钉住，不会被并掉。
+
+    并过以后 ``counts``、``indices`` 与 ``means`` 一起重算；``source_values`` /
+    ``source_counts`` 退回 ``None``，让页面按块的平均色算保真度——那套数字是按「一个
+    调色板位子一种图里本色」统计的，折叠之后对不上了。
+    """
+    cap = int(cap)
+    entries = list(result.palette)
+    if cap <= 0 or len(entries) <= cap:
+        return result
+    counts = np.asarray(result.counts, dtype=np.int64)
+    totals: dict[str, int] = {}
+    for position, entry in enumerate(entries):
+        totals[entry.key] = totals.get(entry.key, 0) + int(counts[position])
+    if len(totals) <= cap:
+        return result
+    pinned = {
+        entry.key for entry in entries if require and (_spool_ids(entry) & require)
+    }
+    if len(pinned) > cap:
+        # 光是点名的颜色就比上限多：没什么可收的，原样交回去（上层另有报错口径）。
+        return result
+    # 每种打印色留一个代表：像素最多的那个位子。
+    weight: dict[str, int] = {}
+    for position, entry in enumerate(entries):
+        best = weight.get(entry.key)
+        if best is None or counts[position] > counts[best]:
+            weight[entry.key] = position
+    order = sorted(
+        totals, key=lambda key: (0 if key in pinned else 1, -totals[key], key)
+    )
+    kept_keys = order[:cap]
+    kept_slots = [weight[key] for key in kept_keys]
+    kept_index = {key: index for index, key in enumerate(kept_keys)}
+    slot_target: dict[int, int] = {}
+    for key in order:
+        target = kept_index.get(key)
+        for position, entry in enumerate(entries):
+            if entry.key != key:
+                continue
+            # 留下来的那种：这一组所有的位子都指到同一个新下标；并掉的：找最近的
+            # 那一种留下来的是谁（每种位置都要有映射，不然重编号时会缺键）。
+            slot_target[position] = (
+                target
+                if target is not None
+                else _nearest_slot(entries, kept_slots, position)
+            )
+    remap = np.array([slot_target[i] for i in range(len(entries))], dtype=np.int64)
+    folded = np.where(
+        result.indices >= 0, remap[np.clip(result.indices, 0, None)], -1
+    ).astype(result.indices.dtype)
+    kept, counts_after, final, sources = _renumber_sources(
+        [entries[slot] for slot in kept_slots], folded
+    )
+    means = result.means
+    if means is not None and len(means) == len(entries):
+        blended = _blend_regions(
+            np.asarray(means), counts, slot_target, len(kept_slots)
+        )
+        means = blended[sources].astype(np.asarray(result.means).dtype)
+    return MatchResult(
+        width=result.width,
+        height=result.height,
+        palette=kept,
+        indices=final,
+        counts=counts_after,
+        settings=result.settings,
+        source=result.source,
+        means=means,
+        source_values=None,
+        source_counts=None,
+    )
+
+
 def _plans(
     prepared: _Prepared,
     max_spools: int,
@@ -2104,19 +2228,22 @@ def _plans(
     for fit in fits:
         _report(progress, "统计每种颜色的像素", 0.96)
         report = _source_report(prepared, fit, picture_labs)
+        plan = MatchResult(
+            width=int(fit.indices.shape[1]),
+            height=int(fit.indices.shape[0]),
+            palette=fit.entries,
+            indices=fit.indices,
+            counts=fit.counts,
+            settings=prepared.config,
+            source=prepared.name,
+            means=_region_means(prepared, fit),
+            source_values=None if report is None else report[0],
+            source_counts=None if report is None else report[1],
+        )
+        # 「颜色数量」是用户给的硬上限：新鲜匹配与「按当前色块重新匹配」都从这里收口
+        # （m13246 item 2）。
         results.append(
-            MatchResult(
-                width=int(fit.indices.shape[1]),
-                height=int(fit.indices.shape[0]),
-                palette=fit.entries,
-                indices=fit.indices,
-                counts=fit.counts,
-                settings=prepared.config,
-                source=prepared.name,
-                means=_region_means(prepared, fit),
-                source_values=None if report is None else report[0],
-                source_counts=None if report is None else report[1],
-            )
+            _fold_to_colour_cap(plan, prepared.config.max_colours, require=require)
         )
     return results
 

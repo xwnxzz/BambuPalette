@@ -2565,6 +2565,34 @@ def main() -> int:
                 "撤销回到改色块之前，调色板和方案表都回到原样",
             )
 
+            # m13246 item 2：「颜色数量」是用户给的硬上限，「按当前色块重新匹配」也得守。
+            # 收口只改「这些像素打印成什么」，色块与打印的像素一个不少。
+            plain_keys = {entry.key for entry in page._result.palette}
+            if len(plain_keys) > 3:
+                count_box = page._colour_count
+                was_count = count_box.value()
+                painted_before = int((page._result.indices >= 0).sum())
+                count_box.setValue(3)
+                page._on_rematch_blocks()
+                app.processEvents()
+                capped_keys = {entry.key for entry in page._result.palette}
+                check(
+                    len(capped_keys) <= 3,
+                    f"颜色数量收到 3 以后再重匹配，打印色不超过 3 种，got {len(capped_keys)}",
+                )
+                check(
+                    int((page._result.indices >= 0).sum()) == painted_before,
+                    f"收口以后打印的像素一个不少（{painted_before} 个）",
+                )
+                count_box.setValue(was_count)
+                page._undo()
+                app.processEvents()
+            else:
+                check(
+                    True,
+                    f"样张的打印色本来就在 3 种以内（{len(plain_keys)} 种），跳过收口检查",
+                )
+
             # Exercise the two export buttons, with the file chooser stubbed out.
             original_dialog = _picture_page.QFileDialog
             original_box = _picture_page.QMessageBox
@@ -2948,6 +2976,26 @@ def main() -> int:
                 page._view._pick_index(lonely, 3, 2) == 0,
                 "按色块边缘选择 still finds the block next door",
             )
+            # m13246 item 1：深棕色笔画里嵌着的小斑点也要点得到。预览里的圆滑色块把那点
+            # 画得比真实像素大，用户点在画出来的斑点上时，脚下最近的像素仍属于周围那根
+            # 大笔画，所以边缘选择先在 3 像素以内找「比脚下这一块更小」的块。
+            speck = _np.full((5, 5), -1, dtype=_np.int32)
+            speck[1:4, 1:4] = 0
+            speck[2, 2] = 1
+            speck_sizes = _np.asarray(
+                [int((speck == 0).sum()), int((speck == 1).sum())], dtype=_np.int64
+            )
+            page._view.setBlockLabels(speck, speck_sizes)
+            page._set_pick_mode(_picture_page.PICK_EDGE, save=False)
+            check(
+                page._view._pick_index(lonely, 2, 1) == 1,
+                "边缘选择：贴着大块的小斑点先被选中（m13246 item 1）",
+            )
+            check(
+                page._view._pick_index(lonely, 1, 1) == 1,
+                "边缘选择：小斑点在自己的半径里赢过脚下的大块",
+            )
+            page._view.setBlockLabels(None, None)
             page._set_pick_mode(_picture_page.PICK_COLOUR, save=False)
 
             # --- 1.6.19 (m01566): Del is the 删除 button, and 删除/合并 edit 原图 ----

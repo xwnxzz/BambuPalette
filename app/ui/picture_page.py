@@ -236,6 +236,10 @@ PAGE_HELP = (
 #: 一点就选中半张图外的一块。
 EDGE_PICK_RADIUS = 10
 
+#: 光标附近这么大一圈里，比脚下那一块更小的块先被选中（m13246 item 1）。深棕色笔画
+#: 里嵌着的小斑点画出来的样子比真实像素大，只按「最近边界」判的话永远轮不到它们。
+EDGE_SMALL_RADIUS = 3
+
 
 def _nearest_edge(result: MatchResult, x: int, y: int, *, fallback: int) -> int:
     """The block with a pixel nearest to ``(x, y)``, within :data:`EDGE_PICK_RADIUS`.
@@ -279,6 +283,52 @@ def _nearest_label(labels: np.ndarray, x: int, y: int, *, fallback: int) -> int:
     distances = (xs + left - x) ** 2 + (ys + top - y) ** 2
     closest = int(np.argmin(distances))
     return int(window[ys[closest], xs[closest]])
+
+
+def _pick_smaller_near(
+    labels: np.ndarray,
+    sizes: np.ndarray | None,
+    x: int,
+    y: int,
+    own: int,
+    *,
+    radius: int = EDGE_SMALL_RADIUS,
+) -> int:
+    """A smaller block near ``(x, y)``, if there is one — otherwise ``own``.
+
+    「按色块边缘选择」本来是「最近边界」说了算：光标落在哪一块上就选哪一块，落在
+    空白处就选最近的那一块。深棕色笔画里嵌着几处小斑点时，这条规则够不着它们：
+    预览里的圆滑色块把小斑点画得比真实像素大，用户点在画出来的斑点上，脚下最近
+    的真实像素还是周围那根大笔画。
+
+    所以在 ``radius`` 像素以内先找一圈：里面有比 ``own`` 更小的块，就选离得最近的
+    那一个（一样近就选更小的）；没有才认 ``own``。``own`` 是空白（``-1``）时圈里
+    任何一块都算更小，于是退化成原来那条「最近边界」（m13246 item 1）。
+    """
+    if sizes is None:
+        return own
+    height, width = labels.shape
+    left = max(0, x - radius)
+    right = min(width, x + radius + 1)
+    top = max(0, y - radius)
+    bottom = min(height, y + radius + 1)
+    window = np.asarray(labels[top:bottom, left:right])
+    ys, xs = np.nonzero(window >= 0)
+    if not len(ys):
+        return own
+    own_size = float(sizes[own]) if 0 <= own < len(sizes) else float("inf")
+    distances = (xs + left - x) ** 2 + (ys + top - y) ** 2
+    best = own
+    best_key: tuple[float, float] | None = None
+    for spot in range(len(ys)):
+        label = int(window[ys[spot], xs[spot]])
+        size = float(sizes[label]) if 0 <= label < len(sizes) else float("inf")
+        if size >= own_size:
+            continue
+        key = (float(distances[spot]), size)
+        if best_key is None or key < best_key:
+            best, best_key = label, key
+    return best
 
 
 def _live_means(
@@ -426,6 +476,8 @@ class PictureView(QWidget):
         self._pick_mode = DEFAULT_PICK_MODE
         #: 「按色块边缘选择」下的色块编号图（``-1`` = 没打印），点图片时用它找块。
         self._block_labels: np.ndarray | None = None
+        #: 每块多少像素，和 ``_block_labels`` 配套：小块优先得靠它比大小（m13246 item 1）。
+        self._block_sizes: np.ndarray | None = None
         #: 选中的那一堆色块的并集掩码；比单个颜色更宽，因为「多选」可以选好几块。
         self._selected_mask: np.ndarray | None = None
 
@@ -464,9 +516,17 @@ class PictureView(QWidget):
         self._highlight = None
         self.update()
 
-    def setBlockLabels(self, labels: np.ndarray | None) -> None:
-        """The block numbering 「按色块边缘选择」 points with (``None`` = no blocks)."""
+    def setBlockLabels(
+        self, labels: np.ndarray | None, sizes: np.ndarray | None = None
+    ) -> None:
+        """The block numbering 「按色块边缘选择」 points with (``None`` = no blocks).
+
+        ``sizes`` is how many pixels each block owns.  The edge picker gives a
+        smaller block priority inside :data:`EDGE_SMALL_RADIUS`, which is what
+        keeps a speck inside a dark stroke clickable (m13246 item 1).
+        """
         self._block_labels = None if labels is None else np.asarray(labels)
+        self._block_sizes = None if sizes is None else np.asarray(sizes)
         if self._selected_mask is not None:
             self._highlight = None
             self.update()
@@ -832,8 +892,10 @@ class PictureView(QWidget):
         labels = self._block_labels
         if labels is not None and labels.shape == result.indices.shape:
             own = int(labels[y, x])
-            if own >= 0:
-                return own
+            # 小块优先：深棕色笔画里的小斑点也在这一条里被够着（m13246 item 1）。
+            smaller = _pick_smaller_near(labels, self._block_sizes, x, y, own)
+            if smaller >= 0:
+                return smaller
             return _nearest_label(labels, x, y, fallback=-1)
         return _nearest_edge(result, x, y, fallback=exact)
 
@@ -3336,7 +3398,10 @@ class PicturePage(QWidget):
         self._blocks = blocks
         self._view.setResult(result, self._source_qimage)
         self._original_view.setResult(result, self._source_qimage)
-        self._view.setBlockLabels(blocks.labels if blocks is not None else None)
+        self._view.setBlockLabels(
+            blocks.labels if blocks is not None else None,
+            blocks.sizes if blocks is not None else None,
+        )
         self._list.setContent(result, blocks)
         self._refresh_base_combo()
         if blocks is not None:
