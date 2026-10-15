@@ -1748,6 +1748,32 @@ def main() -> int:
     # hidden widget — the 耗材方案 checks below click real radios.
     window._tabs.setCurrentWidget(page)
     app.processEvents()
+
+    # --- 导入 SVG 当原图（m13907 item 2）---------------------------------
+    # 矢量图没有分辨率，按「最大边长」渲染成位图再走后面的全流程；渲染器和屏幕上
+    # 是同一个 Qt 渲染器，所以颜色与透明度都不用自己解释。
+    vector_target = TEMP / "vector.svg"
+    vector_target.write_text(
+        '<svg xmlns="http://www.w3.org/2000/svg" width="60" height="30" viewBox="0 0 60 30">'
+        '<rect width="60" height="30" fill="#E8C7BD"/>'
+        '<circle cx="15" cy="15" r="8" fill="#8C4A52"/>'
+        '<circle cx="45" cy="15" r="8" fill="#2F2A33"/>'
+        "</svg>",
+        encoding="utf-8",
+    )
+    original_span = page._max_dimension.value()
+    page._max_dimension.setValue(120)
+    page.loadImage(vector_target)
+    app.processEvents()
+    check(
+        page._image is not None and page._image.size == (120, 60),
+        f"导入 SVG 会按最大边长渲染成位图，got {None if page._image is None else page._image.size}",
+    )
+    check(
+        page.result is not None and len(page.result.palette) >= 2,
+        "SVG 渲染出来的图照样能匹配",
+    )
+    page._max_dimension.setValue(original_span)
     page.loadImage(sample)
     app.processEvents()
     result = page.result

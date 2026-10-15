@@ -21,8 +21,22 @@ import traceback
 
 import numpy as np
 from PIL import Image
-from PySide6.QtCore import QEvent, QEventLoop, QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import (
+    QByteArray,
+    QEvent,
+    QEventLoop,
+    QPointF,
+    QRectF,
+    Qt,
+    QTimer,
+    Signal,
+)
 from PySide6.QtGui import QColor, QImage, QKeySequence, QPainter, QPixmap, QShortcut
+
+try:  # QtSvg 只有导入矢量图时用得到；缺了也不该让整个程序起不来。
+    from PySide6.QtSvg import QSvgRenderer
+except ImportError:  # pragma: no cover - 打包漏收 QtSvg 时才会走到这里
+    QSvgRenderer = None  # type: ignore[assignment]
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QAbstractSpinBox,
@@ -106,10 +120,19 @@ from .swatch import swatch_pixmap
 
 __all__ = ["PicturePage", "PictureView", "ColourList"]
 
-IMAGE_FILTER = "图片 (*.png *.jpg *.jpeg *.bmp *.webp *.gif *.tif *.tiff);;所有文件 (*)"
+IMAGE_FILTER = (
+    "图片 (*.png *.jpg *.jpeg *.bmp *.webp *.gif *.tif *.tiff *.svg);;"
+    "矢量图 (*.svg);;所有文件 (*)"
+)
 #: 「导出原图」只写 PNG：原图里可能带着「删掉的地方是透明的」这种 alpha，换成 JPEG 就丢了
 #: （m12426 item 3）。
 PNG_FILTER = "PNG 图片 (*.png);;所有文件 (*)"
+
+#: 矢量图（SVG）也能当原图 (m13907 item 2)。位图导入是「有什么像素就用什么像素」，
+#: 而 SVG 是无限清晰的：渲染得比它自己声明的大，细笔画（猪尾巴那种一两像素的卷）才有
+#: 像素可认。SVG_RENDER_LIMIT 是防止拿一个图标渲染出 4000×4000 的位图把内存吃掉。
+SVG_SUFFIXES = frozenset({".svg"})
+SVG_RENDER_LIMIT = 4096
 
 #: Wheel zoom runs between 「整张铺满面板」 (1.0) and this many times the fit.
 ZOOM_MIN = 1.0
@@ -427,6 +450,33 @@ def _to_qimage(image: Image.Image) -> QImage:
     data = rgba.tobytes("raw", "RGBA")
     qimage = QImage(data, rgba.width, rgba.height, QImage.Format.Format_RGBA8888)
     return qimage.copy()
+
+
+def _load_vector(path: Path, target: int) -> Image.Image:
+    """SVG → 位图（m13907 item 2）。
+
+    用 Qt 自己的 QSvgRenderer：跟屏幕上画的是同一个渲染器，颜色和透明度不用自己解释，
+    也不多一个依赖。渲染边长取「SVG 自己声明的尺寸」与调用方要的 ``target`` 里较大的那个
+    （上限 SVG_RENDER_LIMIT）：矢量图放大不掉细节，渲得大一点，细笔画才落在像素上。
+    """
+    if QSvgRenderer is None:  # pragma: no cover - 只有打包漏收 QtSvg 才会走到这里
+        raise ValueError("这个版本没带上 SVG 支持（缺 QtSvg），请先导出成 PNG 再导入。")
+    renderer = QSvgRenderer(QByteArray(path.read_bytes()))
+    if not renderer.isValid():
+        raise ValueError(f"这张 SVG 读不出来：{path.name}")
+    declared = renderer.defaultSize()
+    span = max(1, declared.width(), declared.height())
+    scale = max(1.0, float(target) / span)
+    width = max(1, min(SVG_RENDER_LIMIT, round(max(1, declared.width()) * scale)))
+    height = max(1, min(SVG_RENDER_LIMIT, round(max(1, declared.height()) * scale)))
+    canvas = QImage(width, height, QImage.Format.Format_RGBA8888)
+    canvas.fill(0)
+    painter = QPainter(canvas)
+    try:
+        renderer.render(painter)
+    finally:
+        painter.end()
+    return Image.frombytes("RGBA", (width, height), bytes(canvas.constBits()))
 
 
 def _scrollable(widget: QWidget) -> QScrollArea:
@@ -2049,8 +2099,14 @@ class PicturePage(QWidget):
     def loadImage(self, source) -> None:
         """Load ``source`` (path or PIL image) and match it straight away."""
         if isinstance(source, (str, Path)):
-            self._image_name = Path(source).stem or "混色底板"
-            image = Image.open(source)
+            path = Path(source)
+            self._image_name = path.stem or "混色底板"
+            if path.suffix.lower() in SVG_SUFFIXES:
+                # 矢量图先渲染成位图（m13907 item 2）：按「最大边长」渲，细笔画才有像素；
+                # 之后整条流程（匹配、删除/合并、导出）跟位图导入完全一样。
+                image = _load_vector(path, int(self._max_dimension.value()))
+            else:
+                image = Image.open(source)
         else:
             image = source
         self._image = image.convert("RGBA")

@@ -35,6 +35,7 @@ from app.core.image_matching import (  # noqa: E402
     _fold_clusters,
     _kmeans_labels,
     _median_cut_seeds,
+    _merge_blend_fringes,
     _merge_indistinguishable,
     _merge_similar_colours,
     _objective_closest,
@@ -599,6 +600,56 @@ class IndistinguishableColourTests(unittest.TestCase):
         )
         self.assertTrue((remapped >= 0).all())
         self.assertLess(int(remapped.max()), len(merged))
+
+
+class BlendFringeTests(unittest.TestCase):
+    """缩放留下的抗锯齿坡不是画面内容（m13907 item 1）。
+
+    猪那张图的实测：白与绿之间那条淡绿坡占 3.5% 的像素，却是全图最差的一处
+    ΔE00 11.78 —— 耗材档案里没有这种淡绿，最后印成一圈偏黄的绿，它描出来的细结构
+    （尾巴）就被糊了。判据见 :func:`_merge_blend_fringes` 的文档串。
+    """
+
+    @staticmethod
+    def _picture(colours, rows):
+        """``rows`` 里一行一个 (底色序号, 该行的坡色序号或 None)，坡占一个像素列。"""
+        classes = np.zeros((len(rows), 5), dtype=np.int32)
+        for index, (base, ramp) in enumerate(rows):
+            classes[index, :] = base
+            if ramp is not None:
+                classes[index, 2] = ramp
+        return np.array(colours, dtype=np.uint8), classes
+
+    def test_a_one_pixel_ramp_folds_into_the_nearer_side(self):
+        # 灰阶上白→黑，坡取 (200,200,200)：在 Lab 的连线上，且明显离白更近。
+        colours, classes = self._picture(
+            [(240, 240, 240), (10, 10, 10), (200, 200, 200)],
+            [(0, None), (0, 2), (1, None), (1, None)],
+        )
+        merged, remapped = _merge_blend_fringes(colours, classes)
+        self.assertEqual(len(merged), 2, "那条坡被并掉了")
+        self.assertEqual(tuple(int(value) for value in merged[0]), (240, 240, 240))
+        self.assertEqual(int(remapped[1, 2]), 0, "坡进了更近的白")
+
+    def test_a_thin_line_that_is_not_a_blend_keeps_its_colour(self):
+        # 同样细的一条线，但它是饱和红：不在白—黑连线上，属于画面内容，不能被并。
+        colours, classes = self._picture(
+            [(240, 240, 240), (10, 10, 10), (220, 30, 30)],
+            [(0, None), (0, 2), (1, None), (1, None)],
+        )
+        merged, remapped = _merge_blend_fringes(colours, classes)
+        self.assertEqual(len(merged), 3, "真的细线留下来了")
+        self.assertEqual(int(remapped[1, 2]), 2)
+
+    def test_the_two_sides_are_ramps_not_the_two_biggest_neighbours(self):
+        # 第一版漏掉的情形：坡的一侧本身被拆成两个近似的绿，于是它挨着三个位子。
+        colours, classes = self._picture(
+            [(240, 240, 240), (30, 210, 110), (34, 206, 106), (150, 226, 180)],
+            [(0, None), (0, 3), (1, None), (2, None)],
+        )
+        merged, remapped = _merge_blend_fringes(colours, classes)
+        self.assertEqual(len(merged), 3, "淡绿坡并进白或绿，两个绿都留着")
+        self.assertNotIn(3, set(int(value) for value in np.unique(remapped)))
 
 
 class RecipeTextTests(unittest.TestCase):

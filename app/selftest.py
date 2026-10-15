@@ -2700,6 +2700,24 @@ def run_selftest(*, report_path: Path | None = None) -> int:
             f"状态栏说明导出了原图：{page._status.text()[:28]}",
         )
 
+        # m13907 item 2：矢量图（SVG）先按「最大边长」渲染成位图再走全流程。
+        vector_target = scratch / "vector.svg"
+        vector_target.write_text(
+            '<svg xmlns="http://www.w3.org/2000/svg" width="60" height="30" viewBox="0 0 60 30">'
+            '<rect width="60" height="30" fill="#E8C7BD"/>'
+            "</svg>",
+            encoding="utf-8",
+        )
+        rendered_vector = _pp._load_vector(vector_target, 120)
+        check(
+            rendered_vector.size == (120, 60),
+            f"SVG 按最大边长渲染成位图：{rendered_vector.size}",
+        )
+        check(
+            rendered_vector.convert("RGB").getpixel((60, 30)) == (232, 199, 189),
+            f"SVG 的颜色按 Qt 的渲染来：{rendered_vector.convert('RGB').getpixel((60, 30))}",
+        )
+
         if zipfile.is_zipfile(three_mf):
             with zipfile.ZipFile(three_mf) as archive:
                 names = set(archive.namelist())

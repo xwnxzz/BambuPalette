@@ -15,6 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from itertools import combinations
 from math import comb
+import os
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
 
@@ -1023,6 +1024,214 @@ def _merge_similar_colours(
     return _fold_clusters(colours, classes, len(colours), threshold)
 
 
+# 抗锯齿过渡色的判据（m13907 item 1）。数字来自 docs/算法说明.md 第 63 章那次实测：
+# 猪那张图的过渡色平均横向连续长度 1.0-2.1 像素、到两邻居连线的距离 1.1-3.8 ΔE00；
+# 画面里真正的细笔画（鼠标描边、眼睛高光）量到的是 ≥4 像素 / 8-30 ΔE00。
+_FRINGE_MAX_RUN = 3.0
+_FRINGE_TOLERANCE = 6.0
+_FRINGE_NEIGHBOUR_SHARE = 0.8
+_FRINGE_FLAT_FACTOR = 4.0  # 一边要比坡大这么多倍，才算「贴着一大片平色」
+_FRINGE_PASSES = 3  # 一条坡常连成好几级（白→淡黄绿→淡绿→绿），得跑几趟
+_FRINGE_SAME_SIZE = 4.0  # 落脚点最多能比坡大这么多倍……
+_FRINGE_SAME_LOOK = 4.0  # ……再大就得颜色几乎一样（细白细节并进白身那种）
+_FRINGE_HAIRLINE = 1.6  # 不到这么宽的坡随便并：那是缩放压出来的，不是画出来的
+
+
+def _segment_distance(lab: np.ndarray, start: np.ndarray, end: np.ndarray) -> float:
+    """``lab`` 到 ``start``-``end`` 这条线段的 ΔE00（线段上的最近点）。"""
+    span = end - start
+    length = float(span @ span)
+    if length <= 0.0:
+        return _color.delta_e_2000(lab, start)
+    position = float((lab - start) @ span) / length
+    position = min(1.0, max(0.0, position))
+    return _color.delta_e_2000(lab, start + position * span)
+
+
+def _blend_fold_map(colours: np.ndarray, classes: np.ndarray) -> dict[int, int]:
+    """一趟扫描：哪些位子是抗锯齿的过渡色、各自并进哪一格（键是位子，值是它并进的位子）。
+
+    判据与理由见 :func:`_merge_blend_fringes` 的文档串。
+    """
+    if len(colours) < 3:
+        return {}
+
+    count = len(colours)
+    counts = _class_counts(classes, count)
+    if not counts.any():
+        return {}
+
+    # 平均横向连续长度：每行里「左边不是自己」的位置就是一段的起点。
+    starts = np.zeros(classes.shape, dtype=bool)
+    starts[:, 0] = True
+    starts[:, 1:] = classes[:, 1:] != classes[:, :-1]
+    runs = np.bincount(
+        classes[starts & (classes >= 0)].astype(np.int64), minlength=count
+    )
+    mean_run = counts / np.maximum(1, runs)
+
+    # 四邻接的「谁挨着谁」表：pairs[i, j] 是 i 与 j 相邻的像素对数。
+    pairs = np.zeros((count, count), dtype=np.int64)
+    for first, second in (
+        (classes[:, :-1], classes[:, 1:]),
+        (classes[:-1, :], classes[1:, :]),
+    ):
+        touching = (first >= 0) & (second >= 0) & (first != second)
+        left = first[touching].astype(np.int64)
+        right = second[touching].astype(np.int64)
+        block = np.bincount(left * count + right, minlength=count * count).reshape(
+            count, count
+        )
+        pairs += block
+        pairs += block.T
+    borders = pairs.sum(axis=1)
+
+    labs = _color.lab_from_rgb(colours)
+    # 并进谁用并查集记：一条坡常常先并进另一条坡，而那条坡自己后来又并走了
+    # （「先并在前面」的写法在这里会留下指向非幸存格的指针，实测就会漏出越界下标）。
+    parent = list(range(count))
+
+    # 诊断用：BP_FRINGE_DEBUG=1 时把每个候选位子的判据逐条打出来（查「描边被并掉」用）。
+    debug = os.environ.get("BP_FRINGE_DEBUG") == "1"
+
+    def _name(index: int) -> str:
+        red, green, blue = (int(round(value)) for value in colours[index])
+        return f"#{red:02X}{green:02X}{blue:02X}"
+
+    def find(node: int) -> int:
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    # 从像素最少的开始并：一条坡常常自己就挨着另一条坡，先并小的才不会让它反过来吞掉大的。
+    for slot in (int(index) for index in np.argsort(counts, kind="stable")):
+        if find(slot) != slot or mean_run[slot] > _FRINGE_MAX_RUN or borders[slot] <= 0:
+            continue
+        if debug:
+            print(f"[坡] {_name(slot)} 位子={slot} 像素={int(counts[slot])} 宽度={mean_run[slot]:.2f}")
+        room = 0.10 * borders[slot]
+        ones = [int(index) for index in np.argsort(-pairs[slot]) if pairs[slot][index] >= room]
+        if len(ones) < 2:
+            if debug:
+                print("     不并：显著邻居不到 2 个")
+            continue
+        # 一边得是「一大片平色」：颜色归并的产物永远贴着一个大平色，真笔画贴的是
+        # 另一条同样细的线（描边的过渡色就贴不出这样的大块，所以描边本身留得住）。
+        flats = [index for index in ones if counts[index] >= _FRINGE_FLAT_FACTOR * counts[slot]]
+        if not flats:
+            if debug:
+                print("     不并：没有比它大 4 倍的邻居（像是真笔画）")
+            continue
+        lab = labs[slot]
+        main = max(flats, key=lambda index: int(counts[index]))
+        others = [index for index in ones if index != main]
+        far = max(others, key=lambda index: _color.delta_e_2000(labs[index], labs[main]))
+        distance = _segment_distance(lab, labs[main], labs[far])
+        if distance > _FRINGE_TOLERANCE:
+            if debug:
+                print(
+                    f"     不并：离 {_name(main)}→{_name(far)} 这条线 {distance:.2f} ΔE00"
+                    f"（超过 {_FRINGE_TOLERANCE}）"
+                )
+            continue
+        ramp = [
+            index
+            for index in range(count)
+            if _segment_distance(labs[index], labs[main], labs[far]) <= _FRINGE_TOLERANCE
+        ]
+        share = sum(int(pairs[slot][index]) for index in ramp) / borders[slot]
+        if debug:
+            print(
+                f"     主边 {_name(main)}（{int(counts[main])} 像素）/ 远端 {_name(far)}"
+                f"（{int(counts[far])} 像素），到线 {distance:.2f} ΔE00，坡上覆盖 {100 * share:.0f}%"
+            )
+        if share < _FRINGE_NEIGHBOUR_SHARE:
+            if debug:
+                print("     不并：坡没盖到 80% 的边界")
+            continue
+        # 落脚点要么跟它差不多大（坡往同一条带上并，且是往大的那边并），要么几乎一样色
+        # （细白细节并进白身）；不到一个半像素宽的也算「一压就没了」的抗锯齿，随便并。
+        # 少了这一条，第二趟会把灰色描边当成「白到深灰之间的坡」并进白身或者并进更小的
+        # 深色芯，描边就没了。
+        hairline = mean_run[slot] <= _FRINGE_HAIRLINE
+        candidates = [
+            index
+            for index in ramp
+            if index != slot
+            and (
+                hairline
+                or counts[slot] <= counts[index] <= _FRINGE_SAME_SIZE * counts[slot]
+                or _color.delta_e_2000(lab, labs[index]) <= _FRINGE_SAME_LOOK
+            )
+        ]
+        if debug:
+            print(f"     落脚点 {len(candidates)} 个")
+        if not candidates:
+            continue
+        target = find(
+            min(candidates, key=lambda index: _color.delta_e_2000(lab, labs[index]))
+        )
+        if target != slot:
+            parent[slot] = target
+            if debug:
+                print(f"     并进 {_name(target)}（位子={target}）")
+
+    return {slot: find(slot) for slot in range(count) if find(slot) != slot}
+
+
+def _merge_blend_fringes(
+    colours: np.ndarray, classes: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """把抗锯齿的过渡色并回它两边的颜色里（m13907 item 1）。
+
+    缩放过的位图在两种平色之间总留着一两个像素宽的坡：白与绿之间的淡绿线、白与粉
+    之间的淡粉线。颜色归并会把预算花在这些坡上（猪那张图里占 3.5% 的像素，却是全图
+    **最差**的一处 ΔE00 11.78 —— 耗材档案里没有这种淡绿，最后印成一圈偏黄的绿，它描出
+    来的细结构（尾巴）就被糊了），而它们是图片自己的产物，不是用户画的东西。
+
+    同时满足三条才并：
+
+    * **细** —— 它的像素平均横向连续长度不超过 ``_FRINGE_MAX_RUN`` 像素；
+    * **贴着一大片平色** —— 它的一侧要有比它大 ``_FRINGE_FLAT_FACTOR`` 倍以上的邻居；
+    * **夹在中间** —— 它的颜色落在「大平色 ↔ 对面最远那个邻居」的连线近旁（不超过
+      ``_FRINGE_TOLERANCE`` ΔE00），且这条坡覆盖了它 80% 以上的边界。
+
+    并进坡上更近的那一边（CIEDE2000），于是一条白/绿之间的坡让白或绿宽一个像素，而不是
+    多印一种颜色。眼睛、描边这些**真**细结构也细，但描边的过渡色贴不出「大平色」这一条
+    （它两边都是细线），而且描边自己的颜色不在白—绿的连线上（实测 29 ΔE00 开外），
+    所以永远不会被并掉。
+
+    落脚点还要挑：坡往**同一条带上**并（落脚点最多比它大 ``_FRINGE_SAME_SIZE`` 倍），
+    或者并进一个颜色几乎一样（``_FRINGE_SAME_LOOK`` ΔE00 以内）的大片颜色。少了这一条，
+    第二趟会把灰色描边看成「白到深灰之间的坡」并进白身，描边就整条没了（实测：6 个位子
+    那版，猪的耳朵/鼻子/腿的描边全丢）。不到 ``_FRINGE_HAIRLINE`` 像素宽的坡不挑落脚点：
+    那是缩放压出来的，怎么并都看不见。
+
+    邻居要按「坡」而不是按「位子」看：绿色背景本身就被拆成好几个近似的位子，一条淡绿
+    坡两边挨着的往往是**三个**不同的绿，只数前两名会把这种坡漏掉（第一版就是这么漏的）。
+    一条坡也常常连成好几级（白→淡黄绿→淡绿→绿），所以一趟扫描之后还要再来几趟，
+    直到没有新的过渡色为止。
+    """
+    for _ in range(_FRINGE_PASSES):
+        folded = _blend_fold_map(colours, classes)
+        if not folded:
+            break
+        survivors = [slot for slot in range(len(colours)) if slot not in folded]
+        lookup = np.empty(len(colours), dtype=np.int64)
+        for position, slot in enumerate(survivors):
+            lookup[slot] = position
+        for slot, target in folded.items():
+            lookup[slot] = lookup[target]
+        colours = colours[survivors]
+        classes = np.where(classes >= 0, lookup[np.clip(classes, 0, None)], -1).astype(
+            classes.dtype
+        )
+        if len(colours) < 3:
+            break
+    return colours, classes
+
+
 def _merge_indistinguishable(
     kept: list[PaletteEntry],
     counts: np.ndarray,
@@ -1903,6 +2112,10 @@ def _prepare(
     _report(progress, "减少图片颜色数量", 0.30)
     colours, classes = reduce_colours(image, config, mask)
     colours, classes = _merge_similar_colours(colours, classes, config.merge_delta_e)
+    # 缩放留下的抗锯齿坡不是画面内容（m13907 item 1）：并回两边，细结构才不会被
+    # 印成第三种颜色糊掉。放在「归并相近色」之后、找耗材之前，下游一律按合并后的
+    # 色块算，所以只在这一点动手就够。
+    colours, classes = _merge_blend_fringes(colours, classes)
 
     _report(progress, "在耗材与混色库里寻找最接近的颜色", 0.35)
     labs = _color.lab_from_rgb(colours)
