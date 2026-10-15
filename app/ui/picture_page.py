@@ -254,6 +254,13 @@ PAGE_HELP = (
     "的格子，边界从台阶变成圆滑曲线，小块面积还会再动几个百分点（实测大块 ±0.5% 以内、最小的"
     "几块 −5%～−10%）。想看原始格子就取消这个勾；想让细线更准，把「颜色数量」调大，或者「导入 "
     "SVG」按最大边长重画——矢量放大不会先糊一层。\n"
+    "· 预览里的格子是**匹配栅格**，所以格子大小和原图不是一回事（m14567）：匹配前整张图会先缩到"
+    "最长边「最大边长」那么多像素（默认 512），原图 2048×2048 时一个色块格就盖住 4×4 个原像素，"
+    "台阶看着比原图的笔触粗、一两个原像素宽的细线也落不进格子。实测同一张图（SVG 按 1024 画）："
+    "最大边长 256（一格 4.0 像素）时有 7.87% 的格子跟原图归的色对不上，512（2.0 像素）降到 3.41%，"
+    "1024（1.0 像素）是 1.97%——剩下那 1.97% 才是「颜色数量」和抗锯齿坡合并那一层。想让形状更贴"
+    "原图，把「最大边长」往原图尺寸靠；「原图」面板的标题和「最大边长」的悬停提示都写着原图尺寸"
+    "和缩小了几倍。\n"
     f"· 「{IMAGE_SIDE_LABEL}」选图片印在模型的哪一面（1.6.23 起）：{IMAGE_SIDE_BOTTOM}（默认）"
     f"是图片朝下贴着打印板、顶面一整片底板色，打出来顶面平整；{IMAGE_SIDE_TOP} 是图片朝上，"
     "也就是 1.6.22 及以前的样子。两面都是同一块闭合实体上下对调，尺寸、厚度、体积都不变；"
@@ -1663,6 +1670,10 @@ class PicturePage(QWidget):
         self._max_dimension.setSingleStep(64)
         self._max_dimension.setValue(512)
         self._max_dimension.setSuffix(" px")
+        # 匹配前整张图会缩到最长边这么多像素再分色块，所以预览里的格子有可能比原图粗
+        # （m14567）：提示里写清缩了多少、一格盖住几个原像素，「最大边长」才不是一个
+        # 孤零零的数字。
+        self._max_dimension.valueChanged.connect(self._sync_dimension_hint)
 
         self._dither = QCheckBox("抖动")
 
@@ -1946,7 +1957,10 @@ class PicturePage(QWidget):
         # (which covered the picture the user was looking at).
         original_area = _scrollable(self._original_view)
         preview_area = _scrollable(self._view)
-        pictures.addWidget(self._wrap(original_area, "原图", badge="原图已修改"))
+        #: 原图 面板：标题里会带上原图的像素尺寸（``_sync_source_title``），因为预览画的
+        #: 是缩下来的匹配栅格（m14567）。
+        self._original_panel = self._wrap(original_area, "原图", badge="原图已修改")
+        pictures.addWidget(self._original_panel)
         pictures.addWidget(self._wrap(preview_area, "预览"))
         # 预览 is the one the user works in, so it gets the extra room.
         pictures.setStretchFactor(0, 1)
@@ -2147,6 +2161,8 @@ class PicturePage(QWidget):
         self._source_qimage = _to_qimage(self._image) if self._image is not None else None
         if self._original_badge is not None:
             self._original_badge.setVisible(self._original_edited)
+        self._sync_source_title()
+        self._sync_dimension_hint()
 
     def _picture_colour(self, mask: np.ndarray) -> tuple[int, int, int] | None:
         """The colour this patch of 「原图」 already has, or ``None`` if it has none.
@@ -3637,6 +3653,63 @@ class PicturePage(QWidget):
                 )
             )
 
+    def _sync_source_title(self) -> None:
+        """把原图的像素尺寸写进「原图」面板的标题（m14567）。
+
+        预览画的是匹配栅格，原图比它大一截的时候色块形状自然对不上；标题里带上尺寸，
+        用户一眼就知道自己被缩了多少，不用去猜是识别画错了还是图本身变了。
+        """
+        label = getattr(getattr(self, "_original_panel", None), "title_label", None)
+        if label is None:
+            return
+        title = "原图" if self._image is None else f"原图 {self._image.width}×{self._image.height}"
+        if label.text() != title:
+            label.setText(title)
+
+    def _sync_dimension_hint(self) -> None:
+        """「最大边长」的悬停提示：说清原图会不会被缩小、一格盖住几个原像素（m14567）。
+
+        用户按「预览的色块大小形状和原图不一样」来问，一半的原因就在这一步：匹配前整张图
+        会缩到最长边「最大边长」像素（默认 512），原图 2048×2048 时一个色块格就盖住 4×4
+        个原像素，一两个原像素宽的细线根本落不进格子。
+        """
+        spin = self._max_dimension
+        limit = int(spin.value())
+        if self._image is None:
+            spin.setToolTip(f"匹配前把整张图缩到最长边 {limit} 像素再分色块（m14567）。")
+            return
+        source_w, source_h = self._image.size
+        long_side = max(source_w, source_h)
+        if long_side <= limit:
+            spin.setToolTip(
+                f"原图 {source_w}×{source_h}：比这个数小，匹配前不会缩小，"
+                "一个色块格就是一个原像素。"
+            )
+            return
+        factor = long_side / limit
+        spin.setToolTip(
+            f"原图 {source_w}×{source_h}：匹配前会先缩到最长边 {limit} 像素，"
+            f"一个色块格盖住 {factor:.1f}×{factor:.1f} 个原像素，一两个原像素宽的细线会并进"
+            "相邻的块。想让预览更贴原图就把它调大（匹配会慢一些）。"
+        )
+
+    def _grid_note(self) -> str:
+        """「原图 2048×2048 → 匹配 512×512（缩小 4.0 倍）」这半句话（m14567）。
+
+        状态行原来只说「匹配完成：512×512 像素」——用户看到预览里的台阶，会以为那
+        512 就是原图的分辨率。把原图尺寸和倍数一起写出来，误解就没有了。
+        """
+        if self._image is None:
+            return ""
+        source_w, source_h = self._image.size
+        if self._result is None:
+            return f"原图 {source_w}×{source_h}"
+        grid_w, grid_h = self._result.width, self._result.height
+        if (grid_w, grid_h) == (source_w, source_h):
+            return f"原图 {source_w}×{source_h}（一格就是一个原像素）"
+        factor = max(source_w / max(1, grid_w), source_h / max(1, grid_h))
+        return f"原图 {source_w}×{source_h} → 匹配 {grid_w}×{grid_h}（缩小 {factor:.1f} 倍）"
+
     def _sync_list_title(self) -> None:
         """Name the colour/block column after what it is currently listing.
 
@@ -3718,9 +3791,8 @@ class PicturePage(QWidget):
             # 跟右侧小结、跟「颜色数量」上限同一个口径 (m13246 item 2)：位子数会多出来，
             # 用户对着两个数会以为上限又破了。
             self._status.setText(
-                "匹配完成：{0}×{1} 像素，{2} 种颜色。{3}".format(
-                    result.width,
-                    result.height,
+                "匹配完成：{0}，{1} 种颜色。{2}".format(
+                    self._grid_note() or f"{result.width}×{result.height} 像素",
                     len({entry.key for entry in result.palette}),
                     choices,
                 )

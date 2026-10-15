@@ -716,6 +716,30 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         not page._delete_button.isEnabled() and not page._replace_button.isEnabled(),
         "没有选中颜色时 删除 / 更换颜色 是灰的",
     )
+    # m14567: 预览画的是匹配栅格，原图比「最大边长」大时会被缩小——原图面板的标题、
+    # 控件的悬停提示、匹配完成的状态行三处都要把原图尺寸和倍数写出来。
+    check(
+        page._original_panel.title_label.text() == "原图 160×120",
+        f"「原图」面板的标题带原图尺寸，got {page._original_panel.title_label.text()!r}",
+    )
+    check(
+        "一格就是一个原像素" in page._status.text() and "不会缩小" in page._max_dimension.toolTip(),
+        f"原图比最大边长小时，状态行与提示都说不会缩小，"
+        f"got {page._status.text()!r} / {page._max_dimension.toolTip()!r}",
+    )
+    _span = page._max_dimension.value()
+    page._max_dimension.setValue(60)
+    page.loadImage(picture)
+    app.processEvents()
+    check(
+        "原图 160×120 → 匹配 60×45（缩小 2.7 倍）" in page._status.text()
+        and "盖住 2.7×2.7 个原像素" in page._max_dimension.toolTip(),
+        f"原图比最大边长大时，状态行与提示写清缩了多少，"
+        f"got {page._status.text()!r} / {page._max_dimension.toolTip()!r}",
+    )
+    page._max_dimension.setValue(_span)
+    page.loadImage(picture)
+    app.processEvents()
 
     # m00519 #2: 「原图 / 预览」用滚轮缩放、按住左键拖动平移、双击还原成整张。
     from PySide6.QtCore import QEvent as _QEvent

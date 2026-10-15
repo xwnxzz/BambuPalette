@@ -1776,6 +1776,37 @@ def main() -> int:
     page._max_dimension.setValue(original_span)
     page.loadImage(sample)
     app.processEvents()
+
+    # --- 预览画的是匹配栅格：原图尺寸和缩小倍数要说清楚（m14567）---------------
+    # 用户按「预览的色块大小形状和原图不一样」来问，一半原因就在这一步：匹配前整张图
+    # 会缩到最长边「最大边长」像素。这里把「原图比边长大」和「原图比边长小」两档都跑
+    # 一遍，确认状态行、面板标题、控件的悬停提示三处都写了这件事。
+    page._max_dimension.setValue(60)
+    page.loadImage(sample)
+    app.processEvents()
+    check(
+        page._original_panel.title_label.text() == "原图 160×120",
+        f"「原图」面板的标题带原图尺寸，got {page._original_panel.title_label.text()!r}",
+    )
+    check(
+        "原图 160×120" in page._max_dimension.toolTip()
+        and "盖住 2.7×2.7 个原像素" in page._max_dimension.toolTip(),
+        f"原图比最大边长大时，控件的悬停提示写清一格盖住几个原像素，"
+        f"got {page._max_dimension.toolTip()!r}",
+    )
+    check(
+        "原图 160×120 → 匹配 60×45（缩小 2.7 倍）" in page._status.text(),
+        f"匹配完成的状态行写明原图 → 匹配栅格，got {page._status.text()!r}",
+    )
+    page._max_dimension.setValue(original_span)
+    page.loadImage(sample)
+    app.processEvents()
+    check(
+        "一格就是一个原像素" in page._status.text() and "不会缩小" in page._max_dimension.toolTip(),
+        f"原图比最大边长小时，状态行和提示都说不会缩小，"
+        f"got {page._status.text()!r} / {page._max_dimension.toolTip()!r}",
+    )
+
     result = page.result
     check(result is not None, "the sample picture matched a palette")
     check(
