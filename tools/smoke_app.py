@@ -2584,6 +2584,13 @@ def main() -> int:
                     int((page._result.indices >= 0).sum()) == painted_before,
                     f"收口以后打印的像素一个不少（{painted_before} 个）",
                 )
+                # 状态栏那句话也要跟小结、跟上限一个口径 (m13246 item 2)：位子数会比
+                # 「种颜色」多，两个数并存用户就会以为上限又破了。
+                check(
+                    f"{len(capped_keys)} 种颜色" in page._status.text()
+                    and f"共 {len(capped_keys)} 种颜色" in page._list._summary.text(),
+                    f"状态栏和小结都按打印色计数（{len(capped_keys)} 种）",
+                )
                 count_box.setValue(was_count)
                 page._undo()
                 app.processEvents()

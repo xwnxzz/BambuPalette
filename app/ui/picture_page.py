@@ -3652,9 +3652,15 @@ class PicturePage(QWidget):
                 else "点击右侧颜色看图片高光，点击图片看它属于哪种颜色；点「更换颜色」可以"
                 "手动换掉不合适的颜色，多选颜色后可以「删除」（留空不打印）或「合并」。"
             )
+            # 「N 种颜色」数的是**打印出来的颜色**（顶着同一种打印色的几个位子算一种），
+            # 跟右侧小结、跟「颜色数量」上限同一个口径 (m13246 item 2)：位子数会多出来，
+            # 用户对着两个数会以为上限又破了。
             self._status.setText(
                 "匹配完成：{0}×{1} 像素，{2} 种颜色。{3}".format(
-                    result.width, result.height, len(result.palette), choices
+                    result.width,
+                    result.height,
+                    len({entry.key for entry in result.palette}),
+                    choices,
                 )
                 + hint
             )
@@ -3663,7 +3669,7 @@ class PicturePage(QWidget):
         total = max(1, result.total_pixels)
         self._status.setText(
             "、".join(parts)
-            + f"，现在打 {len(result.palette)} 种颜色，实心 {printed} 像素"
+            + f"，现在打 {len({entry.key for entry in result.palette})} 种颜色，实心 {printed} 像素"
             f"（占 {printed / total * 100:.1f}%）。导出的 3MF / OBJ 就照这样切，"
             "Ctrl+Z 撤销、Ctrl+Y 恢复。"
         )
