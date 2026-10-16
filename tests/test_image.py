@@ -1238,14 +1238,49 @@ class BudgetOptionTests(unittest.TestCase):
             [int(value) for value in plain.counts],
         )
 
-    def test_a_picture_that_fits_the_cap_is_offered_once(self):
-        # Four spools and a cap of four: nothing has to be refused, so every
-        # 方案 prints the same rolls and the extra roll buys nothing.
+    def test_a_picture_that_fits_the_cap_is_offered_with_its_alternatives(self):
+        # Four spools and a cap of four: the first row prints exactly the rolls the
+        # picture asks for, and the list also carries what the other objectives found
+        # plus the 「少用一个卷」 rows (m18338 第 2 条 widened the counts and added
+        # that axis), each of them a 方案 of its own.
         options = match_options(
             _quadrant_image(), self.palette, MatchSettings(max_colours=4, max_spools=4)
         )
-        self.assertEqual(len(options), 1)
         self.assertEqual(len(options[0].spools), 4)
+        rolls = [frozenset(option.spools) for option in options]
+        self.assertEqual(len(rolls), len(set(rolls)))  # no 方案 twice
+        self.assertGreaterEqual(len(options), 4)
+        for option in options:
+            self.assertLessEqual(len(option.spools), 4)
+        spares = [row for row in options if "少用一个卷" in row.title]
+        self.assertTrue(spares)
+        for row in spares:
+            self.assertEqual(len(row.spools), 3)  # 上限 4 少用一个
+
+    def test_a_tight_cap_gets_the_fewer_roll_rows_and_an_unlimited_one_does_not(self):
+        # 「多给些耗材方案」(m18338 第 2 条): 上限咬住的时候多出「少用一个卷」那几行，
+        # 每行真的比上限少一卷；上限写成 0（不限制）时没有上限可省，那几行就不出现。
+        options = match_options(
+            _quadrant_image(), self.palette, MatchSettings(max_colours=4, max_spools=3)
+        )
+        spares = [row for row in options if "少用一个卷" in row.title]
+        self.assertTrue(spares)
+        for row in spares:
+            self.assertEqual(len(row.spools), 2)
+        # 「少用两个卷」也是同一个要求的另一半（m18338 第 2 条）：上限 3 时它出一卷。
+        far = [row for row in options if "少用两个卷" in row.title]
+        self.assertTrue(far)
+        for row in far:
+            self.assertEqual(len(row.spools), 1)
+        heads = [row for row in options if "少用" not in row.title]
+        self.assertTrue(heads)
+        for row in heads:
+            self.assertEqual(len(row.spools), 3)
+
+        unlimited = match_options(
+            _quadrant_image(), self.palette, MatchSettings(max_colours=4, max_spools=0)
+        )
+        self.assertFalse([row for row in unlimited if "少用" in row.title])
 
     def test_an_unlimited_cap_is_offered_once_and_never_asks_for_an_extra_roll(self):
         result = match_image(
@@ -1343,7 +1378,7 @@ class BudgetOptionTests(unittest.TestCase):
         text = plan_help()
         self.assertIn("差块", text)
         self.assertIn(f"{_BAD_BLOCK_DELTA_E:g}", text)
-        for _key, title, note, _objective, _variants in _PLAN_SPECS:
+        for _key, title, note, _objective, _variants, _delta in _PLAN_SPECS:
             self.assertIn(title, text)
             self.assertIn(note, text)
         self.assertNotIn("…", text)

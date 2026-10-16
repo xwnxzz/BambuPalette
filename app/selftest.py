@@ -1626,6 +1626,82 @@ def run_selftest(*, report_path: Path | None = None) -> int:
             "SVG 渲染也不封 4096（m17910 第 2 条）",
         )
 
+        # m18338 第 1 条：底行看得见、改得动匹配栅格的像素数。
+        check(
+            hasattr(page, "_px_width_spin")
+            and hasattr(page, "_px_height_spin")
+            and hasattr(page, "_rematch_px_button"),
+            "底行多了「宽/长」两个像素框和「按当前px重新匹配」（m18338 第 1 条）",
+        )
+        check(
+            page._px_width_spin.value() == int(page.result.width)
+            and page._px_height_spin.value() == int(page.result.height),
+            f"两个框显示现在这一份匹配的像素数，got "
+            f"{page._px_width_spin.value()}×{page._px_height_spin.value()} / "
+            f"{page.result.width}×{page.result.height}",
+        )
+        check(
+            page._rematch_px_button.text() == "按当前px重新匹配",
+            f"按钮写「按当前px重新匹配」，got {page._rematch_px_button.text()!r}",
+        )
+        _picture_size = (int(page._image.width), int(page._image.height))
+        page._px_width_spin.setValue(64)
+        app.processEvents()
+        _want_height = max(1, round(64 * _picture_size[1] / _picture_size[0]))
+        check(
+            page._px_height_spin.value() == _want_height,
+            f"改「宽」时「长」按原图比例联动，got {page._px_height_spin.value()} 期望 {_want_height}",
+        )
+        _grid_before = (int(page.result.width), int(page.result.height))
+        _plans_before = list(page._plans)
+        page._on_rematch_px()
+        app.processEvents()
+        check(
+            (int(page.result.width), int(page.result.height)) != _grid_before,
+            f"「按当前px重新匹配」按新尺寸从头分色，got "
+            f"{page.result.width}×{page.result.height}（原来 {_grid_before}）",
+        )
+        check(
+            int(page._px_width_spin.value()) == int(page.result.width)
+            and "匹配完成" in page._status.text(),
+            f"重匹配完两个框跟着新结果走、状态行说了这件事，got "
+            f"{page._px_width_spin.value()}×{page._px_height_spin.value()} / "
+            f"{page._status.text()[:40]}",
+        )
+        page._undo()
+        app.processEvents()
+        check(
+            (int(page.result.width), int(page.result.height)) == _grid_before,
+            "撤销一步回到按下之前的那一份匹配（像素数一起回来）",
+        )
+        check(
+            [row.key for row in page._plans] == [row.key for row in _plans_before]
+            and len(page._plans) == len(_plans_before),
+            f"撤销把「耗材方案」那几行也一起带回来（m18338 第 2 条），"
+            f"got {len(page._plans)} 行 / 原来 {len(_plans_before)} 行",
+        )
+        page._redo_stack.clear()
+
+        # m18338 第 2 条：耗材方案多给几行，其中一档是「少用一个卷」。
+        _cap_now = int(page._settings().max_spools)
+        _spare_rows = [row for row in page._plans if "少用一个卷" in row.title]
+        check(
+            len(page._plans) >= 6,
+            f"「耗材方案」的行数比从前多（m18338 第 2 条），got {len(page._plans)} 行",
+        )
+        if _cap_now > 0:
+            check(
+                bool(_spare_rows)
+                and all(len(row.spools) == _cap_now - 1 for row in _spare_rows),
+                f"「少用一个卷」那几行真的比上限 {_cap_now} 少一卷，got "
+                f"{[(row.title, len(row.spools)) for row in page._plans]}",
+            )
+        else:
+            check(
+                not _spare_rows,
+                "「耗材上限 0」不限制时没有「少用一个卷」可说",
+            )
+
         replacement = next(entry for entry in ordered if entry.key != auto.key)
         # Exactly what _on_replace does: snapshot FIRST, then record the change,
         # which is why 撤销 covers a manual replacement with no extra button.

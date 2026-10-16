@@ -1549,6 +1549,15 @@ _BUDGET_ROLL_LIMIT = 22
 #: by roll and then swapping, which is the same answer on everything measured.
 _BUDGET_SUBSET_LIMIT = 20_000
 
+#: When there are too many rolls to enumerate, the search keeps this many of the
+#: ones that look most useful on their own and enumerates subsets of those.  The
+#: shortlist is what makes 「多给几组耗材方案」 real on a big library: the walk alone
+#: returns one answer plus its one-roll variations, so a picture that needs four
+#: rolls out of sixty offered a handful of rows however deep the objective went.
+#: Fourteen rolls is ``comb(14, 4) == 1001`` subsets — the whole shortlist still
+#: fits under :data:`_BUDGET_SUBSET_LIMIT`.
+_BUDGET_BEAM_ROLLS = 14
+
 #: How many of a block's nearest colours 「按当前色块重新匹配」 keeps on hand.  The
 #: block is printed with the nearest one that the 「耗材上限」 can afford, so this is
 #: the depth of the trade the search may make to keep a block on the picture; six
@@ -1933,9 +1942,25 @@ def _budget_fits(
                 if printable:
                     found.append((score, list(candidate), printable, picked))
         else:
-            # Too many combinations to walk: grow the set by whichever roll helps
-            # most, then swap rolls in and out until nothing improves.  The
-            # alternatives come from forbidding one roll of the winner at a time.
+            # Too many combinations to walk them all.  The walk below finds one
+            # answer plus 「轮流禁掉它里面的一个卷」 的几个变体, which on a big
+            # library is barely any rows at all — and 「多给几组」 was exactly what
+            # was asked for (m18338 第 2 条), so the pool is widened here as well:
+            # the rolls are ranked by 单个卷自己有多准 (``_score([spool])``) and the
+            # subset search is repeated over the best ``_BUDGET_BEAM_ROLLS`` of
+            # them, which is small enough to enumerate.  The walk still runs and
+            # still counts — it may spend a roll the shortlist left out.
+            ranked = sorted(rolls, key=lambda spool: _score([spool])[0])
+            narrowed = ranked[:_BUDGET_BEAM_ROLLS]
+            if (
+                len(narrowed) < len(rolls)
+                and comb(len(narrowed), width) <= _BUDGET_SUBSET_LIMIT
+            ):
+                for candidate in combinations(narrowed, width):
+                    score, printable, picked = _score(candidate)
+                    if printable:
+                        found.append((score, list(candidate), printable, picked))
+            # The alternatives come from forbidding one roll of the winner at a time.
             walked = _walk(rolls, width)
             if walked is None:
                 continue
@@ -2687,34 +2712,77 @@ def _without_banned(
 #: than a worse objective.  1.6.15（m00830 第 4 条「耗材方案多给些选项」）把每一档都
 #: 加宽：前两档各五组，后两档各四组。印出来是同一套卷的行仍然只留一行，所以卷库小、
 #: 不少组合打平的图上会少几行。
-_PLAN_SPECS: tuple[tuple[str, str, str, BudgetObjective, int], ...] = (
+#:
+#: 1.6.46（m18338 第 2 条「多给些耗材方案」）两处加宽：既有的四档各多给两组
+#: （8 / 8 / 6 / 6），再补两档**少用一个卷**的口径 —— 同一把尺子，但只准用
+#: 「耗材上限」−1 卷。这是真正的新搭配而不是同一套卷换个名字：省一卷意味着画面
+#: 上有一块要拿别人的颜色凑，代价看得见，值不值得由用户定。最后一个数字 ``delta``
+#: 是这一档相对「耗材上限」的卷数增减（0 = 用满，-1 = 少一卷），换卷搜索与列出的行
+#: 都照着它收口。
+_PLAN_SPECS: tuple[tuple[str, str, str, BudgetObjective, int, int], ...] = (
     (
         "priority",
         "大色差色块优先",
         "先把差得最明显的色块认出来，再让每个色块拿到不同的颜色，耗材上限优先用满，剩下的拉近整张图。",
         _objective_priority,
-        5,
+        8,
+        0,
     ),
     (
         "closest",
         "总体最接近",
         "整张图算下来最像；个别小色块可能差一点。",
         _objective_closest,
-        5,
+        8,
+        0,
     ),
     (
         "worst",
         "最不像的色块优先",
         "先把差得最明显的那一块拉回来，平均会稍差。",
         _objective_worst,
-        4,
+        6,
+        0,
     ),
     (
         "distinct",
         "小色块优先",
         "眼睛、鼻子这类小色块更准；超过 ΔE00 5 的色块最少。",
         _objective_distinct,
-        4,
+        6,
+        0,
+    ),
+    (
+        "priority_spare",
+        "大色差色块优先（少用一个卷）",
+        "跟「大色差色块优先」同一把尺子，但比「耗材上限」少用一个卷——省一卷料，画面上多一块要用别人的颜色凑。",
+        _objective_priority,
+        3,
+        -1,
+    ),
+    (
+        "closest_spare",
+        "总体最接近（少用一个卷）",
+        "跟「总体最接近」同一把尺子，但比「耗材上限」少用一个卷——省一卷料，画面上多一块要用别人的颜色凑。",
+        _objective_closest,
+        3,
+        -1,
+    ),
+    (
+        "priority_spare2",
+        "大色差色块优先（少用两个卷）",
+        "跟「大色差色块优先」同一把尺子，但比「耗材上限」少用两个卷——省料省得更多，凑色的地方也更多。",
+        _objective_priority,
+        3,
+        -2,
+    ),
+    (
+        "closest_spare2",
+        "总体最接近（少用两个卷）",
+        "跟「总体最接近」同一把尺子，但比「耗材上限」少用两个卷——省料省得更多，凑色的地方也更多。",
+        _objective_closest,
+        3,
+        -2,
     ),
 )
 
@@ -2744,7 +2812,7 @@ def plan_caption(key: str) -> tuple[str, str]:
     row prints those.
     """
     base, _, _rank = key.partition("#")
-    for spec_key, title, note, _objective, _count in _PLAN_SPECS:
+    for spec_key, title, note, _objective, _count, _delta in _PLAN_SPECS:
         if spec_key != base:
             continue
         return title, note
@@ -2768,7 +2836,7 @@ def plan_help() -> str:
         "越少，越不容易一眼看出偏差。卷少、颜色多的时候这个数天生就大：几卷料印不出几十种颜色。",
     ]
     lines.extend(
-        f"· {title}：{note}" for _key, title, note, _objective, _count in _PLAN_SPECS
+        f"· {title}：{note}" for _key, title, note, _objective, _count, _delta in _PLAN_SPECS
     )
     lines.append(
         "· 同一种口径下的第二、第三套不再另起名字：按行里那几卷的颜色认就行，"
@@ -2862,29 +2930,48 @@ def _offer_options(
     A candidate that cannot obey the 筛选 never reaches the list: the cap and the
     demanded / forbidden rolls are instructions about this machine, not
     preferences to trade against picture quality.
+
+    A spec whose ``delta`` is negative asks for plans that spend *fewer* rolls than
+    the 耗材上限 (「少用一个卷」): its search runs with the smaller cap, and only
+    plans inside that smaller cap are ranked under its name — otherwise the same
+    objective would hand the row its full-cap answer and the name would be a lie.
     """
     cap = prepared.config.max_spools
     total = max(1, sum(spec[4] for spec in _PLAN_SPECS))
-    pool: list[MatchResult] = []
+    # 同一个「花多少卷」的问法共用一个候选池（m18338 第 2 条）：上限那几行只在用满上限的
+    # 方案里挑，「少用一个卷」那几行只在省一卷的方案里挑 —— 混在一个池里排，省一卷的方案
+    # 常常平均色差更小，会把「总体最接近」那一行整行换掉，也会把「保留手上这一卷」的承诺挤
+    # 出去（那几卷是 pinned 的，只有用满上限的搜索带着这个约束）。
+    pools: dict[int, list[MatchResult]] = {}
     done = 0
-    for key, title, note, objective, count in _PLAN_SPECS:
+    for key, title, note, objective, count, delta in _PLAN_SPECS:
+        if cap <= 0 and delta:
+            # 「耗材上限 0」＝不限制：没有上限可省，「少用一个卷」在这里不是一句真话。
+            continue
         _report(progress, f"试着搭配耗材（{title}）", 0.90 + 0.1 * done / total)
-        found = _plans(prepared, cap, objective, limit=count, require=require, avoid=avoid)
+        budget = max(1, cap + delta) if cap > 0 else 0
+        found = _plans(
+            prepared, budget, objective, limit=count, require=require, avoid=avoid
+        )
         done += len(found)
+        rows = pools.setdefault(delta, [])
         for result in found:
             rolls = _option_rolls(result)
             if require - rolls or (avoid & rolls):
                 continue  # a plan that breaks the 筛选 is not a plan
-            pool.append(result)
-    ranked = {
-        key: _ranked_plans(pool, objective)
-        for key, _title, _note, objective, _count in _PLAN_SPECS
-    }
-    cursors = {key: 0 for key, _title, _note, _objective, _count in _PLAN_SPECS}
+            rows.append(result)
+    ranked: dict[str, list[MatchResult]] = {}
+    for key, _title, _note, objective, _count, delta in _PLAN_SPECS:
+        rows = _ranked_plans(pools.get(delta, []), objective)
+        if delta and cap > 0:
+            ceiling = max(1, cap + delta)
+            rows = [row for row in rows if len(_option_rolls(row)) <= ceiling]
+        ranked[key] = rows
+    cursors = {key: 0 for key, _title, _note, _objective, _count, _delta in _PLAN_SPECS}
     picks: dict[str, list[MatchResult]] = {key: [] for key in cursors}
     seen: set[frozenset[str]] = set()
     for round_index in range(max(spec[4] for spec in _PLAN_SPECS)):
-        for key, title, note, _objective, count in _PLAN_SPECS:
+        for key, title, note, _objective, count, _delta in _PLAN_SPECS:
             if round_index >= count:
                 continue
             rows = ranked[key]
@@ -2898,7 +2985,7 @@ def _offer_options(
                 seen.add(rolls)
                 break
     options: list[BudgetOption] = []
-    for key, title, note, _objective, _count in _PLAN_SPECS:
+    for key, title, note, _objective, _count, _delta in _PLAN_SPECS:
         for rank, result in enumerate(picks[key]):
             option_key, option_title = _option_title(key, title, rank)
             options.append(

@@ -2221,6 +2221,102 @@ def main() -> int:
                 f"{page._base_button.text()!r} / {page._base_button.toolTip()!r}",
             )
 
+            # --- m18338 第 1 条：底行看得见、改得动匹配栅格的像素数 --------------
+            check(
+                hasattr(page, "_px_width_spin")
+                and hasattr(page, "_px_height_spin")
+                and hasattr(page, "_rematch_px_button")
+                and not hasattr(page, "_max_dimension"),
+                "底行多了「宽/长」两个像素框和「按当前px重新匹配」（m18338 第 1 条）",
+            )
+            check(
+                page._px_width_spin.value() == int(page._result.width)
+                and page._px_height_spin.value() == int(page._result.height),
+                f"两个框显示现在这一份匹配的像素数，got "
+                f"{page._px_width_spin.value()}×{page._px_height_spin.value()} / "
+                f"{page._result.width}×{page._result.height}",
+            )
+            check(
+                page._rematch_px_button.text() == "按当前px重新匹配"
+                and "像素" in page._rematch_px_button.toolTip(),
+                f"按钮文字与提示写的是像素，got {page._rematch_px_button.text()!r} / "
+                f"{page._rematch_px_button.toolTip()[:30]!r}",
+            )
+            _picture_size = (int(page._image.width), int(page._image.height))
+            page._px_width_spin.setValue(80)
+            app.processEvents()
+            _expect_height = max(1, round(80 * _picture_size[1] / _picture_size[0]))
+            check(
+                page._px_height_spin.value() == _expect_height,
+                f"改「宽」时「长」按原图比例联动（{_picture_size[0]}×{_picture_size[1]} 的图，"
+                f"宽 80 ⇒ 长 {_expect_height}），got {page._px_height_spin.value()}",
+            )
+            _grid_before = (int(page._result.width), int(page._result.height))
+            _plans_before = list(page._plans)
+            page._on_rematch_px()
+            app.processEvents()
+            check(
+                (int(page._result.width), int(page._result.height)) != _grid_before,
+                f"「按当前px重新匹配」按新尺寸从头分色，got "
+                f"{page._result.width}×{page._result.height}（原来 {_grid_before}）",
+            )
+            check(
+                page._px_width_spin.value() == int(page._result.width)
+                and page._px_height_spin.value() == int(page._result.height)
+                and "匹配完成" in page._status.text(),
+                f"重匹配完两个框跟着新结果走、状态行说了这件事，got "
+                f"{page._px_width_spin.value()}×{page._px_height_spin.value()} / "
+                f"{page._status.text()[:40]}",
+            )
+            # 撤销一步回到按下之前（像素数、那一份匹配、还有「耗材方案」那几行）。
+            page._undo()
+            app.processEvents()
+            check(
+                (int(page._result.width), int(page._result.height)) == _grid_before,
+                f"Ctrl+Z 一步回到按下之前的那一份匹配，got "
+                f"{page._result.width}×{page._result.height} 期望 {_grid_before}",
+            )
+            check(
+                [row.key for row in page._plans] == [row.key for row in _plans_before]
+                and len(page._plans) == len(_plans_before),
+                f"Ctrl+Z 把「耗材方案」那几行也一起带回来，got {len(page._plans)} 行 / "
+                f"原来 {len(_plans_before)} 行",
+            )
+            page._redo_stack.clear()
+
+            # --- m18338 第 2 条：耗材方案多给几行（含「少用一个卷」「少用两个卷」）----
+            _plan_titles = [row.title for row in page._plans]
+            _cap = int(page._settings().max_spools)
+            _spares = [row for row in page._plans if "少用一个卷" in row.title]
+            _fars = [row for row in page._plans if "少用两个卷" in row.title]
+            check(
+                len(page._plans) >= 6,
+                f"「耗材方案」的行数比从前多（m18338 第 2 条），got {len(page._plans)} 行："
+                f"{_plan_titles}",
+            )
+            check(
+                len({frozenset(row.spools) for row in page._plans}) == len(page._plans),
+                f"多出来的行没有重复的耗材组合，got {_plan_titles}",
+            )
+            if _cap > 0:
+                check(
+                    bool(_spares)
+                    and all(len(row.spools) == _cap - 1 for row in _spares)
+                    and all(len(row.spools) == max(1, _cap - 2) for row in _fars)
+                    and all(
+                        len(row.spools) == _cap
+                        for row in page._plans
+                        if "少用" not in row.title
+                    ),
+                    f"「少用一个卷」/「少用两个卷」那几行真的比上限少卷（上限 {_cap}），got "
+                    f"{[(row.title, len(row.spools)) for row in page._plans]}",
+                )
+            else:
+                check(
+                    not _spares and not _fars,
+                    f"「耗材上限 0」不限制时没有「少用卷」可说，got {_plan_titles}",
+                )
+
             # m18149 第 1 条：图片朝下时 X 也照一次镜子 —— 原图里靠左的色块跑到右边，
             # 翻过来看底面（X 再反一次）才跟原图一个方向。
             page._side_combo.setCurrentIndex(1)
@@ -3752,9 +3848,19 @@ def main() -> int:
             page._spool_cap.setValue(remembered_cap)
             page._on_rematch()
             app.processEvents()
+            # m18338 第 2 条把「耗材方案」从「同一把尺子下的前几名」扩成「几档省料」：
+            # 一张本来就打得出来的图，多出来的那几行是「少用一个卷」「少用两个卷」，
+            # 每一行都还能把整张图打完（省的是料，不是画面），卷的组合各不相同。
+            _painted = {int((option.result.indices >= 0).sum()) for option in page._plans}
             check(
-                len(page._plans) == 1 and page._plan_key == page._plans[0].key,
-                f"an exactly printable picture offers one plan, got {len(page._plans)}",
+                len(page._plans) >= 1
+                and page._plan_key == page._plans[0].key
+                and len({frozenset(option.spools) for option in page._plans}) == len(page._plans)
+                and len(_painted) == 1
+                and all(option.spools for option in page._plans),
+                f"an exactly printable picture offers the same spread as any other, got "
+                f"{len(page._plans)} 行 {[(option.title, len(option.spools)) for option in page._plans]}"
+                f" 打印像素 {_painted}",
             )
             check(
                 all(not option.from_file for option in page._plans),

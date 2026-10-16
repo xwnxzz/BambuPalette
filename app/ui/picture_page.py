@@ -208,6 +208,24 @@ BASE_COLOUR_TIP = (
     "· 没挑就跟着图上占像素最多的那一块走。"
 )
 
+#: 匹配栅格是多少像素（m18338 第 1 条）。1.6.43 拿掉了「最大边长」那个框（导入即按图片
+#: 自己的像素数），可「拿多大的格子分色」这件事本身还得看得见、改得动：底行这两个框显示
+#: 现在这一份匹配用了几像素宽、几像素长，改完按右边的按钮拿新尺寸从头分色。
+PX_LABEL_WIDTH = "宽"
+PX_LABEL_HEIGHT = "长"
+PX_TIP = (
+    "现在这一份匹配拿多少像素分色（宽 × 长）。\n"
+    "· 导入就是图片自己的像素数（1.6.43 起）；改大色块边界更细，也慢一些；\n"
+    "· 两个框按图片的比例联动：改一个，另一个跟着走；\n"
+    "· 改完按右边的「按当前px重新匹配」，拿这个尺寸从头分色（色块会变）。"
+)
+REMATCH_PX_BUTTON = "按当前px重新匹配"
+REMATCH_PX_TIP = (
+    "按上面两个框里的像素数，从「原图」（含你做过的删除、合并）重新分色、重新挑卷。\n"
+    "跟重新导入一次一样：色块的划分和编号都是新的；「颜色数量」「耗材上限」「点图片时」"
+    "这些照现在的设置来。想保留现在的色块就别按这个，按上面的「按当前色块重新匹配」。"
+)
+
 PAGE_HELP = (
     "图像转换这一步：\n"
     f"· {ZOOM_HINT}\n"    f"· 颜色数量最多 {MAX_PAINTED_FILAMENTS} 是 Bambu Studio 自己的限制：一个工程里只认 "
@@ -220,6 +238,9 @@ PAGE_HELP = (
     "· 「按当前色块重新匹配」先从「原图」（含你做过的删除、合并）重新找一遍颜色、按「颜色数量」"
     "重算，再拿现在这些色块重新挑卷：色块的划分和编号都不动，你在色块模式里点过、改过的块还在原"
     "处；颜色表里那些「更换颜色」会清掉（行是按旧的颜色表排的，对不上了）。原图本身不改。\n"
+    "· 底行「宽 × 长」两个框是这一份匹配拿多少像素分色：导入就是图片自己的像素数（1.6.43 起），"
+    "改大色块边界更细、也慢一些，两个框按图片比例联动；改完按「按当前px重新匹配」拿这个尺寸从头"
+    "分色 —— 色块会变，跟重新导入一次一样。\n"
     "· 「删除」也可以按键盘上的 Del：选中一种颜色或者一块之后按 Del，和点按钮一样。\n"
     "· 在「按色块边缘选择」下删除或合并，会同时改「原图」本身——删掉的那块在原图里变透明、"
     "并掉的那几块在原图里并进留下来的那一块，所以「按当前色块重新匹配」从改过的原图出发，删掉"
@@ -1731,9 +1752,27 @@ class PicturePage(QWidget):
         self._base_swatch = QLabel()
         self._base_swatch.setFixedSize(18, 18)
         self._base_swatch.setToolTip(BASE_COLOUR_TIP)
-        self._base_button = QPushButton("更换…")
+        self._base_button = QPushButton("更换底板颜色")
         self._base_button.setToolTip(BASE_COLOUR_TIP)
         self._base_button.clicked.connect(self._on_pick_base_colour)
+
+        # 匹配栅格是多少像素 (m18338 第 1 条): 1.6.43 拿掉了「最大边长」那个框，可「拿多大
+        # 的格子分色」本身还得看得见、改得动 —— 两个框按图片比例联动，右边一颗按钮拿这个
+        # 尺寸从头分色（色块会变，所以按钮说明里写明它跟「重新导入」一样）。
+        self._px_lock = False
+        self._px_width_spin = QSpinBox()
+        self._px_width_spin.setRange(8, 999_999_999)
+        self._px_width_spin.setMaximumWidth(110)
+        self._px_width_spin.setToolTip(PX_TIP)
+        self._px_width_spin.valueChanged.connect(lambda _value: self._on_px_edited("width"))
+        self._px_height_spin = QSpinBox()
+        self._px_height_spin.setRange(8, 999_999_999)
+        self._px_height_spin.setMaximumWidth(110)
+        self._px_height_spin.setToolTip(PX_TIP)
+        self._px_height_spin.valueChanged.connect(lambda _value: self._on_px_edited("height"))
+        self._rematch_px_button = QPushButton(REMATCH_PX_BUTTON)
+        self._rematch_px_button.setToolTip(REMATCH_PX_TIP)
+        self._rematch_px_button.clicked.connect(self._on_rematch_px)
 
         # 导出时圆滑色块 (1.6.22): 匹配栅格上的色块边界是一格一格的台阶，在 Bambu
         # Studio 里放大看就是锯齿。 默认勾上；不勾就照 1.6.21 的样子导出。
@@ -1764,6 +1803,14 @@ class PicturePage(QWidget):
         bottom.addWidget(QLabel("底板颜色:"))
         bottom.addWidget(self._base_swatch)
         bottom.addWidget(self._base_button)
+        bottom.addSpacing(12)
+        bottom.addWidget(QLabel(PX_LABEL_WIDTH + ":"))
+        bottom.addWidget(self._px_width_spin)
+        bottom.addWidget(QLabel("px"))
+        bottom.addWidget(QLabel(PX_LABEL_HEIGHT + ":"))
+        bottom.addWidget(self._px_height_spin)
+        bottom.addWidget(QLabel("px"))
+        bottom.addWidget(self._rematch_px_button)
         bottom.addStretch(1)
         bottom.addWidget(QLabel(IMAGE_SIDE_LABEL + ":"))
         bottom.addWidget(self._side_combo)
@@ -2065,6 +2112,9 @@ class PicturePage(QWidget):
             self._save_project_button,
             self._base_spin,
             self._base_button,
+            self._px_width_spin,
+            self._px_height_spin,
+            self._rematch_px_button,
             self._side_combo,
             self._smooth_box,
             self._export_3mf,
@@ -2615,7 +2665,7 @@ class PicturePage(QWidget):
         self._status.setText(f"正在匹配：{message}…")
         QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
 
-    def _on_rematch(self) -> None:
+    def _on_rematch(self, *, pushed: bool = False) -> None:
         if self._image is None:
             return
         if self._library is None or len(self._library) == 0:
@@ -2627,7 +2677,12 @@ class PicturePage(QWidget):
             return
         # The rows on screen describe the match that is about to be replaced:
         # clearing them first is what keeps 「耗材方案」 from showing a choice that
-        # is no longer the one being made.
+        # is no longer the one being made.  The snapshot has to be taken **first**
+        # (m18338 第 1 条): 清空之后再压栈，Ctrl+Z 拿回来的就是一份没有方案的匹配。
+        before = list(self._plans)
+        if self._base is not None and not pushed:
+            self._push()
+            pushed = True
         self._plans = []
         self._plans_stale = False
         self._refresh_plans("正在重新匹配，马上列出几套耗材搭配。")
@@ -2643,6 +2698,7 @@ class PicturePage(QWidget):
             )
         except Exception as error:  # pragma: no cover - defensive
             QMessageBox.warning(self, "匹配失败", str(error))
+            self._drop_failed_match(before, pushed)
             # The controls were switched off for the match, and this path has no
             # new result to switch them back on with.
             self._set_controls_enabled(self._result is not None)
@@ -2657,6 +2713,7 @@ class PicturePage(QWidget):
                 if (self._require or self._avoid)
                 else "这一版没有找到能用的耗材搭配。",
             )
+            self._drop_failed_match(before, pushed)
             self._set_controls_enabled(self._result is not None)
             return
         # 1.6.27 起第一行是 「大色差色块优先」 (m06704 第 3 条), which is also what
@@ -2664,7 +2721,17 @@ class PicturePage(QWidget):
         # the answer and the other rows stay the alternatives.
         # 从头匹配的这份划分是新的：不许再拿「按当前色块重新匹配」留下的那张标签图。
         self._block_template = None
-        self._adopt_options(options)
+        self._adopt_options(options, pushed=pushed)
+
+    def _drop_failed_match(self, before: list[BudgetOption], pushed: bool) -> None:
+        """一次没成功的匹配不该留下痕迹：行摆回去，白压的那一步也撤掉。"""
+        if pushed and self._undo_stack:
+            snapshot = self._undo_stack.pop()
+            # 「按当前px重新匹配」是先压栈、再改 _span 的（m18338 第 1 条）：这一步没
+            # 成功，栅格也得跟着退回按下之前，不然下一次匹配会按新像素数重划色块。
+            self._span = int(snapshot[-1])
+        self._plans = before
+        self._refresh_plans()
 
     def _original_means(self, result: MatchResult) -> np.ndarray | None:
         """每种 live 颜色在当前「原图」上的平均色（``None`` = 量不了，仍用旧的）。
@@ -2804,6 +2871,7 @@ class PicturePage(QWidget):
         *,
         block_labels: np.ndarray | None = None,
         keep_block_edits: bool = False,
+        pushed: bool = False,
     ) -> None:
         """Make ``options[0]`` the match on screen, with the rest listed under it.
 
@@ -2820,8 +2888,10 @@ class PicturePage(QWidget):
         —— 划分没变，那些掩码指的仍是用户当初点的那几块。
         """
         # The very first match of a picture has nothing behind it; pushing there
-        # would arm Ctrl+Z against a page that had no match at all.
-        if self._base is not None:
+        # would arm Ctrl+Z against a page that had no match at all.  ``pushed``
+        # says the caller already took it — 「重新匹配」 has to, because it clears
+        # the rows before the match and the snapshot would otherwise miss them.
+        if self._base is not None and not pushed:
             self._push()
         self._plans = options
         self._plans_stale = False
@@ -3179,6 +3249,70 @@ class PicturePage(QWidget):
             self._base_button.setToolTip(
                 f"{BASE_COLOUR_TIP}\n现在用的是 {colour}（{entry.short_label}）。{where}"
             )
+        self._refresh_px_view()
+
+    def _refresh_px_view(self) -> None:
+        """两个像素框显示现在这一份匹配用的尺寸（m18338 第 1 条）。
+
+        有结果就写结果自己的宽 × 长（匹配栅格）；还没有结果就写原图的像素数，也就是
+        按一次「按当前px重新匹配」会用的数字。写的时候挂上 ``_px_lock``，免得
+        :meth:`_on_px_edited` 把「按比例改另一个框」又跑一遍。
+        """
+        size: tuple[int, int] | None = None
+        if self._result is not None and self._result.width and self._result.height:
+            size = (int(self._result.width), int(self._result.height))
+        elif self._image is not None:
+            size = (int(self._image.width), int(self._image.height))
+        self._px_lock = True
+        try:
+            if size is None:
+                self._px_width_spin.setValue(int(self._span))
+                self._px_height_spin.setValue(int(self._span))
+            else:
+                self._px_width_spin.setValue(size[0])
+                self._px_height_spin.setValue(size[1])
+        finally:
+            self._px_lock = False
+
+    def _on_px_edited(self, changed: str) -> None:
+        """改一个像素框，另一个按原图比例跟着走（m18338 第 1 条）。
+
+        比例取**原图**的宽高比：匹配栅格是原图等比缩到「最大边长」得到的，拿结果的
+        宽高比去推会把已经取整的误差再放大一轮。
+        """
+        if self._px_lock or self._image is None:
+            return
+        width = max(1, int(self._image.width))
+        height = max(1, int(self._image.height))
+        self._px_lock = True
+        try:
+            if changed == "width":
+                self._px_height_spin.setValue(
+                    max(1, min(999_999_999, int(round(self._px_width_spin.value() * height / width))))
+                )
+            else:
+                self._px_width_spin.setValue(
+                    max(1, min(999_999_999, int(round(self._px_height_spin.value() * width / height))))
+                )
+        finally:
+            self._px_lock = False
+
+    def _on_rematch_px(self) -> None:
+        """「按当前px重新匹配」(m18338 第 1 条): 拿两个框里的像素数从头分色、重新挑卷。
+
+        走「重新匹配」那条路而不是「按当前色块重新匹配」：尺寸变了，划分本来就对不上，
+        所以色块是新的（用户 m18369 确认过就是这个意思）。撤销一步回到按下之前，栅格与
+        那一份匹配一起回来 —— 快照要**先**压（m18338 的收尾）：先改 ``_span`` 再压，
+        撤回来的就是「旧结果配新栅格」，下一次「按当前色块重新匹配」会按新栅格重划色块。
+        """
+        if self._image is None:
+            return
+        pushed = False
+        if self._base is not None:
+            self._push()
+            pushed = True
+        self._span = max(1, int(self._px_width_spin.value()), int(self._px_height_spin.value()))
+        self._on_rematch(pushed=pushed)
 
     def _restore_base_entry(self, key: str) -> None:
         """按 ``PaletteEntry.key`` 认回工程里存的那一种底板颜色（m16941 第 2 条）。"""
@@ -3412,6 +3546,9 @@ class PicturePage(QWidget):
         Ctrl+Z has to bring the old picture back as well.  The reference is enough —
         every path that changes ``_image`` (``_paint_original``, ``loadImage``,
         ``_adopt_project``) REPLACES the object and nothing ever edits one in place.
+
+        m18338 第 1 条 adds ``_span``（匹配拿多少像素）: 底行两个框改完按「按当前px重新
+        匹配」，匹配栅格就换了 —— 那也是能撤的一步。
         """
         return (
             set(self._deleted),
@@ -3426,6 +3563,7 @@ class PicturePage(QWidget):
             self._original_edited,
             self._plans_stale,
             self._base_entry,
+            self._span,
         )
 
     def _restore(self, snapshot: tuple) -> None:
@@ -3442,6 +3580,7 @@ class PicturePage(QWidget):
             original_edited,
             plans_stale,
             base_entry,
+            span,
         ) = snapshot
         self._deleted = set(deleted)
         self._merged = dict(merged)
@@ -3457,6 +3596,8 @@ class PicturePage(QWidget):
         self._plans_stale = bool(plans_stale)
         # 底板颜色也是一步能撤的编辑（m16941 第 2 条）。
         self._base_entry = base_entry
+        # 匹配栅格也是（m18338 第 1 条）: 撤回到「改像素数之前」，两个框跟着回去。
+        self._span = int(span)
         self._plate = None
         self._refresh_base_view()
         # 原图 has to catch up before ``_apply_edits`` hands the views a backdrop.
