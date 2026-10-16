@@ -1877,7 +1877,11 @@ def build_plate(
     if config.image_on_bottom:
         thickness = z_colour_top
         points[:, 2] = thickness - points[:, 2]
-        faces = faces[:, ::-1]
+        # 图片印在底面，看的人要把整块翻过来才看得见图，而那一下翻的正是左右 —— 所以 X 也
+        # 得照一次镜子：「opus」在底面上才还是「opus」，不然印出来是「2uqo」（m18149 第 1
+        # 条）。Z 与 X 两次镜像合起来是旋转，绕序不变；Y 那一次已经由上面的
+        # ``faces[:, ::-1]`` 配平了，所以这里不再动 faces。
+        points[:, 0] = width * cell - points[:, 0]
         base_z = (config.colour_thickness_mm, thickness)
         colour_z = (0.0, config.colour_thickness_mm)
     else:

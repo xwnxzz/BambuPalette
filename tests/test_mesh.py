@@ -379,30 +379,61 @@ class PlateTests(unittest.TestCase):
             self.assertAlmostEqual(part.z_bottom_mm, base_top, places=9)
             self.assertAlmostEqual(part.z_top_mm, plate.total_thickness_mm, places=9)
 
-    def test_the_two_sides_are_mirror_images_of_each_other(self):
+    def test_the_two_sides_differ_by_a_z_mirror_and_an_x_mirror(self):
         down = build_plate(self.result, settings_for_width(100.0, self.result.width))
         up = build_plate(
             self.result, settings_for_width(100.0, self.result.width, image_on_bottom=False)
         )
         thickness = down.total_thickness_mm
+        width_mm = down.width_mm
         self.assertEqual(len(down.parts), len(up.parts))
         for a, b in zip(down.parts, up.parts):
             self.assertEqual(a.name, b.name)
             self.assertEqual(a.extruder, b.extruder)
-            self.assertTrue(np.allclose(a.vertices[:, 0], b.vertices[:, 0]))
-            self.assertTrue(np.allclose(a.vertices[:, 1], b.vertices[:, 1]))
+            # Z 照镜子：顶面 ↔ 底面、色块层 ↔ 底板层。
             self.assertTrue(
                 np.allclose(a.vertices[:, 2], thickness - b.vertices[:, 2]),
                 f"{a.name} is not the z-mirror of its face-up twin",
             )
-        # A reflection flips orientation, so the winding has to be reversed to
-        # compensate — otherwise every normal points into the solid and the volume
-        # comes out negative.
+            # X 也照镜子（m18149 第 1 条）：看底面要把整块翻过来，那一下翻的是左右，
+            # 所以导出时得先翻一次，「opus」在底面上才不是「2uqo」。
+            self.assertTrue(
+                np.allclose(a.vertices[:, 0], width_mm - b.vertices[:, 0]),
+                f"{a.name} is not the x-mirror of its face-up twin",
+            )
+            self.assertTrue(np.allclose(a.vertices[:, 1], b.vertices[:, 1]))
+        # Z 与 X 两次镜像合起来是绕 Y 轴转 180°，绕序不变，法线仍旧朝外，体积也不变。
         down_points, down_faces, _ = plate_mesh(down)
         up_points, up_faces, _ = plate_mesh(up)
         self.assertGreater(signed_volume(down_points, down_faces), 0.0)
         self.assertGreater(signed_volume(up_points, up_faces), 0.0)
         self.assertAlmostEqual(down.volume_mm3, up.volume_mm3, places=6)
+
+    def test_the_bottom_face_is_mirrored_left_to_right(self):
+        """左右翻的方向要对：原图里靠左的那一块，在底面朝下的实体里靠右。
+
+        翻过来看底面时 X 又反一次，于是跟原图一个方向 —— 这正是用户要的那个效果
+        （m18149 第 1 条：原图里的 opus 导出后成了 2uqo）。
+        """
+        down = build_plate(self.result, settings_for_width(100.0, self.result.width))
+        up = build_plate(
+            self.result, settings_for_width(100.0, self.result.width, image_on_bottom=False)
+        )
+
+        def centres(plate) -> dict[int, float]:
+            return {
+                part.palette_index: float(part.vertices[:, 0].mean()) for part in plate.parts[1:]
+            }
+
+        down_centres, up_centres = centres(down), centres(up)
+        self.assertEqual(set(down_centres), set(up_centres))
+        left_up = min(up_centres, key=up_centres.get)
+        right_up = max(up_centres, key=up_centres.get)
+        left_down = min(down_centres, key=down_centres.get)
+        right_down = max(down_centres, key=down_centres.get)
+        self.assertNotEqual(left_up, right_up, "素材得左右不对称，这条才说明问题")
+        self.assertEqual(left_up, right_down)
+        self.assertEqual(right_up, left_down)
 
     def test_both_sides_are_watertight(self):
         for face_down in (True, False):

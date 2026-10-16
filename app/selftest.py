@@ -1607,6 +1607,13 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         page._base_entry = None
         page._plate = None
         page._refresh_base_view()
+        # m18149 第 2 条：按钮上只写它干什么（「更换底板颜色」），「自动」不再塞进按钮文字里。
+        check(
+            page._base_button.text() == "更换底板颜色"
+            and "自动挑的" in page._base_button.toolTip(),
+            f"按钮写「更换底板颜色」、自动与否在 tooltip 里，got "
+            f"{page._base_button.text()!r} / {page._base_button.toolTip()!r}",
+        )
         app.processEvents()
 
         # m17910 第 2 条：栅格与 SVG 渲染都不再有上限。

@@ -2213,6 +2213,34 @@ def main() -> int:
             page._plate = None
             page._refresh_base_view()
             app.processEvents()
+            # m18149 第 2 条：按钮文字只说它干什么，「自动」挪进 tooltip。
+            check(
+                page._base_button.text() == "更换底板颜色"
+                and "自动挑的" in page._base_button.toolTip(),
+                f"按钮写「更换底板颜色」、自动与否写在 tooltip 里，got "
+                f"{page._base_button.text()!r} / {page._base_button.toolTip()!r}",
+            )
+
+            # m18149 第 1 条：图片朝下时 X 也照一次镜子 —— 原图里靠左的色块跑到右边，
+            # 翻过来看底面（X 再反一次）才跟原图一个方向。
+            page._side_combo.setCurrentIndex(1)
+            face_up = page.buildPlate()
+            page._side_combo.setCurrentIndex(0)
+            face_down = page.buildPlate()
+            app.processEvents()
+            up_x = {p.palette_index: float(p.vertices[:, 0].mean()) for p in face_up.parts[1:]}
+            down_x = {p.palette_index: float(p.vertices[:, 0].mean()) for p in face_down.parts[1:]}
+            left_up = min(up_x, key=up_x.get) if up_x else None
+            left_down = min(down_x, key=down_x.get) if down_x else None
+            check(
+                len(down_x) >= 2
+                and left_up is not None
+                and left_down is not None
+                and left_up != left_down
+                and max(up_x, key=up_x.get) == left_down,
+                f"图片朝下时左右翻了一次，翻过来看才是正的（m18149 第 1 条），got "
+                f"朝上 {up_x} / 朝下 {down_x}",
+            )
 
             # m17910 第 2 条：栅格不再有上限（1.6.43 里的 4096 也删了）。
             from app.core.image_matching import MatchSettings as _GridSettings

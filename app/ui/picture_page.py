@@ -192,7 +192,8 @@ IMAGE_SIDE_TOP = "顶面"
 IMAGE_SIDE_TIP = (
     "图片印在模型的哪一面。\n"
     f"· {IMAGE_SIDE_BOTTOM}（默认）：图片朝下贴着打印板，顶面是一整片底板色，打出来顶面平整、"
-    "不被色块的边线划过。\n"
+    "不被色块的边线划过。看底面得把整块翻过来看，所以导出时图片会**左右翻一次**，翻过来看"
+    "字和图才是正的（1.6.45 起）。\n"
     f"· {IMAGE_SIDE_TOP}：图片朝上，就是 1.6.22 及以前的样子。\n"
     "两面都是同一块闭合实体，只是上下对调；尺寸、厚度、体积都不变。"
 )
@@ -202,7 +203,7 @@ IMAGE_SIDE_TIP = (
 #: 耗材槽写进 3MF（底板的混色配方才带得过去）。
 BASE_COLOUR_TIP = (
     "底板用哪一种颜色。\n"
-    "· 点「更换…」从整套混色里挑（跟「更换颜色」是同一个框，可以按 ΔE00 排序、也能搜）；\n"
+    "· 点「更换底板颜色」从整套混色里挑（跟「更换颜色」是同一个框，可以按 ΔE00 排序、也能搜）；\n"
     "· 挑的颜色不在「打印图片需要的颜色」里也行 —— 导出时它自己占一个耗材槽；\n"
     "· 没挑就跟着图上占像素最多的那一块走。"
 )
@@ -275,12 +276,14 @@ PAGE_HELP = (
     "· 导入图片时按图片自己的像素数建匹配栅格（1.6.43 起不再有「最大边长」数字框，1.6.44 起连上限"
     "也没有）：一格 0.4 mm，板的长宽就是像素数 × 0.4。 图片多少像素就按多少像素分（没有上限），"
     "SVG 也按它在文件里声明的那一档渲。 图越大匹配越慢，那是像素数本身的事。\n"
-    "· 「底板颜色」点「更换…」可以从**整套混色**里挑任意一种当底板（1.6.43 起，跟「更换颜色」用同"
+    "· 「底板颜色」点「更换底板颜色」可以从**整套混色**里挑任意一种当底板（1.6.43 起，跟「更换颜色」用同"
     "一个框，能按 ΔE00 排序、也能搜）：挑的正好是图上某一卷时，底板跟那一卷共用一个耗材槽；"
     "不在图上时它自己占一个槽写进 3MF，那一片的混色配方才带得过去；不挑就跟着占像素最多的那一块"
     "走。 这一项写进 .bpproj，Ctrl+Z 也撤得回来。\n"
     f"· 「{IMAGE_SIDE_LABEL}」选图片印在模型的哪一面（1.6.23 起）：{IMAGE_SIDE_BOTTOM}（默认）"
-    f"是图片朝下贴着打印板、顶面一整片底板色，打出来顶面平整；{IMAGE_SIDE_TOP} 是图片朝上，"
+    f"是图片朝下贴着打印板、顶面一整片底板色，打出来顶面平整（看底面要把整块翻过来，所以导出时"
+    "图片左右翻一次，翻过来看是正的，1.6.45 起）；"
+    f"{IMAGE_SIDE_TOP} 是图片朝上，"
     "也就是 1.6.22 及以前的样子。两面都是同一块闭合实体上下对调，尺寸、厚度、体积都不变；"
     "这一项也写进 .bpproj。"
 )
@@ -3162,12 +3165,20 @@ class PicturePage(QWidget):
                 "background:transparent; border:1px dashed #9aa2ad; border-radius:3px;"
             )
         self._base_button.setEnabled(self._result is not None and bool(self._candidate_palette()))
-        self._base_button.setText("更换…" if self._base_entry is not None else "更换…（自动）")
-        self._base_button.setToolTip(
-            BASE_COLOUR_TIP
-            if entry is None
-            else f"{BASE_COLOUR_TIP}\n现在用的是 {colour}（{entry.short_label}）。"
-        )
+        # 文案只说这个按钮干什么（m18149 第 2 条：原来的「更换…（自动）」把「自动」塞进按钮
+        # 文字里，读起来像两个按钮拼在一起）；自动还是手挑，写进 tooltip。
+        self._base_button.setText("更换底板颜色")
+        if entry is None:
+            self._base_button.setToolTip(BASE_COLOUR_TIP)
+        else:
+            where = (
+                "现在这一种是自动挑的（跟着图上最大的一块）。"
+                if self._base_entry is None
+                else "现在这一种是手动挑的。"
+            )
+            self._base_button.setToolTip(
+                f"{BASE_COLOUR_TIP}\n现在用的是 {colour}（{entry.short_label}）。{where}"
+            )
 
     def _restore_base_entry(self, key: str) -> None:
         """按 ``PaletteEntry.key`` 认回工程里存的那一种底板颜色（m16941 第 2 条）。"""
