@@ -1626,79 +1626,26 @@ def run_selftest(*, report_path: Path | None = None) -> int:
             "SVG 渲染也不封 4096（m17910 第 2 条）",
         )
 
-        # m18338 第 1 条：底行看得见、改得动匹配栅格的像素数。
-        check(
-            hasattr(page, "_px_width_spin")
-            and hasattr(page, "_px_height_spin")
-            and hasattr(page, "_rematch_px_button"),
-            "底行多了「宽/长」两个像素框和「按当前px重新匹配」（m18338 第 1 条）",
-        )
-        check(
-            max(page._px_width_spin.value(), page._px_height_spin.value()) == int(page._span)
-            and int(page._span) == max(int(page._image.width), int(page._image.height)),
-            f"两个框写的是「按下去会用多大的栅格」（导入后就是原图的像素数），got "
-            f"{page._px_width_spin.value()}×{page._px_height_spin.value()} / span {page._span} / "
-            f"{page._image.size}",
-        )
-        check(
-            page._rematch_px_button.text() == "按当前px重新匹配",
-            f"按钮写「按当前px重新匹配」，got {page._rematch_px_button.text()!r}",
-        )
+        # m19523：1.6.46 加的「宽/长」两个框与「按当前px重新导入图片」撤掉了；
+        # 导入仍然按图片自己的像素数分色。
         _picture_size = (int(page._image.width), int(page._image.height))
-        page._px_width_spin.setValue(64)
-        app.processEvents()
-        _want_height = max(1, round(64 * _picture_size[1] / _picture_size[0]))
         check(
-            page._px_height_spin.value() == _want_height,
-            f"改「宽」时「长」按原图比例联动，got {page._px_height_spin.value()} 期望 {_want_height}",
-        )
-        _grid_before = (int(page.result.width), int(page.result.height))
-        _plans_before = list(page._plans)
-        page._on_rematch_px()
-        app.processEvents()
-        check(
-            (int(page.result.width), int(page.result.height)) != _grid_before,
-            f"「按当前px重新匹配」按新尺寸从头分色，got "
-            f"{page.result.width}×{page.result.height}（原来 {_grid_before}）",
+            not hasattr(page, "_px_width_spin")
+            and not hasattr(page, "_px_height_spin")
+            and not hasattr(page, "_rematch_px_button")
+            and not hasattr(page, "_px_lock"),
+            "「宽/长」两个框与「按当前px重新导入图片」都撤了（m19523）",
         )
         check(
-            int(page._px_width_spin.value()) == 64
-            and int(page._px_height_spin.value()) == _want_height
-            and int(page._span) == max(64, _want_height)
-            and "匹配完成" in page._status.text(),
-            f"重匹配用框里写的数、框里还是我写的数、状态行说了这件事，got "
-            f"{page._px_width_spin.value()}×{page._px_height_spin.value()} / span {page._span}",
-        )
-        page._undo()
-        app.processEvents()
-        check(
-            (int(page.result.width), int(page.result.height)) == _grid_before,
-            "撤销一步回到按下之前的那一份匹配（像素数一起回来）",
+            int(page._span) == max(_picture_size),
+            f"导入按图片自己的像素数分色，got span {page._span} / 图 "
+            f"{_picture_size[0]}×{_picture_size[1]}",
         )
         check(
-            [row.key for row in page._plans] == [row.key for row in _plans_before]
-            and len(page._plans) == len(_plans_before),
-            f"撤销把「耗材方案」那几行也一起带回来（m18338 第 2 条），"
-            f"got {len(page._plans)} 行 / 原来 {len(_plans_before)} 行",
+            (int(page.result.width), int(page.result.height)) == _picture_size,
+            f"栅格就是原图的像素数（一格一个像素），got "
+            f"{page.result.width}×{page.result.height}",
         )
-        # m19050 第 2 条：写的数比原图大 ⇒ 不放大，但框里留着我写的数、状态行说明。
-        _big = max(_picture_size) * 2
-        page._px_width_spin.setValue(_big)
-        app.processEvents()
-        page._on_rematch_px()
-        app.processEvents()
-        check(
-            int(page._px_width_spin.value()) == _big
-            and (int(page.result.width), int(page.result.height)) == _picture_size
-            and "不放大" in page._status.text(),
-            f"写的数比原图大：按原图像素数匹配、框里留着我写的数、状态行说不放大，got "
-            f"{page._px_width_spin.value()} / {page.result.width}×{page.result.height} / "
-            f"{page._status.text()[:80]}",
-        )
-        page._undo()
-        app.processEvents()
-        page._redo_stack.clear()
-
         # m18338 第 2 条：耗材方案多给几行，其中一档是「少用一个卷」。
         _cap_now = int(page._settings().max_spools)
         _spare_rows = [row for row in page._plans if "少用一个卷" in row.title]
