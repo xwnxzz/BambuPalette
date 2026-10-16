@@ -90,6 +90,10 @@ class PlateSettings:
     #: Palette index whose filament also prints the base plate; -1 = the colour
     #: that covers the most pixels.
     base_index: int = -1
+    #: 用户挑的底板颜色（``PaletteEntry.key``）；空串 = 跟着图上最大的一块走（m16941 第 2 条）。
+    #: 以前底板颜色只能从「打印图片需要的颜色」那几行里选，现在跟「更换颜色」用同一个框，
+    #: 可以挑整套混色里的任意一种，所以得单独记它自己的 key（不再是一个调色板下标）。
+    base_key: str = ""
     #: 导出时把色块边界圆滑 (1.6.22 / 1.6.27)。 匹配栅格上的色块边界是「一格一格的台阶」，
     #: 150 mm 宽、512 像素的图上约 0.29 mm 一级，在 Bambu Studio 里放大看就是锯齿。
     #: 打开之后先在匹配栅格上把每种颜色糊一遍再细分若干倍：1.6.27 起直接描出那条边界线
@@ -108,6 +112,7 @@ class PlateSettings:
             base_thickness_mm=max(colour + 0.2, min(20.0, float(self.base_thickness_mm))),
             colour_thickness_mm=colour,
             base_index=int(self.base_index),
+            base_key=str(self.base_key),
             smooth_edges=bool(self.smooth_edges),
             image_on_bottom=bool(self.image_on_bottom),
         )
@@ -180,6 +185,23 @@ class PlateModel:
     colour_thickness_mm: float
     notes: list[str] = field(default_factory=list)
     source: str = ""
+
+    #: 用户挑的那一种底板颜色，**不在**图片的调色板里时记在这里（m16941 第 2 条）。
+    #: 它占一个自己的耗材槽：``build_plate`` 会把底板那件排到 ``len(palette) + 1``。
+    #: 底板颜色本来就取自图片的某一卷时这里是 ``None``，底板跟那一卷共用一个槽
+    #: （1.6.23 起的老行为）。
+    base_slot: object | None = None
+
+    def filament_entries(self, palette: Sequence[object]) -> list[object]:
+        """导出时要按耗材槽顺序交给 3MF 的那份条目表（``base_slot`` 接在末尾）。
+
+        ``write_3mf`` 的 ``filaments`` 是按槽号 - 1 取用的，所以底板自己占一个槽时
+        必须把它接在图片调色板后面，否则那一个槽会退回「只有颜色、没有混色配方」。
+        """
+        entries = list(palette)
+        if self.base_slot is not None:
+            entries.append(self.base_slot)
+        return entries
 
     @property
     def total_thickness_mm(self) -> float:
@@ -1465,11 +1487,49 @@ def plate_mesh(plate: PlateModel) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 # ---------------------------------------------------------------------------
 # Assembly
 # ---------------------------------------------------------------------------
+def _own_base_slot(result: MatchResult, base_entry: object | None) -> object | None:
+    """挑出来的底板颜色要不要占一个自己的耗材槽（m16941 第 2 条）。
+
+    ``base_entry`` 是用户在「底板颜色」里挑的那一种 —— 整套混色里的任意一条，可能根本
+    不在图片的调色板里。 挑的正好是图上某一卷（``PaletteEntry.key`` 相同）时返回
+    ``None``：底板跟那一卷共用一个槽，这是 1.6.23 以来的老行为。 否则返回那个条目，
+    :func:`build_plate` 让底板自己占一个槽（``len(palette) + 1``），它的混色配方才带得
+    进 3MF；读 3MF 的人看到的就是用户挑的那一种颜色，而不是「最接近的图上颜色」。
+    """
+    if base_entry is None:
+        return None
+    key = str(getattr(base_entry, "key", "") or "")
+    if not key:
+        return base_entry
+    if _printed_position(result, base_entry) is not None:
+        return None
+    return base_entry
+
+
+def _printed_position(result: MatchResult, base_entry: object | None) -> int | None:
+    """``base_entry`` 在图片调色板里的第几行；挑的不是图上那一卷时返回 ``None``。
+
+    底板印出来的颜色由**用户挑的那一种**说了算：挑了图上第 3 行，底板就跟第 3 行走
+    同一个耗材槽（``extruder = 3 + 1``），而不是退回「最大一块」那一行（m16941 第 2
+    条）。
+    """
+    if base_entry is None:
+        return None
+    key = str(getattr(base_entry, "key", "") or "")
+    if not key:
+        return None
+    for position, entry in enumerate(result.palette):
+        if str(getattr(entry, "key", "") or "") == key:
+            return position
+    return None
+
+
 def build_plate(
     result: MatchResult,
     settings: PlateSettings | None = None,
     *,
     base_label: str = "底板",
+    base_entry: object | None = None,
     progress: ProgressFn | None = None,
 ) -> PlateModel:
     """Build the picture as ONE watertight slab, then cut it into per-filament parts.
@@ -1485,6 +1545,11 @@ def build_plate(
 
     There are no interior walls and no coincident faces, so the assembly is a
     genuine 2-manifold with a well-defined inside and outside.
+
+    ``base_entry``（m16941 第 2 条）是界面「底板颜色」里挑的那一种。 它不是图上任何
+    一卷时，底板会占一个自己的耗材槽；导 3MF 时用
+    :meth:`PlateModel.filament_entries` 把那一条接在图片调色板后面交给
+    :func:`app.mesh.threemf.write_3mf`，槽号才对得上。
     """
     config = (settings or PlateSettings()).clamped()
     if not result.palette:
@@ -1538,10 +1603,21 @@ def build_plate(
     width_mm = result.width * cell
     depth_mm = result.height * cell
 
-    base_index = config.base_index
-    if base_index < 0 or base_index >= len(result.palette):
-        base_index = int(np.argmax(result.counts))
-    base_extruder = base_index + 1
+    # 底板颜色（m16941 第 2 条）：界面上挑的那一种优先，挑的正好是图上某一卷时就跟它
+    # 共用一个耗材槽，否则自己占一个槽（排在图片调色板后面）。没挑就按老规矩 —— 用盖
+    # 住像素最多的那一卷。
+    base_slot = _own_base_slot(result, base_entry)
+    if base_slot is None:
+        picked = _printed_position(result, base_entry)
+        base_index = config.base_index if picked is None else picked
+        if base_index < 0 or base_index >= len(result.palette):
+            base_index = int(np.argmax(result.counts))
+        base_extruder = base_index + 1
+        base_colour = result.palette[base_index].color_hex
+    else:
+        base_index = -1
+        base_extruder = len(result.palette) + 1
+        base_colour = str(getattr(base_slot, "color_hex", "") or "#FFFFFF")
 
     z_colour_top = config.base_thickness_mm
     z_base_top = config.base_thickness_mm - config.colour_thickness_mm
@@ -1816,7 +1892,7 @@ def build_plate(
             faces,
             face_tags,
             name=base_label,
-            color_hex=result.palette[base_index].color_hex,
+            color_hex=base_colour,
             palette_index=base_index,
             extruder=base_extruder,
             region_pixels=int(np.count_nonzero(silhouette)),
@@ -1860,6 +1936,7 @@ def build_plate(
         colour_thickness_mm=config.colour_thickness_mm,
         notes=notes,
         source=result.source,
+        base_slot=base_slot,
     )
 
 

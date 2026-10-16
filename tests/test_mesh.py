@@ -11,6 +11,7 @@ Run with::
 
 from __future__ import annotations
 
+import dataclasses
 import sys
 import unittest
 from collections import Counter
@@ -426,6 +427,35 @@ class PlateTests(unittest.TestCase):
     def test_an_explicit_base_colour_is_honoured(self):
         plate = build_plate(self.result, PlateSettings(base_index=2))
         self.assertEqual(plate.parts[0].extruder, 3)
+
+    def test_a_base_colour_picked_from_outside_the_palette_gets_its_own_slot(self):
+        """m16941 第 2 条：底板颜色可以像「更换颜色」一样从整套混色里挑。
+
+        图上没有的颜色得自己占一个耗材槽（接在印刷色后面），并且交给 3MF 的清单
+        （:meth:`PlateModel.filament_entries`）要把它带上，否则切片器不知道那槽是什么。
+        """
+        chosen = dataclasses.replace(
+            self.result.palette[0], key="filament:test-base", color_hex="#123456"
+        )
+        plate = build_plate(self.result, PlateSettings(), base_entry=chosen)
+        self.assertEqual(plate.parts[0].color_hex, "#123456")
+        self.assertEqual(plate.parts[0].extruder, len(self.result.palette) + 1)
+        self.assertEqual(plate.parts[0].palette_index, -1)
+        self.assertIs(plate.base_slot, chosen)
+        entries = plate.filament_entries(self.result.palette)
+        self.assertEqual(len(entries), len(self.result.palette) + 1)
+        self.assertIs(entries[-1], chosen)
+        self.assertEqual(plate.extruder_count, len(self.result.palette) + 1)
+
+    def test_a_base_colour_that_is_already_printed_shares_its_slot(self):
+        """挑的正好是图上某一卷时，底板跟它共用一个槽（老行为不变）。"""
+        for index, entry in enumerate(self.result.palette):
+            with self.subTest(index=index):
+                plate = build_plate(self.result, PlateSettings(), base_entry=entry)
+                self.assertEqual(plate.parts[0].extruder, index + 1)
+                self.assertEqual(plate.parts[0].color_hex, entry.color_hex)
+                self.assertIsNone(plate.base_slot)
+                self.assertEqual(len(plate.filament_entries(self.result.palette)), len(self.result.palette))
 
     def test_geometry_scales_with_the_cell_size(self):
         # 一格多宽是唯一的尺度：板长宽 = 图片像素数 × 一格。

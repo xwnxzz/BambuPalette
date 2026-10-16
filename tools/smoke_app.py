@@ -1764,8 +1764,8 @@ def main() -> int:
     app.processEvents()
 
     # --- 导入 SVG 当原图（m13907 item 2）---------------------------------
-    # 矢量图没有分辨率，按「最大边长」渲染成位图再走后面的全流程；渲染器和屏幕上
-    # 是同一个 Qt 渲染器，所以颜色与透明度都不用自己解释。
+    # 矢量图没有分辨率，按它在文件里声明的那一档（这里是 60×30）渲染成位图，再走后面的
+    # 全流程；渲染器和屏幕上是同一个 Qt 渲染器，所以颜色与透明度都不用自己解释。
     vector_target = TEMP / "vector.svg"
     vector_target.write_text(
         '<svg xmlns="http://www.w3.org/2000/svg" width="60" height="30" viewBox="0 0 60 30">'
@@ -1775,37 +1775,44 @@ def main() -> int:
         "</svg>",
         encoding="utf-8",
     )
-    original_span = page._max_dimension.value()
-    page._max_dimension.setValue(120)
     page.loadImage(vector_target)
     app.processEvents()
     check(
-        page._image is not None and page._image.size == (120, 60),
-        f"导入 SVG 会按最大边长渲染成位图，got {None if page._image is None else page._image.size}",
+        page._image is not None and page._image.size == (60, 30),
+        f"导入 SVG 会按它在文件里声明的尺寸渲染成位图（m16941 第 1 条），"
+        f"got {None if page._image is None else page._image.size}",
     )
     check(
         page.result is not None and len(page.result.palette) >= 2,
         "SVG 渲染出来的图照样能匹配",
     )
-    page._max_dimension.setValue(original_span)
+    check(
+        page._image is not None and page._span == max(page._image.size),
+        f"导入之后匹配栅格取图片自己的像素数，got {page._span}",
+    )
     page.loadImage(sample)
     app.processEvents()
 
-    # --- 预览画的是匹配栅格：原图尺寸和缩小倍数要说清楚（m14567）---------------
-    # 用户按「预览的色块大小形状和原图不一样」来问，一半原因就在这一步：匹配前整张图
-    # 会缩到最长边「最大边长」像素。这里把「原图比边长大」和「原图比边长小」两档都跑
-    # 一遍，确认状态行、面板标题、控件的悬停提示三处都写了这件事。
-    #
-    # 1.6.42（m15721 第 2 条）之后这档只有先导入再调小才看得到：位图一进来，「最大边长」
-    # 就跟着图片自己的像素数走，默认那个 512 不再把图悄悄缩小。
+    # --- 删除「最大边长」：导入即按图片自身的像素数（m16941 第 1 条）-------------
+    # 界面上不再有这个数字框：位图一进来栅格就是它自己的最长边，状态行写「一格就是一个
+    # 原像素」。 缩小那一档只剩内部上限（4096）和老工程会碰到，这里直接把 _span 压小来
+    # 验证状态行仍然把「原图 → 匹配栅格（缩小几倍）」写出来。
+    check(
+        not hasattr(page, "_max_dimension"),
+        "界面上不再有「最大边长」这个数字框（m16941 第 1 条）",
+    )
     page.loadImage(sample)
     app.processEvents()
     check(
-        page._max_dimension.value() == max(page._image.size),
-        f"导入位图之后「最大边长」= 图片自己的像素数（m15721 第 2 条），"
-        f"got {page._max_dimension.value()} / {page._image.size}",
+        page._span == max(page._image.size),
+        f"导入位图之后匹配栅格 = 图片自己的像素数（m16941 第 1 条），"
+        f"got {page._span} / {page._image.size}",
     )
-    page._max_dimension.setValue(60)
+    check(
+        "一格就是一个原像素" in page._status.text(),
+        f"导入之后状态行写「一格就是一个原像素」，got {page._status.text()!r}",
+    )
+    page._span = 60
     page._on_rematch()
     app.processEvents()
     check(
@@ -1813,22 +1820,15 @@ def main() -> int:
         f"「原图」面板的标题带原图尺寸，got {page._original_panel.title_label.text()!r}",
     )
     check(
-        "原图 160×120" in page._max_dimension.toolTip()
-        and "盖住 2.7×2.7 个原像素" in page._max_dimension.toolTip(),
-        f"原图比最大边长大时，控件的悬停提示写清一格盖住几个原像素，"
-        f"got {page._max_dimension.toolTip()!r}",
-    )
-    check(
         "原图 160×120 → 匹配 60×45（缩小 2.7 倍）" in page._status.text(),
-        f"匹配完成的状态行写明原图 → 匹配栅格，got {page._status.text()!r}",
+        f"栅格被压小时状态行写明原图 → 匹配栅格，got {page._status.text()!r}",
     )
-    page._max_dimension.setValue(max(page._image.size))
+    page._span = max(page._image.size)
     page._on_rematch()
     app.processEvents()
     check(
-        "一格就是一个原像素" in page._status.text() and "不会缩小" in page._max_dimension.toolTip(),
-        f"原图比最大边长小时，状态行和提示都说不会缩小，"
-        f"got {page._status.text()!r} / {page._max_dimension.toolTip()!r}",
+        "一格就是一个原像素" in page._status.text(),
+        f"栅格回到一比一时状态行也说清楚，got {page._status.text()!r}",
     )
 
     result = page.result
@@ -2104,6 +2104,62 @@ def main() -> int:
                 f"底板厚度框的提示写清整块里含图上那 0.4 mm 颜色，"
                 f"got {page._base_spin.toolTip()!r}",
             )
+
+            # --- m16941 第 2 条：底板颜色跟「更换颜色」用同一个挑选框 -----------------
+            check(
+                not hasattr(page, "_base_combo") and hasattr(page, "_base_button"),
+                "底板颜色不再是只列图上几行的下拉框（m16941 第 2 条）",
+            )
+            check(
+                page._base_entry is None,
+                "没挑过底板颜色时是「自动」（跟着图上最大的一块走）",
+            )
+            _auto = page._shown_base_entry()
+            check(
+                _auto is not None
+                and plate.parts[0].color_hex == _auto.color_hex
+                and plate.base_slot is None,
+                f"自动时底板取图上最大一块的颜色、不另占槽，"
+                f"got {plate.parts[0].color_hex} / {_auto.color_hex if _auto else None}",
+            )
+            _printed = {str(entry.key) for entry in page._result.palette}
+            _extra = next(
+                (entry for entry in page._candidate_palette() if str(entry.key) not in _printed),
+                None,
+            )
+            if _extra is None:
+                check(False, "整套混色里找不到一个图外的颜色，没法验证底板另占一个槽")
+            else:
+                page._base_entry = _extra
+                _own = page.buildPlate()
+                _slot = _own.parts[0]
+                _entries = _own.filament_entries(page._result.palette)
+                check(
+                    _slot.color_hex == _extra.color_hex
+                    and _slot.extruder == len(page._result.palette) + 1,
+                    f"挑了图上没有的颜色时，底板自己占一个耗材槽（m16941 第 2 条），"
+                    f"got {_slot.color_hex} 槽 {_slot.extruder}",
+                )
+                check(
+                    _own.base_slot is _extra and _entries[-1] is _extra,
+                    "底板那一种被接在调色板后面交给 3MF（filament_entries）",
+                )
+                from app.mesh import threemf as _slots_mod
+
+                _slots = _slots_mod.slots_from_palette(_entries, page.library)
+                check(
+                    _slots[-1].color_hex == _extra.color_hex,
+                    f"3MF 的槽表里底板那一种带上了自己的颜色，got {_slots[-1].color_hex}",
+                )
+                page._base_entry = page._result.palette[0]
+                _shared = page.buildPlate()
+                check(
+                    _shared.base_slot is None and _shared.parts[0].extruder == 1,
+                    "挑的正好是图上某一卷时，底板跟它共用一个槽（老行为不变）",
+                )
+                page._base_entry = None
+                page.buildPlate()
+                app.processEvents()
 
             # --- 选中的颜色: both RGBs, the recipe, and manual replacement -------
             from app.core.image_matching import MatchSettings, sort_palette

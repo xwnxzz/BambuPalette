@@ -716,30 +716,31 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         not page._delete_button.isEnabled() and not page._replace_button.isEnabled(),
         "没有选中颜色时 删除 / 更换颜色 是灰的",
     )
-    # m14567: 预览画的是匹配栅格，原图比「最大边长」大时会被缩小——原图面板的标题、
-    # 控件的悬停提示、匹配完成的状态行三处都要把原图尺寸和倍数写出来。
+    # m16941 第 1 条：界面上不再有「最大边长」，导入时就按图片自己的像素数建栅格。
+    # m14567 的「原图 → 匹配栅格」那句话仍然要有：内部上限或老工程把栅格压小时，
+    # 状态行里得写着缩了多少。
     check(
         page._original_panel.title_label.text() == "原图 160×120",
         f"「原图」面板的标题带原图尺寸，got {page._original_panel.title_label.text()!r}",
     )
     check(
-        "一格就是一个原像素" in page._status.text() and "不会缩小" in page._max_dimension.toolTip(),
-        f"原图比最大边长小时，状态行与提示都说不会缩小，"
-        f"got {page._status.text()!r} / {page._max_dimension.toolTip()!r}",
+        not hasattr(page, "_max_dimension"),
+        "界面上不再有「最大边长」这个数字框（m16941 第 1 条）",
     )
-    _span = page._max_dimension.value()
-    page._max_dimension.setValue(60)
-    # 1.6.42（m15721 第 2 条）之后导入图片会把「最大边长」设成图片自己的像素数，所以
-    # 想缩小只能先导入、再调小，然后按那个按钮重算一遍（它从原图重新分色）。
+    check(
+        page._span == max(page._image.size) and "一格就是一个原像素" in page._status.text(),
+        f"导入后栅格 = 图片自己的像素数，状态行也这么说，"
+        f"got {page._span} / {page._image.size} / {page._status.text()!r}",
+    )
+    _span = page._span
+    page._span = 60
     page._on_rematch_blocks()
     app.processEvents()
     check(
-        "原图 160×120 → 匹配 60×45（缩小 2.7 倍）" in page._status.text()
-        and "盖住 2.7×2.7 个原像素" in page._max_dimension.toolTip(),
-        f"原图比最大边长大时，状态行与提示写清缩了多少，"
-        f"got {page._status.text()!r} / {page._max_dimension.toolTip()!r}",
+        "原图 160×120 → 匹配 60×45（缩小 2.7 倍）" in page._status.text(),
+        f"栅格被压小时，状态行写清缩了多少，got {page._status.text()!r}",
     )
-    page._max_dimension.setValue(_span)
+    page._span = _span
     page._on_rematch_blocks()
     app.processEvents()
 

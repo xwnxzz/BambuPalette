@@ -75,6 +75,7 @@ _SETTING_KEYS = ("max_colours", "max_dimension", "dither", "max_spools")
 _PLATE_KEYS = (
     "cell_mm",
     "base_thickness_mm",
+    "base_key",
     "smooth_edges",
     "image_on_bottom",
 )

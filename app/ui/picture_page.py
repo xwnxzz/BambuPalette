@@ -198,10 +198,19 @@ IMAGE_SIDE_TIP = (
     "两面都是同一块闭合实体，只是上下对调；尺寸、厚度、体积都不变。"
 )
 
+#: 底板颜色（m16941 第 2 条）。从前只能从「打印图片需要的颜色」那几行里挑，现在跟
+#: 「更换颜色」用同一个挑选框，整套混色都能搜。挑的那一种不在图上时，它会自己占一个
+#: 耗材槽写进 3MF（底板的混色配方才带得过去）。
+BASE_COLOUR_TIP = (
+    "底板用哪一种颜色。\n"
+    "· 点「更换…」从整套混色里挑（跟「更换颜色」是同一个框，可以按 ΔE00 排序、也能搜）；\n"
+    "· 挑的颜色不在「打印图片需要的颜色」里也行 —— 导出时它自己占一个耗材槽；\n"
+    "· 没挑就跟着图上占像素最多的那一块走。"
+)
+
 PAGE_HELP = (
     "图像转换这一步：\n"
-    f"· {ZOOM_HINT}\n"
-    f"· 颜色数量最多 {MAX_PAINTED_FILAMENTS} 是 Bambu Studio 自己的限制：一个工程里只认 "
+    f"· {ZOOM_HINT}\n"    f"· 颜色数量最多 {MAX_PAINTED_FILAMENTS} 是 Bambu Studio 自己的限制：一个工程里只认 "
     f"{MAX_PAINTED_FILAMENTS} 个耗材位，第 {MAX_PAINTED_FILAMENTS + 1} 种颜色在切片时会被"
     "丢掉（我们已经就这条限制向拓竹提了工单）。耗材上限 0 表示不限制。\n"
     "· 改到一半可以存成工程接着改：Ctrl+S 保存（第一次会问存哪儿），Ctrl+Shift+S 换一个文件名；"
@@ -255,15 +264,22 @@ PAGE_HELP = (
     "压到「颜色数量」那么多种颜色，每个像素归到最近的那一种——细到一两个像素的线（尾巴、描边）"
     "本来就会被两边抢走或者反过来抢两边，块的胖瘦就变了；「圆滑色块」勾着时预览画的又是细四倍"
     "的格子，边界从台阶变成圆滑曲线，小块面积还会再动几个百分点（实测大块 ±0.5% 以内、最小的"
-    "几块 −5%～−10%）。想看原始格子就取消这个勾；想让细线更准，把「颜色数量」调大，或者「导入 "
-    "SVG」按最大边长重画——矢量放大不会先糊一层。\n"
+    "几块 −5%～−10%）。想看原始格子就取消这个勾；想让细线更准，把「颜色数量」调大，或者导入 "
+    "SVG——矢量放大不会先糊一层。\n"
     "· 预览里的格子是**匹配栅格**，所以格子大小和原图不是一回事（m14567）：匹配前整张图会先缩到"
-    "最长边「最大边长」那么多像素（默认 512），原图 2048×2048 时一个色块格就盖住 4×4 个原像素，"
-    "台阶看着比原图的笔触粗、一两个原像素宽的细线也落不进格子。实测同一张图（SVG 按 1024 画）："
-    "最大边长 256（一格 4.0 像素）时有 7.87% 的格子跟原图归的色对不上，512（2.0 像素）降到 3.41%，"
-    "1024（1.0 像素）是 1.97%——剩下那 1.97% 才是「颜色数量」和抗锯齿坡合并那一层。想让形状更贴"
-    "原图，把「最大边长」往原图尺寸靠；「原图」面板的标题和「最大边长」的悬停提示都写着原图尺寸"
-    "和缩小了几倍。\n"
+    "最长边那么多像素，原图比它大时一个色块格就盖住好几个原像素，台阶看着比原图的笔触粗、"
+    "一两个原像素宽的细线也落不进格子。实测同一张图（SVG 按 1024 画）：栅格 256（一格 4.0 像素）"
+    "时有 7.87% 的格子跟原图归的色对不上，512（2.0 像素）降到 3.41%，1024（1.0 像素）是 1.97%"
+    "——剩下那 1.97% 才是「颜色数量」和抗锯齿坡合并那一层。"
+    "1.6.42 起导入时按图片自己的像素数定栅格，所以上面的数字只剩在「导入的图超过 4096 像素」"
+    "或「打开的是老工程」时才会出现；那种情况下状态行会写着原图尺寸、匹配栅格和缩小了几倍。\n"
+    "· 导入图片时按图片自己的像素数建匹配栅格（1.6.43 起不再有「最大边长」数字框）：一格 0.4 mm，"
+    "板的长宽就是像素数 × 0.4。 只有最长边超过 4096 像素的图会先缩到 4096（匹配会慢，状态行里写着"
+    "缩小了几倍），SVG 则按它在文件里声明的那一档渲。\n"
+    "· 「底板颜色」点「更换…」可以从**整套混色**里挑任意一种当底板（1.6.43 起，跟「更换颜色」用同"
+    "一个框，能按 ΔE00 排序、也能搜）：挑的正好是图上某一卷时，底板跟那一卷共用一个耗材槽；"
+    "不在图上时它自己占一个槽写进 3MF，那一片的混色配方才带得过去；不挑就跟着占像素最多的那一块"
+    "走。 这一项写进 .bpproj，Ctrl+Z 也撤得回来。\n"
     f"· 「{IMAGE_SIDE_LABEL}」选图片印在模型的哪一面（1.6.23 起）：{IMAGE_SIDE_BOTTOM}（默认）"
     f"是图片朝下贴着打印板、顶面一整片底板色，打出来顶面平整；{IMAGE_SIDE_TOP} 是图片朝上，"
     "也就是 1.6.22 及以前的样子。两面都是同一块闭合实体上下对调，尺寸、厚度、体积都不变；"
@@ -1590,6 +1606,10 @@ class PicturePage(QWidget):
         #: 分色时把旧划分留在这里，_:meth:`_build_blocks` 见到尺寸对得上就用它，块数和
         #: 编号都不变；导入新图、从头匹配、打开工程都会清掉它。
         self._block_template: np.ndarray | None = None
+        #: 匹配栅格的上限（m16941 第 1 条）。 以前界面上有个「最大边长」数字框，默认 512，
+        #: 用户得自己去调；现在没有这个框：导入图片时就取图片自己的最长边（SVG 取它在文件
+        #: 里声明的那一档），一格就是一个原像素。 打开工程仍按工程里存的那个数走。
+        self._span: int = 512
         #: 当前「点图片时」的方式。存在页面里（而不是只问 view），是因为历史、
         #: 列表和块表都要看它（m02439 的答复：切换方式本身算一步撤销）。
         self._mode: str = DEFAULT_PICK_MODE
@@ -1671,16 +1691,6 @@ class PicturePage(QWidget):
         # 「重新匹配」（那一次要 1.3–3.0 s，不适合挂在数字框上）。
         self._spool_cap.valueChanged.connect(self._on_spool_cap_changed)
 
-        self._max_dimension = QSpinBox()
-        self._max_dimension.setRange(32, 4096)
-        self._max_dimension.setSingleStep(64)
-        self._max_dimension.setValue(512)
-        self._max_dimension.setSuffix(" px")
-        # 匹配前整张图会缩到最长边这么多像素再分色块，所以预览里的格子有可能比原图粗
-        # （m14567）：提示里写清缩了多少、一格盖住几个原像素，「最大边长」才不是一个
-        # 孤零零的数字。
-        self._max_dimension.valueChanged.connect(self._sync_dimension_hint)
-
         self._dither = QCheckBox("抖动")
 
         top = QHBoxLayout()
@@ -1693,8 +1703,6 @@ class PicturePage(QWidget):
         top.addWidget(self._colour_count)
         top.addWidget(QLabel("耗材上限:"))
         top.addWidget(self._spool_cap)
-        top.addWidget(QLabel("最大边长:"))
-        top.addWidget(self._max_dimension)
         top.addWidget(self._dither)
         top.addWidget(self._rematch_blocks_button)
         top.addWidget(QLabel("点图片时:"))
@@ -1712,7 +1720,17 @@ class PicturePage(QWidget):
             "整块底板的厚度，含图上那一层颜色（0.4 mm）。 除以你的层高就是板有几层。"
         )
 
-        self._base_combo = QComboBox()
+        # 底板颜色 (m16941 第 2 条): 从前这里是一个只列「打印图片需要的颜色」那几行的
+        # 下拉框 —— 想拿别的混色当底板就没路可走。 现在跟「更换颜色」用同一个挑选框
+        # （整套混色都能搜），旁边留一个小色块显示当前挑的是哪一种；没挑就跟着图上最大
+        # 的一块走。
+        self._base_entry: PaletteEntry | None = None
+        self._base_swatch = QLabel()
+        self._base_swatch.setFixedSize(18, 18)
+        self._base_swatch.setToolTip(BASE_COLOUR_TIP)
+        self._base_button = QPushButton("更换…")
+        self._base_button.setToolTip(BASE_COLOUR_TIP)
+        self._base_button.clicked.connect(self._on_pick_base_colour)
 
         # 导出时圆滑色块 (1.6.22): 匹配栅格上的色块边界是一格一格的台阶，在 Bambu
         # Studio 里放大看就是锯齿。 默认勾上；不勾就照 1.6.21 的样子导出。
@@ -1741,7 +1759,8 @@ class PicturePage(QWidget):
         bottom.addWidget(QLabel("底板厚度:"))
         bottom.addWidget(self._base_spin)
         bottom.addWidget(QLabel("底板颜色:"))
-        bottom.addWidget(self._base_combo)
+        bottom.addWidget(self._base_swatch)
+        bottom.addWidget(self._base_button)
         bottom.addStretch(1)
         bottom.addWidget(QLabel(IMAGE_SIDE_LABEL + ":"))
         bottom.addWidget(self._side_combo)
@@ -2042,7 +2061,7 @@ class PicturePage(QWidget):
             self._filter_button,
             self._save_project_button,
             self._base_spin,
-            self._base_combo,
+            self._base_button,
             self._side_combo,
             self._smooth_box,
             self._export_3mf,
@@ -2113,23 +2132,19 @@ class PicturePage(QWidget):
             path = Path(source)
             self._image_name = path.stem or "混色底板"
             if path.suffix.lower() in SVG_SUFFIXES:
-                # 矢量图先渲染成位图（m13907 item 2）：按「最大边长」渲，细笔画才有像素；
-                # 之后整条流程（匹配、删除/合并、导出）跟位图导入完全一样。
-                image = _load_vector(path, int(self._max_dimension.value()))
+                # 矢量图先渲染成位图（m13907 item 2）：按它在文件里声明的那一档渲，细笔画
+                # 才有像素；之后整条流程（匹配、删除/合并、导出）跟位图导入完全一样。
+                # m16941 第 1 条去掉了「最大边长」输入框，这里就传 1：_load_vector 取
+                # 「SVG 自己声明的尺寸」与 target 里较大的那个，于是正好是它写的尺寸。
+                image = _load_vector(path, 1)
             else:
                 image = Image.open(source)
-                # 位图按它自己的像素导入（m15721 第 2 条）：从前这里固定缩到最长边 512，
-                # 于是 2363 px 的照片一进来就只剩 512，细笔画全糊进格子里。现在「最大
-                # 边长」跟着图走：一格 0.4 mm，图多大板就多大，缩不缩由用户自己调那个框。
-                longest = max(int(image.width), int(image.height))
-                self._max_dimension.setValue(
-                    max(
-                        self._max_dimension.minimum(),
-                        min(self._max_dimension.maximum(), longest),
-                    )
-                )
         else:
             image = source
+        # 位图按它自己的像素导入（m15721 第 2 条，m16941 第 1 条）：从前这里固定缩到最长边
+        # 512，于是 2363 px 的照片一进来就只剩 512，细笔画全糊进格子里；后来改成一个要用户
+        # 自己调的「最大边长」框，现在连框也没有了 —— 一格 0.4 mm，图多大板就多大。
+        self._span = max(int(image.width), int(image.height))
         self._image = image.convert("RGBA")
         # A freshly imported picture has not been edited yet (1.6.19).
         self._original_edited = False
@@ -2164,7 +2179,6 @@ class PicturePage(QWidget):
         if self._original_badge is not None:
             self._original_badge.setVisible(self._original_edited)
         self._sync_source_title()
-        self._sync_dimension_hint()
 
     def _picture_colour(self, mask: np.ndarray) -> tuple[int, int, int] | None:
         """The colour this patch of 「原图」 already has, or ``None`` if it has none.
@@ -2319,7 +2333,9 @@ class PicturePage(QWidget):
         # re-running it against whatever this window happened to be set to.
         settings = state.base.settings
         self._colour_count.setValue(int(settings.max_colours))
-        self._max_dimension.setValue(int(settings.max_dimension))
+        # 工程里记着当时用的栅格（m16941 第 1 条之后界面上没有这个输入框了），照它开，
+        # 存过的图才算一模一样地回来。
+        self._span = int(settings.max_dimension)
         self._dither.setChecked(bool(settings.dither))
         self._spool_cap.setValue(int(settings.max_spools))
         self._base_spin.setValue(float(state.plate.base_thickness_mm))
@@ -2369,8 +2385,9 @@ class PicturePage(QWidget):
         self._refresh_plans()
         self._stale = False
         self._apply_edits()
-        if 0 <= int(state.plate.base_index) < self._base_combo.count():
-            self._base_combo.setCurrentIndex(int(state.plate.base_index))
+        # 底板颜色（m16941 第 2 条）：工程里记的是那一种的 key，从整套混色里找回来；找不到
+        # （耗材库换过、混色配方没了）就退回跟着图上最大的一块走，而不是随便挑一个。
+        self._restore_base_entry(str(getattr(state.plate, "base_key", "") or ""))
         self._set_controls_enabled(True)
         edits = []
         if self._deleted:
@@ -2524,7 +2541,7 @@ class PicturePage(QWidget):
     def _settings(self) -> MatchSettings:
         return MatchSettings(
             max_colours=int(self._colour_count.value()),
-            max_dimension=int(self._max_dimension.value()),
+            max_dimension=int(self._span),
             dither=bool(self._dither.isChecked()),
             max_spools=int(self._spool_cap.value()),
         ).clamped()
@@ -3106,18 +3123,85 @@ class PicturePage(QWidget):
         box.exec()
         return box.clickedButton() is switch
 
-    def _refresh_base_combo(self) -> None:
+    def _auto_base_entry(self) -> PaletteEntry | None:
+        """没挑底板颜色时，跟着图上最大的一块走 —— 也就是老下拉框里的第一项。"""
         result = self._result
-        if result is None:
+        if result is None or not result.palette:
+            return None
+        index = int(np.argmax(result.counts)) if len(result.counts) else 0
+        if not 0 <= index < len(result.palette):
+            index = 0
+        return result.palette[index]
+
+    def _shown_base_entry(self) -> PaletteEntry | None:
+        """现在这块底板实际会用哪一种颜色：挑过就是挑的那一种，没挑就是自动那一种。"""
+        return self._base_entry if self._base_entry is not None else self._auto_base_entry()
+
+    def _refresh_base_view(self) -> None:
+        """把小色块和提示画成当前的底板颜色（m16941 第 2 条）。"""
+        entry = self._shown_base_entry()
+        colour = entry.color_hex if entry is not None else None
+        if colour:
+            self._base_swatch.setStyleSheet(
+                f"background:{colour}; border:1px solid #9aa2ad; border-radius:3px;"
+            )
+        else:
+            self._base_swatch.setStyleSheet(
+                "background:transparent; border:1px dashed #9aa2ad; border-radius:3px;"
+            )
+        self._base_button.setEnabled(self._result is not None and bool(self._candidate_palette()))
+        self._base_button.setText("更换…" if self._base_entry is not None else "更换…（自动）")
+        self._base_button.setToolTip(
+            BASE_COLOUR_TIP
+            if entry is None
+            else f"{BASE_COLOUR_TIP}\n现在用的是 {colour}（{entry.short_label}）。"
+        )
+
+    def _restore_base_entry(self, key: str) -> None:
+        """按 ``PaletteEntry.key`` 认回工程里存的那一种底板颜色（m16941 第 2 条）。"""
+        self._base_entry = None
+        if key:
+            for entry in self._candidate_palette():
+                if str(getattr(entry, "key", "") or "") == key:
+                    self._base_entry = entry
+                    break
+        self._refresh_base_view()
+
+    def _on_pick_base_colour(self) -> None:
+        """「底板颜色 → 更换…」：跟「更换颜色」用同一个挑选框，整套混色都能搜（m16941 第 2 条）。
+
+        从前这里是一个下拉框，选项只有「打印图片需要的颜色」那几行 —— 想拿别的一卷混色
+        当底板就没有路。 现在选中的是 ``PaletteEntry`` 本身（可能是图上没有的颜色），
+        :func:`app.mesh.plate.build_plate` 会把它当成一个额外的耗材槽写进 3MF。
+        """
+        if self._result is None or self._library is None:
             return
-        previous = self._base_combo.currentData()
-        self._base_combo.blockSignals(True)
-        self._base_combo.clear()
-        for index, entry in enumerate(result.palette):
-            self._base_combo.addItem(f"{entry.color_hex}  {entry.short_label}", index)
-        if isinstance(previous, int) and 0 <= previous < self._base_combo.count():
-            self._base_combo.setCurrentIndex(previous)
-        self._base_combo.blockSignals(False)
+        entries = self._candidate_palette()
+        if not entries:
+            self._status.setText("调色板是空的，请先添加耗材。")
+            return
+        current = self._shown_base_entry()
+        dialog = ColourPickerDialog(
+            entries,
+            current.color_hex if current is not None else "#FFFFFF",
+            library=self._library,
+            current_key=current.key if current is not None else "",
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        chosen = dialog.chosen()
+        if chosen is None:
+            return
+        self._push()
+        self._base_entry = chosen
+        self._plate = None
+        self._refresh_base_view()
+        self._dirty = True
+        self._status.setText(
+            f"底板颜色换成 {chosen.color_hex}（{chosen.short_label}）。导出时它自己占一个耗材槽；"
+            "Ctrl+Z 可以撤销。"
+        )
 
     # -- two-way selection ------------------------------------------------
     def _select(self, index: int) -> None:
@@ -3314,6 +3398,7 @@ class PicturePage(QWidget):
             self._image,
             self._original_edited,
             self._plans_stale,
+            self._base_entry,
         )
 
     def _restore(self, snapshot: tuple) -> None:
@@ -3329,6 +3414,7 @@ class PicturePage(QWidget):
             image,
             original_edited,
             plans_stale,
+            base_entry,
         ) = snapshot
         self._deleted = set(deleted)
         self._merged = dict(merged)
@@ -3342,6 +3428,10 @@ class PicturePage(QWidget):
         self._original_edited = bool(original_edited)
         # 撤销回到「改色块之前」，那一行也就重新变回准的了（m11180）。
         self._plans_stale = bool(plans_stale)
+        # 底板颜色也是一步能撤的编辑（m16941 第 2 条）。
+        self._base_entry = base_entry
+        self._plate = None
+        self._refresh_base_view()
         # 原图 has to catch up before ``_apply_edits`` hands the views a backdrop.
         self._refresh_source()
 
@@ -3501,7 +3591,7 @@ class PicturePage(QWidget):
             self._original_view.setResult(None, self._source_qimage)
             self._view.setBlockLabels(None)
             self._list.setResult(None)
-            self._refresh_base_combo()
+            self._refresh_base_view()
             self._detail.clear()
             self._update_actions()
             self._announce_edits()
@@ -3515,7 +3605,7 @@ class PicturePage(QWidget):
             blocks.sizes if blocks is not None else None,
         )
         self._list.setContent(result, blocks)
-        self._refresh_base_combo()
+        self._refresh_base_view()
         if blocks is not None:
             # 块模式：选中的是块编号，跟调色板下标没有关系，所以整条高亮都走块表。
             wanted = self._blocks_after(reselect)
@@ -3717,33 +3807,6 @@ class PicturePage(QWidget):
         title = "原图" if self._image is None else f"原图 {self._image.width}×{self._image.height}"
         if label.text() != title:
             label.setText(title)
-
-    def _sync_dimension_hint(self) -> None:
-        """「最大边长」的悬停提示：说清原图会不会被缩小、一格盖住几个原像素（m14567）。
-
-        用户按「预览的色块大小形状和原图不一样」来问，一半的原因就在这一步：匹配前整张图
-        会缩到最长边「最大边长」像素（默认 512），原图 2048×2048 时一个色块格就盖住 4×4
-        个原像素，一两个原像素宽的细线根本落不进格子。
-        """
-        spin = self._max_dimension
-        limit = int(spin.value())
-        if self._image is None:
-            spin.setToolTip(f"匹配前把整张图缩到最长边 {limit} 像素再分色块（m14567）。")
-            return
-        source_w, source_h = self._image.size
-        long_side = max(source_w, source_h)
-        if long_side <= limit:
-            spin.setToolTip(
-                f"原图 {source_w}×{source_h}：比这个数小，匹配前不会缩小，"
-                "一个色块格就是一个原像素。"
-            )
-            return
-        factor = long_side / limit
-        spin.setToolTip(
-            f"原图 {source_w}×{source_h}：匹配前会先缩到最长边 {limit} 像素，"
-            f"一个色块格盖住 {factor:.1f}×{factor:.1f} 个原像素，一两个原像素宽的细线会并进"
-            "相邻的块。想让预览更贴原图就把它调大（匹配会慢一些）。"
-        )
 
     def _grid_note(self) -> str:
         """「原图 2048×2048 → 匹配 512×512（缩小 4.0 倍）」这半句话（m14567）。
@@ -4217,13 +4280,24 @@ class PicturePage(QWidget):
         同一件事的两种说法；颜色层厚度则是 Bambu Studio 自己管的事（混色写在它的
         3MF 里），在这里填什么都不影响那边的结果。 现在只留底板厚度，而且是**整块**
         的厚度（含图上那一层 0.4 mm 的颜色）。
+
+        m16941 第 2 条：底板颜色不再是「打印图片需要的颜色」那几行里的一个下标，用户可以从
+        整套混色里挑任意一种 —— 挑的记成 ``base_key``（存进工程），那一种不在图片的调色板
+        里时还会另占一个耗材槽（见 :func:`app.mesh.plate.build_plate` 的 ``base_entry``）。
         """
-        base_index = self._base_combo.currentData()
+        base_index = -1
+        shown = self._shown_base_entry()
+        if shown is not None and self._result is not None:
+            for position, entry in enumerate(self._result.palette):
+                if str(getattr(entry, "key", "") or "") == str(getattr(shown, "key", "") or ""):
+                    base_index = position
+                    break
         return PlateSettings(
             cell_mm=CELL_MM,
             base_thickness_mm=float(self._base_spin.value()),
             colour_thickness_mm=COLOUR_BAND_MM,
-            base_index=int(base_index) if base_index is not None else -1,
+            base_index=base_index,
+            base_key="" if self._base_entry is None else str(self._base_entry.key),
             smooth_edges=bool(self._smooth_box.isChecked()),
             image_on_bottom=bool(self._side_combo.currentData()),
         ).clamped()
@@ -4244,6 +4318,7 @@ class PicturePage(QWidget):
             self._result,
             self._plate_settings(),
             base_label="底板",
+            base_entry=self._base_entry,
             progress=self._report_export,
         )
         return self._plate
@@ -4330,7 +4405,7 @@ class PicturePage(QWidget):
             # The filament list travels inside the project so Bambu Studio opens
             # it with *our* colours instead of whatever is in the AMS.
             filaments = (
-                slots_from_palette(self._result.palette, self._library)
+                slots_from_palette(plate.filament_entries(self._result.palette), self._library)
                 if self._result is not None
                 else None
             )
@@ -4378,7 +4453,7 @@ class PicturePage(QWidget):
         box.setWindowTitle("已生成模型")
         box.setIcon(QMessageBox.Icon.Information)
         filaments = (
-            slots_from_palette(self._result.palette, self._library)
+            slots_from_palette(plate.filament_entries(self._result.palette), self._library)
             if self._result is not None
             else None
         )
