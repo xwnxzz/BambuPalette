@@ -3252,25 +3252,29 @@ class PicturePage(QWidget):
         self._refresh_px_view()
 
     def _refresh_px_view(self) -> None:
-        """两个像素框显示现在这一份匹配用的尺寸（m18338 第 1 条）。
+        """两个像素框显示「按一次按钮会用多大的栅格」（m18338 第 1 条，m19050 第 2 条）。
 
-        有结果就写结果自己的宽 × 长（匹配栅格）；还没有结果就写原图的像素数，也就是
-        按一次「按当前px重新匹配」会用的数字。写的时候挂上 ``_px_lock``，免得
-        :meth:`_on_px_edited` 把「按比例改另一个框」又跑一遍。
+        写的是用户自己写下的要求（``self._span``；导入、开工程时它等于原图的长边），不是
+        这一份结果实际用的尺寸 —— 图比框小的时候引擎一个像素都不插（不放大），只有把用户
+        写的数留在框里，才能看见「你要的 512 其实按 240 跑的」这件事；原来的写法回写结果
+        自己的尺寸，等于把用户写的数悄没声地擦掉，用户以为是自己看错了（m19050 第 2 条）。
+        另一个框按原图比例跟：长边那个等于 ``_span``，短边那个按比例缩。
         """
-        size: tuple[int, int] | None = None
-        if self._result is not None and self._result.width and self._result.height:
-            size = (int(self._result.width), int(self._result.height))
-        elif self._image is not None:
-            size = (int(self._image.width), int(self._image.height))
+        span = max(1, int(self._span))
         self._px_lock = True
         try:
-            if size is None:
-                self._px_width_spin.setValue(int(self._span))
-                self._px_height_spin.setValue(int(self._span))
+            if self._image is None:
+                self._px_width_spin.setValue(span)
+                self._px_height_spin.setValue(span)
+                return
+            width = max(1, int(self._image.width))
+            height = max(1, int(self._image.height))
+            if width >= height:
+                self._px_width_spin.setValue(span)
+                self._px_height_spin.setValue(max(1, int(round(span * height / width))))
             else:
-                self._px_width_spin.setValue(size[0])
-                self._px_height_spin.setValue(size[1])
+                self._px_height_spin.setValue(span)
+                self._px_width_spin.setValue(max(1, int(round(span * width / height))))
         finally:
             self._px_lock = False
 
@@ -3981,18 +3985,32 @@ class PicturePage(QWidget):
 
         状态行原来只说「匹配完成：512×512 像素」——用户看到预览里的台阶，会以为那
         512 就是原图的分辨率。把原图尺寸和倍数一起写出来，误解就没有了。
+
+        1.6.47（m19050 第 2 条）：框里写的数比原图大时，明确说一句「不放大」——用户
+        写了 512 而图只有 240 px，引擎不会插出 512 格来（插值插不出细节，只会把板撑
+        大），栅格仍是 240，倍数也就没有「放大 N 倍」这一档。两个框会把用户写的数原
+        样留着（见 :meth:`_refresh_px_view`），所以这半句话要把两边的数都写出来，人
+        才知道刚才发生了什么。
         """
         if self._image is None:
             return ""
         source_w, source_h = self._image.size
         if self._result is None:
             return f"原图 {source_w}×{source_h}"
+        tail_note = ""
+        if int(self._span) > max(source_w, source_h):
+            tail_note = (
+                f"；框里写的 {int(self._span)} 比原图大，不放大"
+                "（插值只会把格子撑大，多不出细节）"
+            )
         grid_w, grid_h = self._result.width, self._result.height
         if (grid_w, grid_h) == (source_w, source_h):
-            return f"原图 {source_w}×{source_h}（一格就是一个原像素）"
+            return f"原图 {source_w}×{source_h}（一格就是一个原像素）{tail_note}"
         factor = max(source_w / max(1, grid_w), source_h / max(1, grid_h))
-        return f"原图 {source_w}×{source_h} → 匹配 {grid_w}×{grid_h}（缩小 {factor:.1f} 倍）"
-
+        return (
+            f"原图 {source_w}×{source_h} → 匹配 {grid_w}×{grid_h}"
+            f"（缩小 {factor:.1f} 倍）{tail_note}"
+        )
     def _sync_list_title(self) -> None:
         """Name the colour/block column after what it is currently listing.
 

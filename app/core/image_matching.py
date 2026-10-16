@@ -2116,6 +2116,9 @@ def _prepare(
     _report(progress, "读取图片", 0.05)
     image = load_image(source).convert("RGBA")
 
+    # ``max_dimension`` 是上限，不是放大倍数（m19050 第 2 条的取舍）：图比它小的时候
+    # 一个像素都不插，栅格就是原图的像素数 —— 插值插不出细节，只会让板变大、让人以为
+    # 那张 240 px 的图真有 512 px 的信息。用户写的数由界面原样留着并说明白这件事。
     if max(image.size) > config.max_dimension:
         _report(progress, "缩放图片", 0.15)
         scale = config.max_dimension / float(max(image.size))

@@ -2230,11 +2230,11 @@ def main() -> int:
                 "底行多了「宽/长」两个像素框和「按当前px重新匹配」（m18338 第 1 条）",
             )
             check(
-                page._px_width_spin.value() == int(page._result.width)
-                and page._px_height_spin.value() == int(page._result.height),
-                f"两个框显示现在这一份匹配的像素数，got "
-                f"{page._px_width_spin.value()}×{page._px_height_spin.value()} / "
-                f"{page._result.width}×{page._result.height}",
+                max(page._px_width_spin.value(), page._px_height_spin.value()) == int(page._span)
+                and int(page._span) == max(int(page._image.width), int(page._image.height)),
+                f"两个框写的是「按下去会用多大的栅格」（导入后就是原图的像素数），got "
+                f"{page._px_width_spin.value()}×{page._px_height_spin.value()} / span {page._span} / "
+                f"{page._image.size}",
             )
             check(
                 page._rematch_px_button.text() == "按当前px重新匹配"
@@ -2261,11 +2261,12 @@ def main() -> int:
                 f"{page._result.width}×{page._result.height}（原来 {_grid_before}）",
             )
             check(
-                page._px_width_spin.value() == int(page._result.width)
-                and page._px_height_spin.value() == int(page._result.height)
+                page._px_width_spin.value() == 80
+                and page._px_height_spin.value() == _expect_height
+                and int(page._span) == max(80, _expect_height)
                 and "匹配完成" in page._status.text(),
-                f"重匹配完两个框跟着新结果走、状态行说了这件事，got "
-                f"{page._px_width_spin.value()}×{page._px_height_spin.value()} / "
+                f"重匹配用框里写的数、框里还是我写的数、状态行说了这件事，got "
+                f"{page._px_width_spin.value()}×{page._px_height_spin.value()} / span {page._span} / "
                 f"{page._status.text()[:40]}",
             )
             # 撤销一步回到按下之前（像素数、那一份匹配、还有「耗材方案」那几行）。
@@ -2282,6 +2283,22 @@ def main() -> int:
                 f"Ctrl+Z 把「耗材方案」那几行也一起带回来，got {len(page._plans)} 行 / "
                 f"原来 {len(_plans_before)} 行",
             )
+            # m19050 第 2 条：框里写的数比原图大 ⇒ 不放大，但框里留着我写的数，状态行说明。
+            _big = max(_picture_size) * 2
+            page._px_width_spin.setValue(_big)
+            app.processEvents()
+            page._on_rematch_px()
+            app.processEvents()
+            check(
+                page._px_width_spin.value() == _big
+                and (int(page._result.width), int(page._result.height)) == _picture_size
+                and "不放大" in page._status.text(),
+                f"写的数比原图大：按原图像素数匹配、框里留着我写的数、状态行说不放大，got "
+                f"{page._px_width_spin.value()} / {page._result.width}×{page._result.height} / "
+                f"{page._status.text()[:80]}",
+            )
+            page._undo()
+            app.processEvents()
             page._redo_stack.clear()
 
             # --- m18338 第 2 条：耗材方案多给几行（含「少用一个卷」「少用两个卷」）----

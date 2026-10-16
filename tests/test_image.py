@@ -590,8 +590,26 @@ class IndistinguishableColourTests(unittest.TestCase):
         self.assertEqual(MatchSettings(max_dimension=8).clamped().max_dimension, 32)
         self.assertEqual(MatchSettings(max_dimension=-4).clamped().max_dimension, 32)
 
-    def test_the_merge_does_not_chain_a_ramp_into_one_colour(self):
-        # Six greys 1.1–1.2 ΔE00 apart, 5.7 end to end: every neighbouring pair
+    def test_a_grid_larger_than_the_picture_never_upscales_the_picture(self):
+        # m19050 第 2 条的取舍：底行的框里写多大就多大——**往下**。图比框小的时候不放大
+        # （40×40 的图写 120 ⇒ 栅格还是 40×40），因为插值插不出细节，只会把板撑大而让人
+        # 以为那张小图真有 120 px 的信息。界面把用户写的数留在框里并写明「不放大」。
+        settings = MatchSettings(max_colours=4, max_dimension=120)
+        result = match_image(_quadrant_image(), self.palette, settings)
+
+        self.assertEqual((result.width, result.height), (40, 40))
+        self.assertEqual(result.settings.max_dimension, 120)
+        self.assertEqual(len(result.palette), 4)
+
+    def test_the_grid_still_shrinks_a_bigger_picture(self):
+        # 反方向照旧：图比框大就缩到框（40×40 的图写 32 ⇒ 栅格 32×32）。再往下是
+        # MatchSettings 的 32 下限在管（见 test_the_grid_has_a_floor_but_no_ceiling）。
+        settings = MatchSettings(max_colours=4, max_dimension=32)
+        result = match_image(_quadrant_image(), self.palette, settings)
+
+        self.assertEqual((result.width, result.height), (32, 32))
+
+    def test_the_merge_does_not_chain_a_ramp_into_one_colour(self):        # Six greys 1.1–1.2 ΔE00 apart, 5.7 end to end: every neighbouring pair
         # is inside the 2.0 threshold, so a union-find would collapse the whole
         # ramp into one colour — measured, and it is why the merge compares
         # against the leaders only.  Three representatives survive.
