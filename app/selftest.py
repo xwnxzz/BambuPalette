@@ -1539,6 +1539,86 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         )
         picker.close()
 
+        # m16941 第 2 条 / m17910 第 1 条：底板颜色走同一个挑选框，而且按下去真的要能建出来。
+        # 早先这里把 `color_hex` 当 RGB 传下去，框在 `int('#')` 上抛 ValueError，界面上就是
+        # 「更换…」点不动 —— 所以这里既查参数类型，也真的把框建一个出来。
+        check(
+            not hasattr(page, "_base_combo") and hasattr(page, "_base_button"),
+            "底板颜色不再是只列图上几行的下拉框（m16941 第 2 条）",
+        )
+        check(page._base_entry is None, "没挑过底板颜色时是「自动」")
+        base_menu = build_palette(page.library, page._catalog, include_mixes=True)
+        base_rgb = page._base_pick_rgb()
+        check(
+            len(base_rgb) == 3 and all(isinstance(value, int) for value in base_rgb),
+            f"挑选框要的「现在这一种」是 RGB 三元组（m17910 第 1 条），got {base_rgb!r}",
+        )
+        base_picker = ColourPickerDialog(
+            base_menu,
+            base_rgb,
+            library=page.library,
+            current_key=page._shown_base_entry().key,
+            title="更换底板颜色",
+            target_label="现在的底板颜色",
+        )
+        check(
+            tuple(base_picker._target_rgb) == tuple(base_rgb)
+            and base_picker.windowTitle() == "更换底板颜色",
+            f"底板颜色的框收得下三元组、标题也写对了，got {base_picker._target_rgb} / "
+            f"{base_picker.windowTitle()}",
+        )
+        base_picker.close()
+
+        real_base_picker = _pp.ColourPickerDialog
+        seen_base: list[tuple] = []
+
+        class _RecordingBasePicker:  # noqa: N801
+            def __init__(self, entries, target_rgb, **kwargs):
+                seen_base.append((tuple(target_rgb), kwargs.get("title")))
+                self._entries = list(entries)
+
+            def exec(self):
+                return _pp.QDialog.DialogCode.Accepted
+
+            def chosen(self):
+                printed = {str(entry.key) for entry in page.result.palette}
+                return next(
+                    (entry for entry in self._entries if str(entry.key) not in printed),
+                    self._entries[0],
+                )
+
+        _pp.ColourPickerDialog = _RecordingBasePicker
+        try:
+            page._base_button.click()
+        finally:
+            _pp.ColourPickerDialog = real_base_picker
+        app.processEvents()
+        check(
+            len(seen_base) == 1
+            and len(seen_base[0][0]) == 3
+            and all(isinstance(value, int) for value in seen_base[0][0])
+            and seen_base[0][1] == "更换底板颜色",
+            f"「底板颜色 → 更换…」按一下就把框建出来了（m17910 第 1 条），got {seen_base}",
+        )
+        check(
+            page._base_entry is not None and "底板颜色换成" in page._status.text(),
+            f"挑完底板颜色记在 _base_entry 上并写了状态行，got {page._base_entry}",
+        )
+        page._base_entry = None
+        page._plate = None
+        page._refresh_base_view()
+        app.processEvents()
+
+        # m17910 第 2 条：栅格与 SVG 渲染都不再有上限。
+        check(
+            MatchSettings(max_dimension=9999).clamped().max_dimension == 9999,
+            f"匹配栅格不封顶，got {MatchSettings(max_dimension=9999).clamped().max_dimension}",
+        )
+        check(
+            not hasattr(_pp, "SVG_RENDER_LIMIT"),
+            "SVG 渲染也不封 4096（m17910 第 2 条）",
+        )
+
         replacement = next(entry for entry in ordered if entry.key != auto.key)
         # Exactly what _on_replace does: snapshot FIRST, then record the change,
         # which is why 撤销 covers a manual replacement with no extra button.

@@ -582,6 +582,14 @@ class IndistinguishableColourTests(unittest.TestCase):
         self.assertEqual(MatchSettings(merge_delta_e=99.0).clamped().merge_delta_e, 10.0)
         self.assertEqual(MatchSettings(merge_delta_e=1.5).clamped().merge_delta_e, 1.5)
 
+    def test_the_grid_has_a_floor_but_no_ceiling(self):
+        # m17910 第 2 条：栅格不封顶。 下限还在（0 或负数没法匹配），但像 9999 这种
+        # 以前会被 1.6.43 的 4096 削掉的值现在要原样留着。
+        self.assertEqual(MatchSettings(max_dimension=9999).clamped().max_dimension, 9999)
+        self.assertEqual(MatchSettings(max_dimension=200_000).clamped().max_dimension, 200_000)
+        self.assertEqual(MatchSettings(max_dimension=8).clamped().max_dimension, 32)
+        self.assertEqual(MatchSettings(max_dimension=-4).clamped().max_dimension, 32)
+
     def test_the_merge_does_not_chain_a_ramp_into_one_colour(self):
         # Six greys 1.1–1.2 ΔE00 apart, 5.7 end to end: every neighbouring pair
         # is inside the 2.0 threshold, so a union-find would collapse the whole

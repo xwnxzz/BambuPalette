@@ -329,16 +329,18 @@ class ColourPickerDialog(QDialog):
         library=None,
         current_key: str | None = None,
         parent: QWidget | None = None,
+        title: str = "更换颜色",
+        target_label: str = "要替换的图片颜色",
     ) -> None:
         super().__init__(parent)
         self._entries = list(entries)
         self._target_rgb = tuple(int(v) for v in target_rgb)
         self._library = library
         self._chosen: PaletteEntry | None = None
-        self.setWindowTitle("更换颜色")
+        self.setWindowTitle(title)
         self.resize(560, 620)
 
-        self._target = _SwatchCard("要替换的图片颜色")
+        self._target = _SwatchCard(target_label)
         self._target.setColour(
             hex_of(self._target_rgb),
             f"RGB {self._target_rgb[0]}, {self._target_rgb[1]}, {self._target_rgb[2]}",

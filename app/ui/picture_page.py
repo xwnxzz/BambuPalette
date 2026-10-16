@@ -131,9 +131,8 @@ PNG_FILTER = "PNG 图片 (*.png);;所有文件 (*)"
 
 #: 矢量图（SVG）也能当原图 (m13907 item 2)。位图导入是「有什么像素就用什么像素」，
 #: 而 SVG 是无限清晰的：渲染得比它自己声明的大，细笔画（猪尾巴那种一两像素的卷）才有
-#: 像素可认。SVG_RENDER_LIMIT 是防止拿一个图标渲染出 4000×4000 的位图把内存吃掉。
+#: 像素可认。1.6.44 起渲染不再设上限 —— 拿来一个图标渲染成多大，由它自己的尺寸和栅格决定（m17910 第 2 条）。
 SVG_SUFFIXES = frozenset({".svg"})
-SVG_RENDER_LIMIT = 4096
 
 #: Wheel zoom runs between 「整张铺满面板」 (1.0) and this many times the fit.
 ZOOM_MIN = 1.0
@@ -271,11 +270,11 @@ PAGE_HELP = (
     "一两个原像素宽的细线也落不进格子。实测同一张图（SVG 按 1024 画）：栅格 256（一格 4.0 像素）"
     "时有 7.87% 的格子跟原图归的色对不上，512（2.0 像素）降到 3.41%，1024（1.0 像素）是 1.97%"
     "——剩下那 1.97% 才是「颜色数量」和抗锯齿坡合并那一层。"
-    "1.6.42 起导入时按图片自己的像素数定栅格，所以上面的数字只剩在「导入的图超过 4096 像素」"
-    "或「打开的是老工程」时才会出现；那种情况下状态行会写着原图尺寸、匹配栅格和缩小了几倍。\n"
-    "· 导入图片时按图片自己的像素数建匹配栅格（1.6.43 起不再有「最大边长」数字框）：一格 0.4 mm，"
-    "板的长宽就是像素数 × 0.4。 只有最长边超过 4096 像素的图会先缩到 4096（匹配会慢，状态行里写着"
-    "缩小了几倍），SVG 则按它在文件里声明的那一档渲。\n"
+    "1.6.42 起导入时按图片自己的像素数定栅格，所以上面的数字只剩在「打开的是老工程」时才会出现；"
+    "那种情况下状态行会写着原图尺寸、匹配栅格和缩小了几倍。\n"
+    "· 导入图片时按图片自己的像素数建匹配栅格（1.6.43 起不再有「最大边长」数字框，1.6.44 起连上限"
+    "也没有）：一格 0.4 mm，板的长宽就是像素数 × 0.4。 图片多少像素就按多少像素分（没有上限），"
+    "SVG 也按它在文件里声明的那一档渲。 图越大匹配越慢，那是像素数本身的事。\n"
     "· 「底板颜色」点「更换…」可以从**整套混色**里挑任意一种当底板（1.6.43 起，跟「更换颜色」用同"
     "一个框，能按 ΔE00 排序、也能搜）：挑的正好是图上某一卷时，底板跟那一卷共用一个耗材槽；"
     "不在图上时它自己占一个槽写进 3MF，那一片的混色配方才带得过去；不挑就跟着占像素最多的那一块"
@@ -488,8 +487,9 @@ def _load_vector(path: Path, target: int) -> Image.Image:
     """SVG → 位图（m13907 item 2）。
 
     用 Qt 自己的 QSvgRenderer：跟屏幕上画的是同一个渲染器，颜色和透明度不用自己解释，
-    也不多一个依赖。渲染边长取「SVG 自己声明的尺寸」与调用方要的 ``target`` 里较大的那个
-    （上限 SVG_RENDER_LIMIT）：矢量图放大不掉细节，渲得大一点，细笔画才落在像素上。
+    也不多一个依赖。渲染边长取「SVG 自己声明的尺寸」与调用方要的 ``target`` 里较大的那个：
+    矢量图放大不掉细节，渲得大一点，细笔画才落在像素上。 1.6.44 起不再设上限 —— 渲多大由
+    图片自己的尺寸与调用方要的栅格决定。
     """
     if QSvgRenderer is None:  # pragma: no cover - 只有打包漏收 QtSvg 才会走到这里
         raise ValueError("这个版本没带上 SVG 支持（缺 QtSvg），请先导出成 PNG 再导入。")
@@ -499,8 +499,8 @@ def _load_vector(path: Path, target: int) -> Image.Image:
     declared = renderer.defaultSize()
     span = max(1, declared.width(), declared.height())
     scale = max(1.0, float(target) / span)
-    width = max(1, min(SVG_RENDER_LIMIT, round(max(1, declared.width()) * scale)))
-    height = max(1, min(SVG_RENDER_LIMIT, round(max(1, declared.height()) * scale)))
+    width = max(1, round(max(1, declared.width()) * scale))
+    height = max(1, round(max(1, declared.height()) * scale))
     canvas = QImage(width, height, QImage.Format.Format_RGBA8888)
     canvas.fill(0)
     painter = QPainter(canvas)
@@ -3137,6 +3137,18 @@ class PicturePage(QWidget):
         """现在这块底板实际会用哪一种颜色：挑过就是挑的那一种，没挑就是自动那一种。"""
         return self._base_entry if self._base_entry is not None else self._auto_base_entry()
 
+    def _base_pick_rgb(self) -> tuple[int, int, int]:
+        """挑选框要的「现在这一种」——RGB 三元组，不是 ``"#RRGGBB"``。
+
+        m17910 第 1 条咬过一次：之前这里把 ``color_hex`` 直接塞进
+        :class:`ColourPickerDialog`，它在 ``int('#')`` 上抛 ``ValueError``，框还没建出来就
+        死了，界面上看起来就是「更换…」按钮点不动。
+        """
+        current = self._shown_base_entry()
+        if current is None:
+            return (255, 255, 255)
+        return tuple(int(value) for value in current.rgb)
+
     def _refresh_base_view(self) -> None:
         """把小色块和提示画成当前的底板颜色（m16941 第 2 条）。"""
         entry = self._shown_base_entry()
@@ -3183,10 +3195,14 @@ class PicturePage(QWidget):
         current = self._shown_base_entry()
         dialog = ColourPickerDialog(
             entries,
-            current.color_hex if current is not None else "#FFFFFF",
+            # 这个框要的是 RGB 三元组，不是 "#RRGGBB"（m17910 第 1 条：传 hex 会在 int('#')
+            # 上抛异常，框建不出来，表现就是「点不动」）。
+            self._base_pick_rgb(),
             library=self._library,
             current_key=current.key if current is not None else "",
             parent=self,
+            title="更换底板颜色",
+            target_label="现在的底板颜色",
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return

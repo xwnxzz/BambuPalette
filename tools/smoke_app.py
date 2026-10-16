@@ -1795,8 +1795,8 @@ def main() -> int:
 
     # --- 删除「最大边长」：导入即按图片自身的像素数（m16941 第 1 条）-------------
     # 界面上不再有这个数字框：位图一进来栅格就是它自己的最长边，状态行写「一格就是一个
-    # 原像素」。 缩小那一档只剩内部上限（4096）和老工程会碰到，这里直接把 _span 压小来
-    # 验证状态行仍然把「原图 → 匹配栅格（缩小几倍）」写出来。
+    # 原像素」。 也没有任何上限（m17910 第 2 条），缩小那一档只剩「打开的是老工程会碰到」，
+    # 这里直接把 _span 压小来验证状态行仍然把「原图 → 匹配栅格（缩小几倍）」写出来。
     check(
         not hasattr(page, "_max_dimension"),
         "界面上不再有「最大边长」这个数字框（m16941 第 1 条）",
@@ -2160,6 +2160,71 @@ def main() -> int:
                 page._base_entry = None
                 page.buildPlate()
                 app.processEvents()
+
+            # m17910 第 1 条：按下去要真的把这个挑选框建出来。早先这里把 hex 字符串当 RGB
+            # 传下去，框在 int('#') 上抛异常，界面上看起来就是「按钮点不动」。
+            from app.ui import picture_page as _picker_mod
+
+            _real_base_picker = _picker_mod.ColourPickerDialog
+            _base_calls: list[tuple] = []
+
+            class _RecordingBasePicker:
+                def __init__(self, entries, target_rgb, **kwargs):
+                    _base_calls.append(
+                        (tuple(target_rgb), kwargs.get("title"), kwargs.get("target_label"))
+                    )
+                    self._entries = list(entries)
+
+                def exec(self):
+                    return _picker_mod.QDialog.DialogCode.Accepted
+
+                def chosen(self):
+                    printed = {str(e.key) for e in page._result.palette}
+                    return next(
+                        (e for e in self._entries if str(e.key) not in printed),
+                        self._entries[0],
+                    )
+
+            _picker_mod.ColourPickerDialog = _RecordingBasePicker
+            try:
+                page._base_button.click()
+            finally:
+                _picker_mod.ColourPickerDialog = _real_base_picker
+            app.processEvents()
+            check(
+                len(_base_calls) == 1
+                and len(_base_calls[0][0]) == 3
+                and all(isinstance(v, int) for v in _base_calls[0][0]),
+                f"「底板颜色 → 更换…」按一下真的把框建出来了，而且传的是 RGB 三元组"
+                f"（m17910 第 1 条），got {_base_calls}",
+            )
+            check(
+                _base_calls and _base_calls[0][1] == "更换底板颜色"
+                and _base_calls[0][2] == "现在的底板颜色",
+                f"底板颜色的框标题与「现在这一种」的说明写清楚了，got {_base_calls}",
+            )
+            check(
+                page._base_entry is not None
+                and page._base_entry.color_hex != plate.parts[0].color_hex
+                and "底板颜色换成" in page._status.text(),
+                f"挑完底板颜色就记下来并写了状态行，got {page._base_entry} / {page._status.text()[:40]}",
+            )
+            page._base_entry = None
+            page._plate = None
+            page._refresh_base_view()
+            app.processEvents()
+
+            # m17910 第 2 条：栅格不再有上限（1.6.43 里的 4096 也删了）。
+            from app.core.image_matching import MatchSettings as _GridSettings
+
+            check(
+                _GridSettings(max_dimension=9999).clamped().max_dimension == 9999,
+                f"栅格不封顶，got {_GridSettings(max_dimension=9999).clamped().max_dimension}",
+            )
+            check(
+                not hasattr(_picker_mod, "SVG_RENDER_LIMIT"),
+                "SVG 渲染也不再封 4096（m17910 第 2 条）",
+            )
 
             # --- 选中的颜色: both RGBs, the recipe, and manual replacement -------
             from app.core.image_matching import MatchSettings, sort_palette

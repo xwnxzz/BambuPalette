@@ -304,7 +304,7 @@ class MatchSettings:
         return replace(
             self,
             max_colours=max(2, min(MAX_PAINTED_FILAMENTS, int(self.max_colours))),
-            max_dimension=max(32, min(4096, int(self.max_dimension))),
+            max_dimension=max(32, int(self.max_dimension)),
             alpha_threshold=max(0, min(255, int(self.alpha_threshold))),
             merge_delta_e=max(0.0, min(10.0, float(self.merge_delta_e))),
             smooth_radius=max(0, min(8, int(self.smooth_radius))),
