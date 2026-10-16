@@ -643,7 +643,7 @@ class MainWindow(QMainWindow):
             self.library.save(paths.library_path())
         except (LibraryError, OSError) as exc:
             # OSError covers DataDirectoryError: no usable location at all.
-            self._status.setText(f"保存失败：{exc}")
+            self._set_status_text(f"保存失败：{exc}")
 
     def _on_clear_library(self) -> None:
         """Throw the whole archive away — the only honest way to start empty.
@@ -683,7 +683,7 @@ class MainWindow(QMainWindow):
         removed = len(self.library)
         self.library.clear()
         self._reload_library()
-        self._status.setText(
+        self._set_status_text(
             f"已清空耗材库（{removed} 条）。接下来点「添加耗材」新建，或「导入」一份档案。"
         )
 
@@ -725,7 +725,7 @@ class MainWindow(QMainWindow):
             self.library.add(filament)
             self._reload_library()
             self._select_filament(filament.id)
-            self._status.setText(f"已添加 {filament.display_name}（{filament.color_hex}）")
+            self._set_status_text(f"已添加 {filament.display_name}（{filament.color_hex}）")
             if not dialog.wants_another():
                 return
 
@@ -761,7 +761,7 @@ class MainWindow(QMainWindow):
         if self._pair_filter and filament.id in self._pair_filter:
             self._pair_filter = None
         self._detail.clear()
-        self._status.setText(f"已删除 {filament.display_name}（{filament.color_hex}）")
+        self._set_status_text(f"已删除 {filament.display_name}（{filament.color_hex}）")
         self._reload_library()
 
     def _select_filament(self, filament_id: str) -> None:
@@ -822,7 +822,7 @@ class MainWindow(QMainWindow):
         self._reload_library()
         self._select_filament(filament.id)
         if hidden:
-            self._status.setText(
+            self._set_status_text(
                 f"已隐藏 {filament.display_name}（{filament.color_hex}）："
                 "它不再参与混色，颜色也不在「全部颜色」里。右键可以放回来。"
             )
@@ -1283,8 +1283,14 @@ class MainWindow(QMainWindow):
         forcing the window wider or being clipped.  It used to be duplicated into
         a hover pop-up as well; the pop-up is gone, so the wrapped label is the
         whole channel and the sentences here stay short enough to read in it.
+
+        An empty line hides the label instead of holding an empty row open
+        (m14748 第 3 条): the 「图像转换」页自己带一行状态，切过来时这条就是空的，
+        那行高度全变成窗口底部的白边。藏起来之后省下的高度归上面的分栏 —— 图片
+        和色块表都能多占一点。
         """
         self._status.setText(text)
+        self._status.setVisible(bool(text.strip()))
 
     def _update_status(self) -> None:
         count = len(self.library.visible)

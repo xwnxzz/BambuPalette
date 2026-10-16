@@ -3512,10 +3512,18 @@ class PicturePage(QWidget):
         an anti-aliased edge is hundreds of single-pixel specks, and a list with
         one row per speck is unreadable and unclickable (measured on the reported
         pig: 953 blocks, 773 of them a single pixel).
+
+        ``keep_colours`` 补上「去噪之后一个位子都不剩、可是颜色表里还写着」的颜色
+        （m14748 第 2 条：那张工程里红色 474 px 全是 136 px 以下的碎片，色块表里
+        一块红色都没有，而颜色表照样列着它）。
         """
         if result is None or self._mode != PICK_EDGE:
             return None
-        return label_blocks(result.indices, min_pixels=min_block_pixels(result.printed_pixels))
+        return label_blocks(
+            result.indices,
+            min_pixels=min_block_pixels(result.printed_pixels),
+            keep_colours=True,
+        )
 
     def _blocks_after(
         self, masks: Sequence[np.ndarray] | np.ndarray | None

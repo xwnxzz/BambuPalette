@@ -1792,6 +1792,35 @@ def run_selftest(*, report_path: Path | None = None) -> int:
             "点图片选中的是一整块：预览高亮这块的全部像素，不再按「一种颜色」高亮",
         )
 
+        # m14748 第 2 条：颜色表列出来的颜色，色块表里也要有一个位子；而且去噪
+        # 只许并掉位置，不许把小碎片的颜色盖到大色区上（以前并查集取「编号小的
+        # 根」的颜色，碎片排在光栅序前面就会把整块大色区改色）。
+        from .core.blocks import min_block_pixels as _min_block_pixels  # noqa: PLC0415
+
+        threshold = _min_block_pixels(page.result.printed_pixels)
+        printed_values = {
+            int(value) for value in np.unique(page.result.indices).tolist() if int(value) >= 0
+        }
+        check(
+            printed_values <= {int(value) for value in blocks.values.tolist()},
+            "色块表覆盖颜色表列出的每一种颜色（m14748 第 2 条）："
+            f"印了 {sorted(printed_values)}，色块表只有 {sorted({int(v) for v in blocks.values.tolist()})}",
+        )
+        repainted: list[str] = []
+        for label in blocks.order():
+            mine = blocks.mask(label)
+            if not mine.any():
+                continue
+            inside, counts = np.unique(page.result.indices[mine].tolist(), return_counts=True)
+            own = blocks.value(label)
+            for value, count in zip(inside.tolist(), counts.tolist()):
+                if int(value) != own and int(count) >= threshold:
+                    repainted.append(f"{count} px #{int(value)} → #{own}")
+        check(
+            not repainted,
+            "去噪没有把小碎片的颜色盖到大色区上（m14748 第 2 条）：" + "、".join(repainted[:3]),
+        )
+
         # 删除：只让选中的那几块留空，别的块照打。
         block_pixels = page.result.printed_pixels
         steps = len(page._undo_stack)

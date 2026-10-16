@@ -681,11 +681,25 @@ def main() -> int:
         triple_window._status.text() == "",
         f"the colour-table sentence is hidden on 图像转换, got {triple_window._status.text()[:40]!r}",
     )
+    # An empty bottom line must not keep a row of height open either (m14748 第 3 条):
+    # 空着的那一行高度以前全变成窗口底部的白边，收起来之后省下的高度归上面的分栏。
+    check(
+        not triple_window._status.isVisibleTo(triple_window),
+        "an empty bottom line hides itself instead of holding an empty row open",
+    )
+    check(
+        triple_window._status.sizeHint().height() > 0,
+        "hiding it is a visibility decision, not a zero-height trick",
+    )
     triple_window._tabs.setCurrentIndex(0)
     app.processEvents()
     check(
         triple_window._status.text() == tab_note,
         "switching back to 颜色配方 restores the colour-table sentence",
+    )
+    check(
+        triple_window._status.isVisibleTo(triple_window),
+        "and the line comes back into the layout with it",
     )
 
     # The first page is 「颜色配方」 now, all the way through: tab, panel title and
@@ -3086,6 +3100,22 @@ def main() -> int:
             page._set_pick_mode(_picture_page.PICK_EDGE, save=False)
             app.processEvents()
             blocks = page._blocks
+            # m14748 第 2 条：颜色表列出来的颜色，色块表里也要有一个位子。
+            # 去噪并掉的是位置不是颜色 —— 以前一个颜色要是全由小于门槛的碎片组成
+            # （那份工程里的红色：474 px 散成 214 片，最大 136 px），色块表里它
+            # 会整个消失，而右边「打印图片需要的颜色」照样写着它。
+            if blocks is not None and blocks.count:
+                printed = {
+                    int(value)
+                    for value in _np.unique(page._result.indices).tolist()
+                    if int(value) >= 0
+                }
+                in_blocks = {int(value) for value in blocks.values.tolist()}
+                check(
+                    printed <= in_blocks,
+                    "色块表覆盖了颜色表列出的每一种颜色（m14748 第 2 条）："
+                    f"印了 {sorted(printed)}，色块表只有 {sorted(in_blocks)}",
+                )
             if blocks is not None and blocks.count:
                 whole = blocks.mask(blocks.order()[0])
                 page._list.clear_selection()

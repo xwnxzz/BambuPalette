@@ -281,5 +281,104 @@ class ThresholdTests(unittest.TestCase):
         self.assertEqual(label_blocks(grid, min_pixels=min_block_pixels(24)).count, 1)
 
 
+class FoldDirectionTests(unittest.TestCase):
+    """碎片并进邻居时，留下的必须是**邻居**的颜色（m14748 第 2 条）。"""
+
+    def test_a_low_numbered_speck_does_not_repaint_the_block_it_joins(self):
+        # B 的碎片在光栅序里排在大块 A 前面（第 0 行最左），而且门槛把它吃掉。
+        # 以前并查集取「编号小的根」的颜色，于是这片的颜色会把整块 A 改掉：
+        # 实测那份工程里 4 块就是这样「块里 1921 px 是 #2C2A2C，报出来 #A1A1A1」。
+        grid = _grid(
+            """
+            B....
+            AAAAA
+            AAAAA
+            AAAAA
+            """
+        )
+        blocks = label_blocks(grid, min_pixels=4)
+        self.assertEqual(blocks.count, 1)
+        self.assertEqual(blocks.sizes.tolist(), [16])
+        self.assertEqual(blocks.value(0), _grid("A")[0][0])
+
+    def test_the_bigger_neighbour_keeps_its_colour_through_a_chain(self):
+        # 小片 B 并进小片 A，再一起并进大块 C：最后留下的是 C 的颜色。
+        grid = _grid(
+            """
+            BAAAA..
+            CCCC...
+            CCCC...
+            """
+        )
+        blocks = label_blocks(grid, min_pixels=5)
+        self.assertEqual(blocks.count, 1)
+        self.assertEqual(blocks.value(0), int(grid[1][0]))
+
+
+class ColourCoverageTests(unittest.TestCase):
+    """``keep_colours``：颜色表列出来的颜色，色块表里也要有一个位子（m14748 第 2 条）。"""
+
+    def test_a_colour_below_the_threshold_keeps_one_scattered_row(self):
+        grid = _grid(
+            """
+            AABAAB
+            AABAAB
+            AABAAB
+            """
+        )
+        self.assertEqual(label_blocks(grid, min_pixels=4).count, 1)
+        blocks = label_blocks(grid, min_pixels=4, keep_colours=True)
+        self.assertEqual(blocks.count, 2)
+        self.assertEqual(blocks.sizes.tolist(), [12, 6])
+        self.assertEqual(blocks.values.tolist(), [int(grid[0][0]), int(grid[0][2])])
+        # 散点块占着的正是原来那些像素，总数不变、谁也不多谁也不缺。
+        self.assertEqual(int(blocks.sizes.sum()), 18)
+        self.assertEqual(int(blocks.labels[grid == int(grid[0][2])].min()), 1)
+        self.assertEqual(
+            int(blocks.labels[grid == int(grid[0][2])].max()),
+            1,
+            "散点块的像素必须落在同一个 label 上，否则界面点不到它",
+        )
+
+    def test_a_speck_folded_into_a_neighbour_still_leaves_one_row(self):
+        # 就是 m14748 那份工程的样子：红色（B）全是 136 px 以下的碎片。
+        grid = _grid(
+            """
+            AAAAA
+            ABBAA
+            AABAA
+            AAAAA
+            """
+        )
+        strict = label_blocks(grid, min_pixels=4)
+        self.assertEqual(strict.count, 1)
+        blocks = label_blocks(grid, min_pixels=4, keep_colours=True)
+        self.assertEqual(blocks.count, 2)
+        self.assertEqual(sorted(blocks.values.tolist()), sorted({int(v) for v in grid.ravel()}))
+
+    def test_it_never_invents_a_colour_that_is_not_there(self):
+        grid = _grid(
+            """
+            AAA
+            AAA
+            """
+        )
+        plain = label_blocks(grid, min_pixels=2)
+        kept = label_blocks(grid, min_pixels=2, keep_colours=True)
+        self.assertEqual(plain.count, kept.count)
+        self.assertEqual(plain.values.tolist(), kept.values.tolist())
+
+    def test_a_colour_that_kept_a_block_gets_no_second_row(self):
+        grid = _grid(
+            """
+            AABB
+            AABB
+            """
+        )
+        blocks = label_blocks(grid, min_pixels=2, keep_colours=True)
+        self.assertEqual(blocks.count, 2)
+        self.assertEqual(blocks.sizes.tolist(), [4, 4])
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

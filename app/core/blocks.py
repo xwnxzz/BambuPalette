@@ -69,12 +69,18 @@ class BlockMap:
         return int(self.values[int(label)])
 
 
-def label_blocks(indices: np.ndarray, *, min_pixels: int = 0) -> BlockMap:
+def label_blocks(
+    indices: np.ndarray, *, min_pixels: int = 0, keep_colours: bool = False
+) -> BlockMap:
     """Cut ``indices`` (H, W; ``-1`` = not printed) into blocks.
 
     ``min_pixels`` is the despeckle threshold: blocks smaller than it are folded
     into the neighbour they share the longest border with.  ``0`` keeps every
     connected piece, which is what the tests and the raw measurements want.
+
+    ``keep_colours`` keeps one entry per colour that is still printed (m14748
+    第 2 条).  它只给界面用：去噪之后一个位子都不剩的颜色，会补一行**散点块**，
+    免得「打印图片需要的颜色」列出了它、色块表里却没有它。
     """
     grid = np.asarray(indices)
     if grid.ndim != 2:
@@ -83,7 +89,49 @@ def label_blocks(indices: np.ndarray, *, min_pixels: int = 0) -> BlockMap:
     labels, sizes = _runs(work)
     if min_pixels > 1 and sizes.size:
         work, labels, sizes = _absorb_small(work, labels, sizes, int(min_pixels))
+    if keep_colours:
+        work, labels, sizes = _keep_every_colour(work, labels, sizes, grid)
     return BlockMap(labels=labels, sizes=sizes, values=_block_values(work, labels, len(sizes)))
+
+
+def _keep_every_colour(
+    work: np.ndarray, labels: np.ndarray, sizes: np.ndarray, original: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """每种在图里出现过的颜色都留一个位子（m14748 第 2 条）。
+
+    去噪并掉的是**位置**，不是颜色：颜色表按像素算，照样把这个颜色列进「打印图片需要
+    的颜色」，色块表却一个位子都不剩 —— 用户看到的就是「图一有红色，图二没有红色色块」。
+    实测那一份工程：红色 474 px，散成 214 片，最大一片 136 px，全部低于 64 px 的门槛，
+    于是被吃得干干净净（黑色也整片消失）。
+
+    这里给还缺位子的颜色补一个**散点块**：像素彼此不相连，但一个颜色一行，两本账就
+    一样了。散点块不是新画的东西 —— 颜色表里那个 0.0% 的颜色本来就在打，只是以前
+    它没有可以点的地方：「删除」删不掉、「更换颜色」换不了。
+    """
+    present = [int(value) for value in np.unique(original) if int(value) >= 0]
+    if not present:
+        return work, labels, sizes
+    values = _block_values(work, labels, len(sizes))
+    have = {int(value) for value in values.tolist()}
+    missing = [value for value in present if value not in have]
+    if not missing:
+        return work, labels, sizes
+    count = int(len(sizes))
+    filled = False
+    for value in missing:
+        mask = (original == value) & (labels >= 0)
+        if not mask.any():
+            continue
+        work = work.copy() if not filled else work
+        labels = labels.copy() if not filled else labels
+        filled = True
+        work[mask] = value
+        labels[mask] = count
+        count += 1
+    if not filled:
+        return work, labels, sizes
+    sizes = np.bincount(labels[labels >= 0].ravel(), minlength=count)[:count].astype(np.int64)
+    return work, labels, sizes
 
 
 def _runs(grid: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -197,21 +245,28 @@ def _absorb_small(
                 winner[one] = other
         if not winner:
             return work, labels, sizes  # 只剩孤岛：没邻居可并，留着
-        # Follow the chain (small → small → big) so one pass merges whole groups.
-        target = list(range(len(sizes)))
+        # 折叠的方向由 winner 说了算：小片并进哪一块，留下的就是哪一块的颜色。
+        # 以前用并查集的根（两个里编号小的那个）取颜色，于是「光栅序排在前面」的
+        # 碎点会把整块大色区改色 —— m14748 第 2 条在猪信工程里量到 4 块：块里
+        # 1921 px 的原始像素是 #2C2A2C，报出来的却是 #A1A1A1；颜色表说黑色打了
+        # 7604 px，色块表里黑色只剩两块 698 / 678 px。
+        destination = list(range(len(sizes)))
 
-        def root(node: int) -> int:
-            while target[node] != node:
-                target[node] = target[target[node]]
-                node = target[node]
+        def land(node: int) -> int:
+            trail: list[int] = []
+            while destination[node] != node:
+                trail.append(node)
+                node = destination[node]
+            for step in trail:
+                destination[step] = node
             return node
 
         for one, other in winner.items():
-            mine, theirs = root(one), root(other)
+            mine, theirs = land(one), land(other)
             if mine != theirs:
-                target[max(mine, theirs)] = min(mine, theirs)
-        resolved = np.asarray([root(label) for label in range(len(sizes))], dtype=np.int64)
-        merged = np.where(labels >= 0, resolved[labels], -1)
+                destination[mine] = theirs
+        dest = np.asarray([land(label) for label in range(len(sizes))], dtype=np.int64)
+        merged = np.where(labels >= 0, dest[labels], -1)
         work = np.where(merged >= 0, values[merged], -1).astype(np.int32)
         labels, sizes = _runs(work)
     return work, labels, sizes
