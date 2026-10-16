@@ -60,20 +60,36 @@ Point = tuple[float, float, float]
 # ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------
+#: 一格的宽度：0.4 mm 的喷嘴铺一层就是一格。 1.6.42 起板的长宽由它推出
+#: （图片像素数 × 这一格），不再问「打印宽度」；也不再按 250 mm 的打印范围自动缩，
+#: 用户明确要求「不限制大小，允许超出」，超出多少由切片器去说。
+CELL_MM = 0.4
+#: 图那一层颜色占多厚。 混色是 Bambu Studio 自己的事（它按 ``filament_mixed_sublayer_ratios``
+#: 在层内排），我们只要留出够放住那些颜色的一段，所以这一项也不再暴露给界面。
+COLOUR_BAND_MM = 0.4
+
+
 @dataclass(frozen=True)
 class PlateSettings:
-    """Everything the user can change about the exported slab."""
+    """Everything the user can change about the exported slab.
 
-    target_width_mm: float = 150.0
-    base_thickness_mm: float = 0.8
-    colour_thickness_mm: float = 0.6
+    1.6.42 起界面只问两件事：**底板厚度**和图片印在哪一面。 以前那两个输入框 ——
+    「打印宽度」和「颜色层厚度」—— 都不再是用户的活：
+
+    * 一格打多宽由喷嘴定（:data:`CELL_MM`），所以板的长宽跟着图片像素数走。
+    * 颜色层厚度由 Bambu Studio 自己管，这里固定成 :data:`COLOUR_BAND_MM`；
+      于是 ``base_thickness_mm`` 变成**整块**的厚度（含那一层颜色）。
+    """
+
+    #: 一格多少毫米。 0.4 = 一个 0.4 mm 喷嘴刚好铺满一格，是全套假设里唯一和机器有关的一条。
+    cell_mm: float = CELL_MM
+    #: 整块底板的厚度，含图那一层颜色（1.6.42 之前这里是「底板色那段」的厚度）。
+    base_thickness_mm: float = 1.4
+    #: 图那一层颜色占多厚。 界面上没有这个输入，留着是为了工具和测试能改它看重叠行为。
+    colour_thickness_mm: float = COLOUR_BAND_MM
     #: Palette index whose filament also prints the base plate; -1 = the colour
     #: that covers the most pixels.
     base_index: int = -1
-    #: Keep the plate inside this footprint even if ``target_width_mm`` is larger.
-    max_footprint_mm: float = 250.0
-    #: Cells finer than this are below what an 0.4 mm nozzle resolves.
-    min_pixel_mm: float = 0.35
     #: 导出时把色块边界圆滑 (1.6.22 / 1.6.27)。 匹配栅格上的色块边界是「一格一格的台阶」，
     #: 150 mm 宽、512 像素的图上约 0.29 mm 一级，在 Bambu Studio 里放大看就是锯齿。
     #: 打开之后先在匹配栅格上把每种颜色糊一遍再细分若干倍：1.6.27 起直接描出那条边界线
@@ -85,22 +101,31 @@ class PlateSettings:
     image_on_bottom: bool = True
 
     def clamped(self) -> "PlateSettings":
+        colour = max(0.2, min(20.0, float(self.colour_thickness_mm)))
         return PlateSettings(
-            target_width_mm=max(10.0, min(400.0, float(self.target_width_mm))),
-            base_thickness_mm=max(0.2, min(20.0, float(self.base_thickness_mm))),
-            colour_thickness_mm=max(0.2, min(20.0, float(self.colour_thickness_mm))),
+            cell_mm=max(0.1, min(5.0, float(self.cell_mm))),
+            # 整块厚度：至少要给底板色那段留下 0.2 mm，否则那一层会被颜色层吃掉。
+            base_thickness_mm=max(colour + 0.2, min(20.0, float(self.base_thickness_mm))),
+            colour_thickness_mm=colour,
             base_index=int(self.base_index),
-            max_footprint_mm=max(20.0, min(1000.0, float(self.max_footprint_mm))),
-            min_pixel_mm=max(0.05, min(2.0, float(self.min_pixel_mm))),
             smooth_edges=bool(self.smooth_edges),
             image_on_bottom=bool(self.image_on_bottom),
         )
 
 
+def settings_for_width(width_mm: float, pixels: int, **kwargs) -> PlateSettings:
+    """按「整块要多宽」造一份设置：``cell_mm = width_mm / pixels``。
+
+    1.6.42 起界面上只有「底板厚度」一个尺寸输入，板的一格就是 :data:`CELL_MM`
+    （图片像素数 × 0.4 mm）。 这个帮手留给需要指定整块宽度的场合：样例导出、
+    几何测试，以及把老工程里记的「打印宽度」换算过来看。
+    """
+    return PlateSettings(cell_mm=float(width_mm) / max(1, int(pixels)), **kwargs)
+
+
 #: 圆滑色块时把匹配栅格放大几倍，最多这么多。 4 倍把 0.29 mm 的台阶变成 0.07 mm，
 #: 比 0.4 mm 的喷嘴细一档；再细只是把导出时间拉长，打印上区分不出来。
-SMOOTH_FACTOR = 4
-#: 细栅格的像元上限。 一张 512×512 的图放大 4 倍是 419 万个像元，正是这一步的开销
+SMOOTH_FACTOR = 4#: 细栅格的像元上限。 一张 512×512 的图放大 4 倍是 419 万个像元，正是这一步的开销
 #: 所在（每种颜色都要在细栅格上做一次双线性取样），比这更大就少放几倍。
 SMOOTH_MAX_CELLS = 4_500_000
 #: 「细格像元 × 颜色数」的预算：颜色越多，每种颜色那一趟也越贵。 32 色的图在 512²
@@ -158,7 +183,8 @@ class PlateModel:
 
     @property
     def total_thickness_mm(self) -> float:
-        return self.base_thickness_mm + self.colour_thickness_mm
+        #: 1.6.42 起 ``base_thickness_mm`` 记的就是整块厚度（颜色层算在里面）。
+        return self.base_thickness_mm
 
     @property
     def extruder_count(self) -> int:
@@ -1451,9 +1477,9 @@ def build_plate(
     The solid has exactly four kinds of face:
 
     * the underside, over the whole silhouette, in the base colour;
-    * the top surface at ``base_thickness + colour_thickness``, tiled by colour
-      region and tagged with that region's filament;
-    * the outside rim below ``base_thickness``, in the base colour;
+    * the top surface at ``base_thickness_mm`` (the slab's whole thickness, 1.6.42),
+      tiled by colour region and tagged with that region's filament;
+    * the outside rim below ``base_thickness - colour_thickness``, in the base colour;
     * the outside rim above it, in the colour of the region that owns that
       stretch of rim.
 
@@ -1467,17 +1493,8 @@ def build_plate(
     notes: list[str] = []
     picture_width = max(1, int(result.width))
     picture_height = max(1, int(result.height))
-    pixel = config.target_width_mm / picture_width
-    if pixel * picture_height > config.max_footprint_mm:
-        pixel = config.max_footprint_mm / picture_height
-        notes.append(
-            f"按目标宽度会超出 {config.max_footprint_mm:.0f} mm 的打印范围，已自动缩小"
-        )
-    if pixel < config.min_pixel_mm:
-        # 用图片自己的像素算：细分之后的网格一定更细，拿细格算会天天误报。
-        notes.append(
-            f"每个像素只有 {pixel:.3f} mm，比 0.4 mm 喷嘴还细；相邻颜色在打印时会互相覆盖"
-        )
+    # 一格就是一格喷嘴宽 (1.6.42)：板的长宽 = 图片像素数 × 这一格，不设上限、不自动缩。
+    pixel = config.cell_mm
 
     # --- 导出时圆滑色块 (1.6.22 / 1.6.27) -------------------------------------
     # 色块边界原本落在匹配栅格的格线上（150 mm 宽、512 像素的图约 0.293 mm 一格），斜着走的地方
@@ -1526,8 +1543,8 @@ def build_plate(
         base_index = int(np.argmax(result.counts))
     base_extruder = base_index + 1
 
-    z_base_top = config.base_thickness_mm
-    z_colour_top = config.base_thickness_mm + config.colour_thickness_mm
+    z_colour_top = config.base_thickness_mm
+    z_base_top = config.base_thickness_mm - config.colour_thickness_mm
 
     silhouette = result.indices >= 0
     if not silhouette.any():
@@ -1828,10 +1845,11 @@ def build_plate(
             )
         )
 
-    if config.colour_thickness_mm < 0.4:
-        notes.append("颜色层不足 0.4 mm，打印时可能在层间混色，建议至少 0.4 mm")
-    if config.base_thickness_mm < 0.4:
-        notes.append("底板不足 0.4 mm，太薄容易撕裂，建议至少 0.4 mm")
+    if z_base_top < 0.4:
+        notes.append(
+            f"底板色那段只有 {z_base_top:.2f} mm，太薄容易撕裂；底板厚度建议至少 "
+            f"{config.colour_thickness_mm + 0.4:.1f} mm"
+        )
 
     return PlateModel(
         parts=parts,

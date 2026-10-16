@@ -38,6 +38,7 @@ from app.mesh.plate import (  # noqa: E402
     edge_health,
     merge_parts,
     plate_mesh,
+    settings_for_width,
     signed_volume,
 )
 from app.mesh.threemf import (  # noqa: E402
@@ -90,7 +91,7 @@ class ExportTestCase(unittest.TestCase):
         self.library = _library()
         palette = build_palette(self.library, None, include_mixes=False)
         self.result = match_image(_quadrant_image(), palette, MatchSettings(max_colours=4))
-        self.plate = build_plate(self.result, PlateSettings(target_width_mm=100.0))
+        self.plate = build_plate(self.result, settings_for_width(100.0, self.result.width))
         self._temp = TemporaryDirectory()
         self.tmp = Path(self._temp.name)
 
@@ -408,7 +409,7 @@ class ThreeMfTests(ExportTestCase):
         self.assertIn('a & b <c> "d"', names)
 
     def test_an_empty_plate_is_refused(self):
-        empty = build_plate(self.result, PlateSettings(target_width_mm=100.0))
+        empty = build_plate(self.result, settings_for_width(100.0, self.result.width))
         empty.parts = []
         with self.assertRaises(ValueError):
             write_3mf(empty, self.tmp / "empty")
@@ -492,7 +493,7 @@ class ObjTests(ExportTestCase):
         self.assertEqual(len(obj_faces), total_faces)
 
     def test_an_empty_plate_is_refused(self):
-        empty = build_plate(self.result, PlateSettings(target_width_mm=100.0))
+        empty = build_plate(self.result, settings_for_width(100.0, self.result.width))
         empty.parts = []
         with self.assertRaises(ValueError):
             write_obj(empty, self.tmp / "empty")
@@ -694,7 +695,7 @@ class MixedFilamentTests(ExportTestCase):
         library = FilamentLibrary(list(self.library.filaments) + [spare])
         palette = build_palette(library, None, include_mixes=False)
         result = match_image(_quadrant_image(), palette, MatchSettings(max_colours=4))
-        plate = build_plate(result, PlateSettings(target_width_mm=100.0))
+        plate = build_plate(result, settings_for_width(100.0, result.width))
         painted = slots_from_palette(palette, library)[: plate.extruder_count]
         self.assertNotIn(
             spare.color_hex.upper(),

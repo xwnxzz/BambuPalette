@@ -44,7 +44,7 @@ paths.data_dir = lambda: TEMP  # type: ignore[assignment]
 
 from app.core.image_matching import MatchSettings, build_palette, match_image  # noqa: E402
 from app.core.library import Filament, FilamentLibrary  # noqa: E402
-from app.mesh.plate import PlateSettings, build_plate  # noqa: E402
+from app.mesh.plate import build_plate, settings_for_width  # noqa: E402
 from app.mesh.threemf import slots_from_palette, write_3mf  # noqa: E402
 
 BAMBU_CANDIDATES = (
@@ -90,7 +90,7 @@ def build_sample() -> Path:
 
     palette = build_palette(library, None, include_mixes=False)
     result = match_image(picture, palette, MatchSettings(max_colours=8))
-    plate = build_plate(result, PlateSettings(target_width_mm=120.0))
+    plate = build_plate(result, settings_for_width(120.0, result.width))
     return write_3mf(
         plate,
         TEMP / "source.3mf",

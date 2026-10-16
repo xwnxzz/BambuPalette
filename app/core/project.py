@@ -62,15 +62,19 @@ _LAYER = "色块图层.npy"
 #: （alpha_threshold / merge_delta_e / smooth_radius）用户改不到，写进文件只会变成
 #: 一份需要维护的副本。
 _SETTING_KEYS = ("max_colours", "max_dimension", "dither", "max_spools")
-#: :class:`PlateSettings` 的全部字段。 ``smooth_edges`` 是 1.6.22 加的：旧工程没有
-#: 这一项，读盘时按 dataclass 的默认值补上，也就是「旧工程打开也是勾上的」。
+#: :class:`PlateSettings` 的字段里要记的那几个。 ``smooth_edges`` 是 1.6.22 加的：旧工程
+#: 没有这一项，读盘时按 dataclass 的默认值补上，也就是「旧工程打开也是勾上的」。
 #: ``image_on_bottom`` 是 1.6.23 加的：旧工程同样按默认补上，也就是「图片印在底面」。
+#:
+#: 1.6.42（m15721 第 3 条）把 ``target_width_mm`` / ``max_footprint_mm`` / ``min_pixel_mm``
+#: 删了：一格的尺寸由喷嘴定（``cell_mm`` = 0.4 mm），板长宽 = 图的像素数 × 0.4，不再
+#: 记录、也不再限制。 ``base_thickness_mm`` 的含义同时改了 —— 以前是底板色那一层的厚度、
+#: 整块还要另加 ``colour_thickness_mm``，现在是**整块**的厚度。 旧工程里两个数都在，
+#: 读盘时按「旧的底板 + 旧的颜色层 = 新的底板厚度」换算（见 :func:`_plate_from_json`），
+#: 打印出来的厚度因此和升级前一模一样。
 _PLATE_KEYS = (
-    "target_width_mm",
+    "cell_mm",
     "base_thickness_mm",
-    "colour_thickness_mm",
-    "max_footprint_mm",
-    "min_pixel_mm",
     "smooth_edges",
     "image_on_bottom",
 )
@@ -520,6 +524,15 @@ def load_project(
     }
     block_paints = _paints_from_json(edits.get("block_paints"), layer, indices, library, engine)
     plate_data = document.get("plate") or {}
+    if "cell_mm" not in plate_data:
+        # 1.6.41 及以前的工程：``base_thickness_mm`` 是底板色那一层，整块还要加上
+        # ``colour_thickness_mm``（1.6.42 起这个字段是**整块**的厚度，所以这里按和换算，
+        # 旧的 0.8 + 0.6 打开就是 1.4）。 那时候还记着「打印宽度」，现在板长宽 = 图的
+        # 像素数 × 0.4，这个数就丢掉了（见 _PLATE_KEYS 的注释）。
+        old_total = float(plate_data.get("base_thickness_mm") or 0.0) + float(
+            plate_data.get("colour_thickness_mm") or 0.0
+        )
+        plate_data = {**plate_data, "base_thickness_mm": old_total}
     plate = PlateSettings(
         **{
             key: plate_data.get(key, getattr(PlateSettings(), key))

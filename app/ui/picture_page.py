@@ -70,7 +70,7 @@ from PySide6.QtWidgets import (
 
 from .. import __version__
 from ..core import paths
-from ..core.blocks import BlockMap, label_blocks, min_block_pixels
+from ..core.blocks import BlockMap, label_blocks, min_block_pixels, revalue_blocks
 from ..core.image_matching import (
     BudgetOption,
     MatchResult,
@@ -78,6 +78,7 @@ from ..core.image_matching import (
     PaletteEntry,
     TriplePalette,
     build_palette,
+    match_image,
     match_options,
     plan_caption,
     rematch_options,
@@ -104,7 +105,7 @@ from ..core.project import (
     save_project,
 )
 from ..mesh.objfile import write_obj
-from ..mesh.plate import PlateModel, PlateSettings, build_plate
+from ..mesh.plate import CELL_MM, COLOUR_BAND_MM, PlateModel, PlateSettings, build_plate
 from ..mesh.threemf import MAX_PAINTED_FILAMENTS, slots_from_palette, write_3mf
 from . import theme
 from .colour_picker import (
@@ -207,11 +208,13 @@ PAGE_HELP = (
     "工程里装着原图、这张预览、用到的颜色和耗材，下次「打开工程」就回到现在这一步。\n"
     "· 双击颜色列表里的一行，看这个颜色的详情（图片里的颜色、匹配到的颜色和它的配方）。\n"
     "· 「筛选耗材」先说好哪几卷必须用、哪几卷不要用，之后每套搭配都照这个来。\n"
-    "· 「按当前色块重新匹配」拿现在这些色块重新挑卷，删除、合并和手改过的颜色都留着。\n"
+    "· 「按当前色块重新匹配」先从「原图」（含你做过的删除、合并）重新找一遍颜色、按「颜色数量」"
+    "重算，再拿现在这些色块重新挑卷：色块的划分和编号都不动，你在色块模式里点过、改过的块还在原"
+    "处；颜色表里那些「更换颜色」会清掉（行是按旧的颜色表排的，对不上了）。原图本身不改。\n"
     "· 「删除」也可以按键盘上的 Del：选中一种颜色或者一块之后按 Del，和点按钮一样。\n"
     "· 在「按色块边缘选择」下删除或合并，会同时改「原图」本身——删掉的那块在原图里变透明、"
-    "并掉的那几块在原图里并进留下来的那一块，所以「重新匹配」和「按当前色块重新匹配」都从改过"
-    "的原图出发，删掉的地方不会又被匹配回来。原图被改过之后，它上方的标题旁边会出现「原图已修"
+    "并掉的那几块在原图里并进留下来的那一块，所以「按当前色块重新匹配」从改过的原图出发，删掉"
+    "的地方不会又被匹配回来。原图被改过之后，它上方的标题旁边会出现「原图已修"
     "改」。按颜色删除或合并也一样改原图（1.6.20 起）：删掉一种颜色 = 这些像素在源图里变透明，"
     "合并几种颜色 = 这些像素在源图里并进留下来的那一种——改的是同一张图的同一批像素，就该是同"
     "一件事。只有「更换颜色」不动原图，它说的是「这块地方这一次用哪一卷来印」，换一套搭配还"
@@ -221,7 +224,7 @@ PAGE_HELP = (
     "只是色块大小；再点「按当前色块重新匹配」，就是拿原图里剩下的那几种颜色重新挑卷。\n"
     "· 「耗材方案」里一行是一套卷组（哪几卷料），同一批卷的另一种配方算同一行。颜色越多，"
     "能凑出不同卷组的余地越大；一张图只剩两三种颜色时，往往只有一套卷组能凑出来，那几行就会"
-    "变少——想看别的搭配，得先让图里有更多颜色（颜色数量调大、重新匹配）。\n"
+    "变少——想看别的搭配，得先让图里有更多颜色（颜色数量调大，再按一次「按当前色块重新匹配」）。\n"
     "· 匹配时状态栏右边有一条进度条，跟着「正在匹配：…」一路走到 100%。它要等匹配超过"
     f" {BUSY_DELAY_MS} 毫秒才出现，几毫秒就完成的匹配不会闪一下。\n"
     f"· 点图片时默认「{PICK_MODE_LABELS[PICK_COLOUR]}」：点在哪一块就选哪一块。描边这类细线"
@@ -1583,6 +1586,10 @@ class PicturePage(QWidget):
         self._block_edits: list[BlockPaint] = []
         #: 当前匹配上认出来的色块；只在块模式下建（顺序、掩码都由它出）。
         self._blocks: BlockMap | None = None
+        #: 「这一份划分说了算」的标签图（m15721 第 1 条）。「按当前色块重新匹配」重新
+        #: 分色时把旧划分留在这里，_:meth:`_build_blocks` 见到尺寸对得上就用它，块数和
+        #: 编号都不变；导入新图、从头匹配、打开工程都会清掉它。
+        self._block_template: np.ndarray | None = None
         #: 当前「点图片时」的方式。存在页面里（而不是只问 view），是因为历史、
         #: 列表和块表都要看它（m02439 的答复：切换方式本身算一步撤销）。
         self._mode: str = DEFAULT_PICK_MODE
@@ -1617,14 +1624,13 @@ class PicturePage(QWidget):
         self._import_button.setProperty("accent", "true")
         self._import_button.clicked.connect(self._on_import)
 
-        self._rematch_button = QPushButton("重新匹配")
-        self._rematch_button.clicked.connect(self._on_rematch)
-
-        # 「按当前色块重新匹配」 is 重新匹配's neighbour and its opposite: 重新匹配
-        # reads the picture again (and drops the edits, because the blocks it was
-        # made of are gone), while this one takes the blocks on screen as the
-        # question and only asks which rolls print them.  Two buttons rather than
-        # one with a mode, because the user knows which question they are asking.
+        # 「按当前色块重新匹配」按一次做两件事（m15721 第 1 条）：先从改过的原图重新分色
+        # （「颜色数量」说了算，所以颜色表可能变），再拿着**现有这些色块**去重新挑卷。
+        # 色块的划分和编号不动 —— 用户在色块模式里点出来、改过的那些块还在原处，只用新
+        # 颜色重算每块打哪一色；颜色表里行级的「更换颜色」会清掉（那几行按下标记的，新
+        # 颜色表一换就对不上了）、色块级的编辑按像素掩码留着。
+        # 从前那个「重新匹配」按钮已删：它和这个只差「要不要重新分块」，两个按钮并排时
+        # 用户得先想清楚自己要问哪个问题，而分块是软件该自己认的事。
         self._rematch_blocks_button = QPushButton("按当前色块重新匹配")
 
         # 「点图片时」：how a click in 预览 chooses a colour (m01411 item 4).  No
@@ -1690,29 +1696,21 @@ class PicturePage(QWidget):
         top.addWidget(QLabel("最大边长:"))
         top.addWidget(self._max_dimension)
         top.addWidget(self._dither)
-        top.addWidget(self._rematch_button)
         top.addWidget(self._rematch_blocks_button)
         top.addWidget(QLabel("点图片时:"))
         top.addWidget(self._pick_combo)
         top.addStretch(1)
 
-        self._width_spin = QDoubleSpinBox()
-        self._width_spin.setRange(10.0, 400.0)
-        self._width_spin.setValue(150.0)
-        self._width_spin.setSuffix(" mm")
-        self._width_spin.setDecimals(1)
-
+        # 底板厚度 = **整块**的厚度，含图上那一层颜色（1.6.42）。 一格多宽由喷嘴定
+        # （CELL_MM = 0.4 mm），颜色层厚度由 Bambu Studio 自己管，这两个都不用再问用户。
         self._base_spin = QDoubleSpinBox()
-        self._base_spin.setRange(0.2, 20.0)
-        self._base_spin.setValue(0.8)
+        self._base_spin.setRange(COLOUR_BAND_MM + 0.2, 20.0)
+        self._base_spin.setValue(1.4)
         self._base_spin.setSingleStep(0.2)
         self._base_spin.setSuffix(" mm")
-
-        self._colour_spin = QDoubleSpinBox()
-        self._colour_spin.setRange(0.2, 20.0)
-        self._colour_spin.setValue(0.6)
-        self._colour_spin.setSingleStep(0.2)
-        self._colour_spin.setSuffix(" mm")
+        self._base_spin.setToolTip(
+            "整块底板的厚度，含图上那一层颜色（0.4 mm）。 除以你的层高就是板有几层。"
+        )
 
         self._base_combo = QComboBox()
 
@@ -1740,12 +1738,8 @@ class PicturePage(QWidget):
 
         bottom = QHBoxLayout()
         bottom.setSpacing(8)
-        bottom.addWidget(QLabel("打印宽度:"))
-        bottom.addWidget(self._width_spin)
         bottom.addWidget(QLabel("底板厚度:"))
         bottom.addWidget(self._base_spin)
-        bottom.addWidget(QLabel("颜色层厚度:"))
-        bottom.addWidget(self._colour_spin)
         bottom.addWidget(QLabel("底板颜色:"))
         bottom.addWidget(self._base_combo)
         bottom.addStretch(1)
@@ -2044,13 +2038,10 @@ class PicturePage(QWidget):
 
     def _set_controls_enabled(self, enabled: bool) -> None:
         for widget in (
-            self._rematch_button,
             self._rematch_blocks_button,
             self._filter_button,
             self._save_project_button,
-            self._width_spin,
             self._base_spin,
-            self._colour_spin,
             self._base_combo,
             self._side_combo,
             self._smooth_box,
@@ -2127,6 +2118,16 @@ class PicturePage(QWidget):
                 image = _load_vector(path, int(self._max_dimension.value()))
             else:
                 image = Image.open(source)
+                # 位图按它自己的像素导入（m15721 第 2 条）：从前这里固定缩到最长边 512，
+                # 于是 2363 px 的照片一进来就只剩 512，细笔画全糊进格子里。现在「最大
+                # 边长」跟着图走：一格 0.4 mm，图多大板就多大，缩不缩由用户自己调那个框。
+                longest = max(int(image.width), int(image.height))
+                self._max_dimension.setValue(
+                    max(
+                        self._max_dimension.minimum(),
+                        min(self._max_dimension.maximum(), longest),
+                    )
+                )
         else:
             image = source
         self._image = image.convert("RGBA")
@@ -2147,6 +2148,7 @@ class PicturePage(QWidget):
         self._merged = {}
         self._replaced = {}
         self._block_edits = []
+        self._block_template = None
         self._undo_stack = []
         self._redo_stack = []
         self._on_rematch()
@@ -2320,9 +2322,7 @@ class PicturePage(QWidget):
         self._max_dimension.setValue(int(settings.max_dimension))
         self._dither.setChecked(bool(settings.dither))
         self._spool_cap.setValue(int(settings.max_spools))
-        self._width_spin.setValue(float(state.plate.target_width_mm))
         self._base_spin.setValue(float(state.plate.base_thickness_mm))
-        self._colour_spin.setValue(float(state.plate.colour_thickness_mm))
         self._smooth_box.setChecked(bool(state.plate.smooth_edges))
         self._side_combo.setCurrentIndex(0 if state.plate.image_on_bottom else 1)
         # The 方案 list belongs to a match, and 「打开工程」 deliberately does not run
@@ -2354,6 +2354,9 @@ class PicturePage(QWidget):
         # ``entry_to_json("entry")`` 才炸成「'str' object has no attribute 'key'」
         # ——用户看到的就是「打开工程好好的，一保存就失败」。两种形状都认。
         self._block_edits = []
+        # 工程文件里的块来自保存时那一份划分；重新分色之后块要重新认，别拿旧标签图
+        # 硬贴（m15721 第 1 条只对「按当前色块重新匹配」一路留划分）。
+        self._block_template = None
         for paint in state.block_paints:
             mask, entry = (
                 (paint.get("mask"), paint.get("entry"))
@@ -2639,6 +2642,8 @@ class PicturePage(QWidget):
         # 1.6.27 起第一行是 「大色差色块优先」 (m06704 第 3 条), which is also what
         # 「重新匹配」 uses, so the plain button lands on the row the user asked to be
         # the answer and the other rows stay the alternatives.
+        # 从头匹配的这份划分是新的：不许再拿「按当前色块重新匹配」留下的那张标签图。
+        self._block_template = None
         self._adopt_options(options)
 
     def _original_means(self, result: MatchResult) -> np.ndarray | None:
@@ -2726,28 +2731,37 @@ class PicturePage(QWidget):
         self._refresh_plans()
 
     def _on_rematch_blocks(self) -> None:
-        """「按当前色块重新匹配」: keep the colours on screen, re-choose the rolls.
+        """「按当前色块重新匹配」(m15721 第 1 条): 颜色重找，色块不动，卷重挑。
 
-        Not the same button as 重新匹配.  That one reads the picture again and
-        starts from the colours it finds; this one takes the blocks as settled —
-        a deleted colour stays deleted, a merge prints the colour it was merged
-        into, a hand-picked colour stays picked — and only asks 「哪几卷、怎么混」
-        again.  See :func:`app.core.image_matching.rematch_options`.
+        按一次走三步：
+
+        1. 从**改过的原图**重新分色（``match_image`` 那一套，「颜色数量」说了算），
+           所以颜色表和刚才可能不一样；
+        2. 色块的划分与编号原样搬过来 —— 拿现在这份划分的标签图，只把每块的颜色按新的
+           分色结果重算（:func:`app.core.blocks.revalue_blocks`）。 用户在色块模式里点过、
+           改过的块因此还在原处，块级编辑（按像素掩码）也照样贴得回去；
+        3. 再拿这些色块去重新挑卷（:func:`app.core.image_matching.rematch_options`）。
+
+        行级的「更换颜色」会清掉：它按下标记的是旧颜色表里的第几行，新表一换就对不上了
+        （旧表第 5 行是白，新表第 5 行可能是绿）。 从前那个「重新匹配」按钮已删：它和
+        这个只差「要不要重新分块」，而分块是软件该自己认的事。
         """
-        if self._result is None or self._library is None:
+        if self._image is None or self._result is None or self._library is None:
             return
         palette = self._match_palette()
         if not palette:
             self._status.setText("调色板是空的，请先添加耗材。")
             return
-        source, pinned = self._rematch_source()
+        # 现在这份划分：进过色块模式才有标签图，没有就照旧由 _build_blocks 自己分。
+        labels = None if self._blocks is None else self._blocks.labels
         self._begin_match()
         try:
+            fresh = match_image(self._image, palette, self._settings())
             options = rematch_options(
-                source,
+                fresh,
                 palette,
                 self._settings(),
-                pinned=pinned,
+                pinned={},
                 require=self._require,
                 avoid=self._avoid,
                 progress=self._report_match,
@@ -2762,9 +2776,15 @@ class PicturePage(QWidget):
                 self, "匹配失败", "按现在的色块和筛选，没有找到能用的耗材搭配。"
             )
             return
-        self._adopt_options(options)
+        self._adopt_options(options, block_labels=labels, keep_block_edits=True)
 
-    def _adopt_options(self, options: list[BudgetOption]) -> None:
+    def _adopt_options(
+        self,
+        options: list[BudgetOption],
+        *,
+        block_labels: np.ndarray | None = None,
+        keep_block_edits: bool = False,
+    ) -> None:
         """Make ``options[0]`` the match on screen, with the rest listed under it.
 
         Every edit so far was made against the previous 方案 and the rolls it spent,
@@ -2772,8 +2792,12 @@ class PicturePage(QWidget):
         undo stack first.  「按当前色块重新匹配」 is the one button that throws a whole
         match away, and the reporter pressed it, disliked the answer and could not
         get back (m01411 item 1): one Ctrl+Z now restores the match, its plans and
-        the edits that were made on it.  The hand-picked colours are still carried
-        into the new match as blocks (「按当前色块重新匹配」 pins them).
+        the edits that were made on it.
+
+        ``block_labels`` 是「新结果也用这份色块划分」的标签图（m15721 第 1 条）：
+        :meth:`_build_blocks` 见到尺寸对得上就用 :func:`revalue_blocks` 把它贴到新
+        分色上，块数和编号都不变。 ``keep_block_edits`` 则留着按像素掩码记的块级编辑
+        —— 划分没变，那些掩码指的仍是用户当初点的那几块。
         """
         # The very first match of a picture has nothing behind it; pushing there
         # would arm Ctrl+Z against a page that had no match at all.
@@ -2786,9 +2810,14 @@ class PicturePage(QWidget):
         self._deleted = set()
         self._merged = {}
         self._replaced = {}
-        # 块编辑记的是上一张匹配里某几块的像素；换了一张匹配，那些像素不再代表
-        # 用户当时点的那一块，所以一起清掉（Ctrl+Z 能把它们和旧匹配一起拿回来）。
-        self._block_edits = []
+        self._block_template = None if block_labels is None else np.asarray(block_labels)
+        if keep_block_edits:
+            # 划分没动，掩码还落在同一批像素上：留着。
+            pass
+        else:
+            # 块编辑记的是上一张匹配里某几块的像素；换了一张匹配，那些像素不再代表
+            # 用户当时点的那一块，所以一起清掉（Ctrl+Z 能把它们和旧匹配一起拿回来）。
+            self._block_edits = []
         # A new match is a new picture: whatever the project file holds is now
         # one step behind.
         self._dirty = True
@@ -2873,15 +2902,20 @@ class PicturePage(QWidget):
                 # 这一行是打开工程时从文件里读回来的（m10318 第 2 条）：数字是保存
                 # 那一刻的，不会因为升级了匹配规则而变——不写清楚，用户会以为
                 # 「匹配还没改好」。
-                numbers.setText(numbers.text() + " · 从工程里读的那套，按「重新匹配」重算")
+                numbers.setText(
+                    numbers.text() + " · 从工程里读的那套，按「按当前色块重新匹配」重算"
+                )
                 button.setToolTip(
                     option.note
                     + "　这套方案是打开工程时从文件里读出来的，不是照现在这套规则和现在的"
-                    "耗材库重新算的；按「重新匹配」就会重算。"
+                    "耗材库重新算的；按「按当前色块重新匹配」就会重算。"
                 )
             if over:
                 # 这一行是上一次匹配（上限还是别的数）算出来的，现在装了会超。
-                numbers.setText(numbers.text() + f" · 超过现在的上限（{cap} 卷），按「重新匹配」重算")
+                numbers.setText(
+                    numbers.text()
+                    + f" · 超过现在的上限（{cap} 卷），按「按当前色块重新匹配」重算"
+                )
                 button.setEnabled(False)
             elif self._plans_stale:
                 # m11180：这一行是改色块之前算的 —— 数字留着（那是当时那一套的事实），
@@ -3516,9 +3550,19 @@ class PicturePage(QWidget):
         ``keep_colours`` 补上「去噪之后一个位子都不剩、可是颜色表里还写着」的颜色
         （m14748 第 2 条：那张工程里红色 474 px 全是 136 px 以下的碎片，色块表里
         一块红色都没有，而颜色表照样列着它）。
+
+        ``self._block_template`` 是「这一份划分说了算」的标签图（m15721 第 1 条）：
+        「按当前色块重新匹配」重新分色之后，块还得是同一批块 —— 尺寸对得上就用
+        :func:`revalue_blocks` 把新颜色贴上去，尺寸对不上（用户改过「最大边长」）
+        就退回自己分块。
         """
         if result is None or self._mode != PICK_EDGE:
             return None
+        template = self._block_template
+        if template is not None and np.shape(template) == np.shape(result.indices):
+            # ``previous`` 传现在这一批块：某块在新分色里一格都不剩（全是「不打印」）时
+            # 就留它本来那一种颜色，而不是从别人那里顺手取一个。
+            return revalue_blocks(template, result.indices, previous=self._blocks)
         return label_blocks(
             result.indices,
             min_pixels=min_block_pixels(result.printed_pixels),
@@ -4166,11 +4210,19 @@ class PicturePage(QWidget):
 
     # -- export -----------------------------------------------------------
     def _plate_settings(self) -> PlateSettings:
+        """板长宽按用户的图算（一格 :data:`CELL_MM` mm），厚度只有「底板厚度」一个输入。
+
+        m15721 第 3 条：从前这里问三样 —— 打印宽度、底板厚度、颜色层厚度。 一格的
+        实际尺寸本来就等于 打印宽度 ÷ 图的像素数，所以「打印宽度」和「一格多宽」是
+        同一件事的两种说法；颜色层厚度则是 Bambu Studio 自己管的事（混色写在它的
+        3MF 里），在这里填什么都不影响那边的结果。 现在只留底板厚度，而且是**整块**
+        的厚度（含图上那一层 0.4 mm 的颜色）。
+        """
         base_index = self._base_combo.currentData()
         return PlateSettings(
-            target_width_mm=float(self._width_spin.value()),
+            cell_mm=CELL_MM,
             base_thickness_mm=float(self._base_spin.value()),
-            colour_thickness_mm=float(self._colour_spin.value()),
+            colour_thickness_mm=COLOUR_BAND_MM,
             base_index=int(base_index) if base_index is not None else -1,
             smooth_edges=bool(self._smooth_box.isChecked()),
             image_on_bottom=bool(self._side_combo.currentData()),
@@ -4314,7 +4366,7 @@ class PicturePage(QWidget):
         lines = [
             f"已生成 {written.name}",
             f"{stats['width_mm']} × {stats['depth_mm']} mm，总厚度 {stats['thickness_mm']} mm，"
-            f"像素 {stats['pixel_mm']} mm",
+            f"一格 {stats['pixel_mm']} mm",
             f"整板 1 个对象 / {stats['extruders']} 种耗材 / {stats['triangles']} 个三角面",
         ]
         lines.extend(plate.notes)
@@ -4333,7 +4385,7 @@ class PicturePage(QWidget):
         rows = [
             f"文件：{written}",
             f"尺寸：{stats['width_mm']} × {stats['depth_mm']} mm，"
-            f"底板 {plate.base_thickness_mm:g} mm + 颜色层 {plate.colour_thickness_mm:g} mm",
+            f"厚 {plate.base_thickness_mm:g} mm（图上那层颜色 {plate.colour_thickness_mm:g} mm）",
             f"整块底板是一个对象，{stats['extruders']} 种颜色涂在不同的三角面上。",
             "",
             "在 Bambu Studio 里直接打开这个文件就行：",

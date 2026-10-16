@@ -29,7 +29,7 @@ paths.data_dir = lambda: TEMP  # type: ignore[assignment]
 from app.core.image_matching import MatchSettings, build_palette, match_image  # noqa: E402
 from app.core.library import Filament, FilamentLibrary  # noqa: E402
 from app.mesh.objfile import write_obj  # noqa: E402
-from app.mesh.plate import PlateSettings, build_plate  # noqa: E402
+from app.mesh.plate import build_plate, settings_for_width  # noqa: E402
 from app.mesh.threemf import slots_from_palette, write_3mf  # noqa: E402
 
 SPOOLS = (
@@ -70,7 +70,7 @@ def main() -> int:
     result = match_image(picture, palette, MatchSettings(max_colours=12))
     print(f"matched {len(result.palette)} colours from {result.printed_pixels} solid pixels")
 
-    plate = build_plate(result, PlateSettings(target_width_mm=150.0))
+    plate = build_plate(result, settings_for_width(150.0, result.width))
     print("plate:", plate.stats())
     for note in plate.notes:
         print("note:", note)

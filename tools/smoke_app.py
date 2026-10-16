@@ -1795,8 +1795,18 @@ def main() -> int:
     # 用户按「预览的色块大小形状和原图不一样」来问，一半原因就在这一步：匹配前整张图
     # 会缩到最长边「最大边长」像素。这里把「原图比边长大」和「原图比边长小」两档都跑
     # 一遍，确认状态行、面板标题、控件的悬停提示三处都写了这件事。
-    page._max_dimension.setValue(60)
+    #
+    # 1.6.42（m15721 第 2 条）之后这档只有先导入再调小才看得到：位图一进来，「最大边长」
+    # 就跟着图片自己的像素数走，默认那个 512 不再把图悄悄缩小。
     page.loadImage(sample)
+    app.processEvents()
+    check(
+        page._max_dimension.value() == max(page._image.size),
+        f"导入位图之后「最大边长」= 图片自己的像素数（m15721 第 2 条），"
+        f"got {page._max_dimension.value()} / {page._image.size}",
+    )
+    page._max_dimension.setValue(60)
+    page._on_rematch()
     app.processEvents()
     check(
         page._original_panel.title_label.text() == "原图 160×120",
@@ -1812,8 +1822,8 @@ def main() -> int:
         "原图 160×120 → 匹配 60×45（缩小 2.7 倍）" in page._status.text(),
         f"匹配完成的状态行写明原图 → 匹配栅格，got {page._status.text()!r}",
     )
-    page._max_dimension.setValue(original_span)
-    page.loadImage(sample)
+    page._max_dimension.setValue(max(page._image.size))
+    page._on_rematch()
     app.processEvents()
     check(
         "一格就是一个原像素" in page._status.text() and "不会缩小" in page._max_dimension.toolTip(),
@@ -2036,7 +2046,8 @@ def main() -> int:
             check(
                 face_up.parts[0].z_bottom_mm == 0.0
                 and all(
-                    part.z_bottom_mm == face_up.base_thickness_mm
+                    part.z_bottom_mm
+                    == face_up.base_thickness_mm - face_up.colour_thickness_mm
                     for part in face_up.parts[1:]
                 ),
                 "顶面 is the 1.6.22 layout: base on the bed, picture on top",
@@ -2069,6 +2080,30 @@ def main() -> int:
             app.processEvents()
             check(page._side_combo.currentText() == _picture_page.IMAGE_SIDE_BOTTOM, "back to 底面")
             plate = page.buildPlate()
+
+            # --- m15721 第 3 条：板长宽 = 图的像素数 × 0.4，厚度只有一个框 ---------
+            check(
+                not hasattr(page, "_width_spin") and not hasattr(page, "_colour_spin"),
+                "「打印宽度」和「颜色层厚度」两个框都撤了（m15721 第 3 条）",
+            )
+            from app.mesh.plate import CELL_MM as _cell_mm
+
+            check(
+                abs(page._plate_settings().cell_mm - _cell_mm) < 1e-12
+                and abs(plate.width_mm - page._result.width * _cell_mm) < 1e-9,
+                f"一格固定 {_cell_mm} mm，板长宽由图片像素数决定，"
+                f"got {page._plate_settings().cell_mm} mm / {plate.width_mm} mm",
+            )
+            check(
+                abs(page._plate_settings().base_thickness_mm - page._base_spin.value()) < 1e-9
+                and abs(plate.total_thickness_mm - page._base_spin.value()) < 1e-9,
+                "「底板厚度」就是整块的厚度",
+            )
+            check(
+                "整块" in page._base_spin.toolTip() and "0.4 mm" in page._base_spin.toolTip(),
+                f"底板厚度框的提示写清整块里含图上那 0.4 mm 颜色，"
+                f"got {page._base_spin.toolTip()!r}",
+            )
 
             # --- 选中的颜色: both RGBs, the recipe, and manual replacement -------
             from app.core.image_matching import MatchSettings, sort_palette
@@ -2107,9 +2142,11 @@ def main() -> int:
                 and not page._replaced
                 and not page._merged
                 and not page._deleted
-                and not page._undo_stack
                 and not page._redo_stack,
-                "a fresh match starts with the automatic palette and no edits",
+                "a fresh match starts with the automatic palette and no edits"
+                f"（palette 一致 {page._base is not None and page._base.palette == result.palette}，"
+                f"replaced {len(page._replaced)}，merged {len(page._merged)}，"
+                f"deleted {len(page._deleted)}，redo {len(page._redo_stack)}）",
             )
             check(MatchSettings().merge_delta_e == 2.0, "near-identical matches merge by default")
 
@@ -3584,7 +3621,18 @@ def main() -> int:
 
             check(
                 page._filter_button.isEnabled() and "筛选耗材" == page._filter_button.text(),
-                "「筛选耗材」与「重新匹配」并排放在「耗材方案」面板上",
+                "「筛选耗材」还在「耗材方案」面板上",
+            )
+            # m15721 第 1 条：从前两个按钮只差「要不要重新分块」，现在只有一个 —— 分块
+            # 是软件该自己认的事，颜色重找、色块不动。
+            check(
+                not hasattr(page, "_rematch_button")
+                and page._rematch_blocks_button.text() == "按当前色块重新匹配",
+                "「重新匹配」按钮撤了，只剩「按当前色块重新匹配」",
+            )
+            check(
+                "色块的划分和编号都不动" in _picture_page.PAGE_HELP,
+                "帮助里写清这个按钮不重新分块",
             )
             check(
                 page._filter_hint.text() == "每一卷都可以用。",
@@ -3698,7 +3746,7 @@ def main() -> int:
                 not page._deleted
                 and len(page._result.palette) < keep
                 and abs(printed - opaque) < 0.01,
-                "「重新匹配」从改过的原图出发，删掉的颜色没有回来"
+                "从头匹配也从改过的原图出发，删掉的颜色没有回来"
                 f"（不透明 {opaque:.1%}、打印 {printed:.1%}、{len(page._result.palette)} 种 < {keep}）",
             )
 
@@ -3712,7 +3760,7 @@ def main() -> int:
             check(page._project_path is None, "the picture tab starts with no project file")
             # The rolls are read off the match that is on screen right now: the picture
             # has been edited since `uses` was measured (a colour delete edits 原图, so
-            # 重新匹配 no longer brings that colour back).
+            # a fresh match no longer brings that colour back).
             saving_uses = _spool_usage(page.result, library)
             page._on_save_project()
             app.processEvents()
@@ -3918,6 +3966,60 @@ def main() -> int:
             app.processEvents()
             check(page._dirty is False, "saving the reopened project works again")
 
+            # --- m15721 第 1 条：按当前色块重新匹配 —— 色块划分和编号一个都不动 ----
+            # 从前这个按钮只重新挑卷、颜色表是现成的（`_rematch_source`）。 现在它先
+            # 从改过的原图重新分色，但块还必须留在原处，块级编辑（按像素掩码）才贴得
+            # 回去；行级的「更换颜色」按旧表的行号记，新表一换就对不上，清掉。
+            page._set_pick_mode(_picture_page.PICK_EDGE, save=False)
+            app.processEvents()
+            before_blocks = page._blocks
+            before_labels = None if before_blocks is None else before_blocks.labels.copy()
+            before_count = 0 if before_blocks is None else before_blocks.count
+            before_edits = [edit.mask.copy() for edit in page._block_edits]
+            # 行级的「更换颜色」只在颜色模式里记：它标的是颜色表的第几行。
+            page._set_pick_mode(_picture_page.PICK_COLOUR, save=False)
+            app.processEvents()
+            page._list.select([0])
+            wanted = next(
+                (
+                    entry
+                    for entry in page._candidate_palette()
+                    if entry.key != page._result.palette[0].key
+                ),
+                None,
+            )
+            check(wanted is not None, "有一款和第一行不同的耗材可以换上")
+            real_picker = _picture_page.ColourPickerDialog
+            _picture_page.ColourPickerDialog = lambda *args, **kwargs: _StubDialog(0, wanted)
+            try:
+                page._on_replace()
+                app.processEvents()
+            finally:
+                _picture_page.ColourPickerDialog = real_picker
+            check(bool(page._replaced), "行级的「更换颜色」记下了（下面要看它被清掉）")
+            page._on_rematch_blocks()
+            app.processEvents()
+            page._set_pick_mode(_picture_page.PICK_EDGE, save=False)
+            app.processEvents()
+            after_blocks = page._blocks
+            check(
+                after_blocks is not None
+                and after_blocks.count == before_count
+                and _np.array_equal(after_blocks.labels, before_labels),
+                f"色块的划分和编号一块都没动（{before_count} 块）",
+            )
+            check(
+                not page._replaced,
+                f"行级的「更换颜色」清掉了，got {len(page._replaced)} 条",
+            )
+            check(
+                len(page._block_edits) == len(before_edits)
+                and all(
+                    _np.array_equal(edit.mask, mask)
+                    for edit, mask in zip(page._block_edits, before_edits)
+                ),
+                "块级改动（按像素掩码）原样留着",
+            )
             # --- no menu bar left, and 帮助 is a button (m08102 item 6, renamed
             # by m01885 item 5; m01885 items 6/8 moved the explanations into it) ---
             from PySide6.QtWidgets import QMenuBar as _QMenuBar  # noqa: PLC0415

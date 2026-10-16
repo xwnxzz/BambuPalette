@@ -30,6 +30,7 @@ from app.core.blocks import (  # noqa: E402
     MIN_BLOCK_SHARE,
     label_blocks,
     min_block_pixels,
+    revalue_blocks,
 )
 
 
@@ -378,6 +379,60 @@ class ColourCoverageTests(unittest.TestCase):
         blocks = label_blocks(grid, min_pixels=2, keep_colours=True)
         self.assertEqual(blocks.count, 2)
         self.assertEqual(blocks.sizes.tolist(), [4, 4])
+
+
+class RevalueTests(unittest.TestCase):
+    """「按当前色块重新匹配」的色块不动那一半（m15721 第 1 条）。
+
+    那个按钮按一次要重新分色，但划分和编号不许动：用户点过、改过的块还在原处。
+    :func:`revalue_blocks` 就是拿旧划分和新分色拼一块出来——块数、掩码、顺序照旧，
+    只有每块打哪一色按新结果重算。
+    """
+
+    def test_the_partition_survives_a_new_colour_map(self):
+        old = _grid(
+            """
+            AABB
+            AABB
+            """
+        )
+        before = label_blocks(old, min_pixels=0)
+        # 同一张形状，颜色换了：A 区现在算 B，B 区现在算 C（_grid 按字母序编号，B=0、C=1）。
+        new = _grid(
+            """
+            BBCC
+            BBCC
+            """
+        )
+        after = revalue_blocks(before.labels, new, previous=before)
+        self.assertEqual(after.count, before.count)
+        self.assertTrue(np.array_equal(after.labels, before.labels))
+        self.assertEqual(after.sizes.tolist(), before.sizes.tolist())
+        self.assertEqual(after.values.tolist(), [0, 1])
+
+    def test_it_keeps_the_colour_of_a_block_that_is_now_empty(self):
+        old = _grid(
+            """
+            AA
+            AB
+            """
+        )
+        before = label_blocks(old, min_pixels=0)
+        # 新分色把 B 那一格算成了透明：块还在，颜色留成它原来的那一种，不凭空发明。
+        new = _grid(
+            """
+            AA
+            A.
+            """
+        )
+        after = revalue_blocks(before.labels, new, previous=before)
+        self.assertEqual(after.count, before.count)
+        self.assertEqual(after.values.tolist(), before.values.tolist())
+
+    def test_a_different_size_is_refused_instead_of_guessed(self):
+        labels = label_blocks(_grid("AB\nAB"), min_pixels=0).labels
+        with self.assertRaises(ValueError):
+            revalue_blocks(labels, np.zeros((3, 2), dtype=np.int32))
 
 
 if __name__ == "__main__":  # pragma: no cover

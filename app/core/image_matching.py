@@ -2748,7 +2748,7 @@ def plan_caption(key: str) -> tuple[str, str]:
         if spec_key != base:
             continue
         return title, note
-    return "工程里存的那一套", "保存工程时用的搭配；点「重新匹配」可以再挑一套。"
+    return "工程里存的那一套", "保存工程时用的搭配；点「按当前色块重新匹配」可以再挑一套。"
 
 
 def plan_help() -> str:
@@ -2775,8 +2775,8 @@ def plan_help() -> str:
         "名称只说明它是按什么标准挑出来的。"
     )
     lines.append(
-        f"· 不点名的时候用第一行（{_PLAN_SPECS[0][1]}）：「重新匹配」和打开工程时没带方案的图"
-        "都落在这一行；想要别的口径，点那一行再按下面的「用这一套」就行。"
+        f"· 不点名的时候用第一行（{_PLAN_SPECS[0][1]}）：「按当前色块重新匹配」和打开工程时没带"
+        "方案的图都落在这一行；想要别的口径，点那一行再按下面的「用这一套」就行。"
     )
     return "\n".join(lines)
 

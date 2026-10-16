@@ -37,6 +37,7 @@ from app.mesh.plate import (  # noqa: E402
     prism_mesh,
     rectangles,
     run_rectangles,
+    settings_for_width,
     signed_volume,
     smooth_factor,
     smooth_indices,
@@ -236,11 +237,11 @@ class SmoothingTests(unittest.TestCase):
             (
                 build_plate(
                     result,
-                    PlateSettings(target_width_mm=100.0, image_on_bottom=False, smooth_edges=False),
+                    settings_for_width(100.0, self.result.width, image_on_bottom=False, smooth_edges=False),
                 ),
                 False,
             ),
-            (build_plate(result, PlateSettings(target_width_mm=100.0, image_on_bottom=False)), True),
+            (build_plate(result, settings_for_width(100.0, self.result.width, image_on_bottom=False)), True),
         )
         for plate, expected in plates:
             offset = 0.0
@@ -257,7 +258,7 @@ class SmoothingTests(unittest.TestCase):
             )
 
     def test_a_smooth_plate_is_still_one_closed_solid(self):
-        plate = build_plate(self.result, PlateSettings(target_width_mm=100.0))
+        plate = build_plate(self.result, settings_for_width(100.0, self.result.width))
         points, faces, _ = plate_mesh(plate)
         boundary, non_manifold = edge_health(points, faces)
         self.assertEqual(boundary, 0, "圆滑之后组装起来还是要闭合")
@@ -266,9 +267,9 @@ class SmoothingTests(unittest.TestCase):
 
     def test_smoothing_keeps_the_width_and_the_area(self):
         coarse = build_plate(
-            self.result, PlateSettings(target_width_mm=100.0, smooth_edges=False)
+            self.result, settings_for_width(100.0, self.result.width, smooth_edges=False)
         )
-        smooth = build_plate(self.result, PlateSettings(target_width_mm=100.0))
+        smooth = build_plate(self.result, settings_for_width(100.0, self.result.width))
         self.assertAlmostEqual(smooth.width_mm, 100.0, places=9)
         self.assertAlmostEqual(smooth.depth_mm, coarse.depth_mm, places=9)
         self.assertAlmostEqual(
@@ -279,7 +280,7 @@ class SmoothingTests(unittest.TestCase):
 
     def test_turning_smoothing_off_reproduces_1_6_21(self):
         plate = build_plate(
-            self.result, PlateSettings(target_width_mm=100.0, smooth_edges=False)
+            self.result, settings_for_width(100.0, self.result.width, smooth_edges=False)
         )
         self.assertAlmostEqual(plate.pixel_size_mm, 100.0 / self.result.width, places=9)
         self.assertFalse(any("圆滑" in note for note in plate.notes), plate.notes)
@@ -352,7 +353,7 @@ class PlateTests(unittest.TestCase):
         self.result = match_image(_quadrant_image(20), self.palette, MatchSettings(max_colours=8))
 
     def test_parts_are_the_base_plus_every_colour(self):
-        plate = build_plate(self.result, PlateSettings(target_width_mm=100.0))
+        plate = build_plate(self.result, settings_for_width(100.0, self.result.width))
         self.assertEqual(len(plate.parts), 1 + len(self.result.palette))
         self.assertEqual(plate.parts[0].name, "底板")
         self.assertEqual(plate.extruder_count, len(self.result.palette))
@@ -366,18 +367,21 @@ class PlateTests(unittest.TestCase):
 
     def test_the_picture_can_print_face_up_instead(self):
         plate = build_plate(
-            self.result, PlateSettings(target_width_mm=100.0, image_on_bottom=False)
+            self.result, settings_for_width(100.0, self.result.width, image_on_bottom=False)
         )
+        # 图印在顶面：底板色那段从 0 到「整块厚度 − 颜色层」，颜色层压在它上面
+        # （1.6.42 起 base_thickness_mm 是整块，所以这段的顶面不再等于它）。
+        base_top = plate.base_thickness_mm - plate.colour_thickness_mm
         self.assertEqual(plate.parts[0].z_bottom_mm, 0.0)
-        self.assertAlmostEqual(plate.parts[0].z_top_mm, plate.base_thickness_mm, places=9)
+        self.assertAlmostEqual(plate.parts[0].z_top_mm, base_top, places=9)
         for part in plate.parts[1:]:
-            self.assertAlmostEqual(part.z_bottom_mm, plate.base_thickness_mm, places=9)
+            self.assertAlmostEqual(part.z_bottom_mm, base_top, places=9)
             self.assertAlmostEqual(part.z_top_mm, plate.total_thickness_mm, places=9)
 
     def test_the_two_sides_are_mirror_images_of_each_other(self):
-        down = build_plate(self.result, PlateSettings(target_width_mm=100.0))
+        down = build_plate(self.result, settings_for_width(100.0, self.result.width))
         up = build_plate(
-            self.result, PlateSettings(target_width_mm=100.0, image_on_bottom=False)
+            self.result, settings_for_width(100.0, self.result.width, image_on_bottom=False)
         )
         thickness = down.total_thickness_mm
         self.assertEqual(len(down.parts), len(up.parts))
@@ -404,7 +408,7 @@ class PlateTests(unittest.TestCase):
             with self.subTest(face_down=face_down):
                 plate = build_plate(
                     self.result,
-                    PlateSettings(target_width_mm=100.0, image_on_bottom=face_down),
+                    settings_for_width(100.0, self.result.width, image_on_bottom=face_down),
                 )
                 points, faces, _tags = plate_mesh(plate)
                 self.assertEqual(edge_health(points, faces), (0, 0))
@@ -423,28 +427,38 @@ class PlateTests(unittest.TestCase):
         plate = build_plate(self.result, PlateSettings(base_index=2))
         self.assertEqual(plate.parts[0].extruder, 3)
 
-    def test_geometry_scales_with_the_target_width(self):
-        narrow = build_plate(self.result, PlateSettings(target_width_mm=80.0))
-        wide = build_plate(self.result, PlateSettings(target_width_mm=160.0))
-        self.assertAlmostEqual(narrow.width_mm, 80.0, places=9)
-        self.assertAlmostEqual(wide.width_mm, 160.0, places=9)
+    def test_geometry_scales_with_the_cell_size(self):
+        # 一格多宽是唯一的尺度：板长宽 = 图片像素数 × 一格。
+        narrow = build_plate(self.result, PlateSettings(cell_mm=1.0))
+        wide = build_plate(self.result, PlateSettings(cell_mm=2.0))
+        self.assertAlmostEqual(narrow.width_mm, float(self.result.width), places=9)
+        self.assertAlmostEqual(wide.width_mm, 2.0 * self.result.width, places=9)
         self.assertAlmostEqual(wide.pixel_size_mm, narrow.pixel_size_mm * 2.0, places=9)
         # Twice the width means four times the area at the same thicknesses.
         self.assertAlmostEqual(wide.volume_mm3, narrow.volume_mm3 * 4.0, places=6)
 
-    def test_the_footprint_is_capped(self):
-        plate = build_plate(self.result, PlateSettings(target_width_mm=100.0, max_footprint_mm=30.0))
-        self.assertLessEqual(plate.depth_mm, 30.0 + 1e-9)
-        self.assertTrue(any("打印范围" in note for note in plate.notes))
+    def test_the_plate_is_not_shrunk_to_fit_a_build_volume(self):
+        """m15721 第 3 条：不限制大小，允许超出。
 
-    def test_a_fine_print_resolution_is_reported(self):
-        # ``PlateSettings.clamped`` floors the target width at 10 mm, so ask for a
-        # coarser nozzle instead of a narrower plate.
-        plate = build_plate(
-            self.result,
-            PlateSettings(target_width_mm=10.0, min_pixel_mm=0.9),
+        从前超过 250 mm 打印范围会自动缩进去，还附一句「打印范围」的提示；用户要求
+        不要这一手 —— 板长宽就是图片像素数 × 一格，塞不塞得下由切片器去说。
+        """
+        # 用一张大点的图，让 5 mm 一格真的把板顶到 250 mm 以外去。
+        wide = match_image(
+            _quadrant_image(64), self.palette, MatchSettings(max_colours=4)
         )
-        self.assertTrue(any("喷嘴" in note for note in plate.notes), plate.notes)
+        plate = build_plate(wide, PlateSettings(cell_mm=5.0))
+        self.assertAlmostEqual(plate.width_mm, 5.0 * wide.width, places=9)
+        self.assertGreater(plate.width_mm, 250.0)
+        self.assertFalse(any("打印范围" in note for note in plate.notes), plate.notes)
+
+    def test_a_thin_base_layer_is_reported(self):
+        """整块太薄时提醒一句：颜色层那 0.4 mm 之外，底板色那段也得有肉。
+
+        1.6.42 起一格固定 :data:`CELL_MM`，「像素比喷嘴细」那条提示没有了。
+        """
+        plate = build_plate(self.result, PlateSettings(base_thickness_mm=0.6))
+        self.assertTrue(any("底板色那段" in note for note in plate.notes), plate.notes)
 
     def test_the_whole_plate_is_one_closed_outward_solid(self):
         """The plate is a single manifold solid, not a stack of closed prisms.
@@ -454,7 +468,7 @@ class PlateTests(unittest.TestCase):
         welding the parts back together (which is what an importing slicer does
         before it counts anything) gives a closed surface with no interior walls.
         """
-        plate = build_plate(self.result, PlateSettings(target_width_mm=100.0))
+        plate = build_plate(self.result, settings_for_width(100.0, self.result.width))
         points, faces, extruders = plate_mesh(plate)
         self.assertEqual(len(faces), plate.triangle_count)
         self.assertEqual(len(extruders), len(faces))
@@ -470,7 +484,7 @@ class PlateTests(unittest.TestCase):
         1.6.22 起默认「圆滑色块」，网格比图片像素细一档，``plate.pixel_size_mm``
         报的是模型自己那一格；所以这里按**面积**对账，也就是「印出来的面积 × 总厚度」。
         """
-        plate = build_plate(self.result, PlateSettings(target_width_mm=100.0))
+        plate = build_plate(self.result, settings_for_width(100.0, self.result.width))
         points, faces, _ = plate_mesh(plate)
         printed = sum(part.region_pixels for part in plate.parts[1:])
         expected = printed * plate.pixel_size_mm**2 * plate.total_thickness_mm
@@ -483,7 +497,7 @@ class PlateTests(unittest.TestCase):
         the polygon's own boundary; they inflate both the open-edge and the
         non-manifold-edge count and are what Bambu Studio reported.
         """
-        plate = build_plate(self.result, PlateSettings(target_width_mm=100.0))
+        plate = build_plate(self.result, settings_for_width(100.0, self.result.width))
         points, faces, _ = plate_mesh(plate)
         corners = points[faces]
         areas = np.linalg.norm(
@@ -539,7 +553,7 @@ class PlateTests(unittest.TestCase):
         )
 
     def test_stats_describe_the_plate(self):
-        plate = build_plate(self.result, PlateSettings(target_width_mm=100.0))
+        plate = build_plate(self.result, settings_for_width(100.0, self.result.width))
         stats = plate.stats()
         self.assertEqual(stats["parts"], 1 + len(self.result.palette))
         self.assertEqual(stats["extruders"], len(self.result.palette))

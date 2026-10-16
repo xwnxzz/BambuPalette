@@ -729,7 +729,9 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     )
     _span = page._max_dimension.value()
     page._max_dimension.setValue(60)
-    page.loadImage(picture)
+    # 1.6.42（m15721 第 2 条）之后导入图片会把「最大边长」设成图片自己的像素数，所以
+    # 想缩小只能先导入、再调小，然后按那个按钮重算一遍（它从原图重新分色）。
+    page._on_rematch_blocks()
     app.processEvents()
     check(
         "原图 160×120 → 匹配 60×45（缩小 2.7 倍）" in page._status.text()
@@ -738,7 +740,7 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         f"got {page._status.text()!r} / {page._max_dimension.toolTip()!r}",
     )
     page._max_dimension.setValue(_span)
-    page.loadImage(picture)
+    page._on_rematch_blocks()
     app.processEvents()
 
     # m00519 #2: 「原图 / 预览」用滚轮缩放、按住左键拖动平移、双击还原成整张。
@@ -2475,8 +2477,9 @@ def run_selftest(*, report_path: Path | None = None) -> int:
             f"按当前色块重新匹配给出 {len(page._plans)} 套搭配，并显示第一套",
         )
         check(
-            0 < len(page._base.palette) <= keep_count - 1,
-            f"色块不会变多（{len(page._base.palette)} 块，删除前 {keep_count} 块）",
+            0 < len(page._base.palette) <= page._settings().max_colours,
+            f"颜色重找之后行数不超过「颜色数量」上限（{len(page._base.palette)} 种 / "
+            f"上限 {page._settings().max_colours}，按下之前 {keep_count} 种）",
         )
         # m11985: 色块是用户自己的决定，一次按下不许把两块悄悄并成一块 —— 再按一次，
         # 颜色和行数都必须原样。用户的猪第二次按下把眼睛印成皮肤色，就是「合成一块 +
@@ -2667,7 +2670,8 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         check(
             abs(face_up.parts[0].z_bottom_mm) < 1e-9
             and all(
-                abs(part.z_bottom_mm - face_up.base_thickness_mm) < 1e-9
+                abs(part.z_bottom_mm - (face_up.base_thickness_mm - face_up.colour_thickness_mm))
+                < 1e-9
                 for part in face_up.parts[1:]
             ),
             f"顶面：底板在下，色块层压在上面（{face_up.parts[1].z_bottom_mm:.2f} mm 起）",
@@ -2708,6 +2712,33 @@ def run_selftest(*, report_path: Path | None = None) -> int:
             "换回底面之后一切都回去了",
         )
         plate = page.buildPlate()
+
+        # 1.6.42（m15721 第 3 条）：一格的尺寸固定 0.4 mm（就是 0.4 喷嘴的宽度），板的长宽
+        # 由图片的像素数推出来，不再有「打印宽度」和「颜色层厚度」两个框；「底板厚度」是
+        # 整块的厚度，里面含图上那 0.4 mm 颜色。
+        from .mesh.plate import CELL_MM as _cell_mm
+
+        check(
+            not hasattr(page, "_width_spin") and not hasattr(page, "_colour_spin"),
+            "「打印宽度」和「颜色层厚度」两个框都撤了（m15721 第 3 条）",
+        )
+        check(
+            abs(page._plate_settings().cell_mm - _cell_mm) < 1e-12
+            and abs(plate.width_mm - page.result.width * _cell_mm) < 1e-9
+            and abs(plate.depth_mm - page.result.height * _cell_mm) < 1e-9,
+            f"一格 {_cell_mm} mm，板长宽 = 图片像素数 × {_cell_mm}"
+            f"（量到 {page._plate_settings().cell_mm:.3f} mm、"
+            f"{plate.width_mm:.1f} × {plate.depth_mm:.1f} mm）",
+        )
+        check(
+            abs(plate.total_thickness_mm - page._base_spin.value()) < 1e-9
+            and abs(page._plate_settings().base_thickness_mm - page._base_spin.value()) < 1e-9,
+            f"「底板厚度」就是整块的厚度（{plate.total_thickness_mm:.2f} mm）",
+        )
+        check(
+            all("颜色层" not in note for note in plate.notes),
+            f"厚度提醒说的是底板色那一段，不再提颜色层（{plate.notes}）",
+        )
 
         three_mf = write_3mf(
             plate,

@@ -94,6 +94,43 @@ def label_blocks(
     return BlockMap(labels=labels, sizes=sizes, values=_block_values(work, labels, len(sizes)))
 
 
+def revalue_blocks(
+    labels: np.ndarray, indices: np.ndarray, *, previous: BlockMap | None = None
+) -> BlockMap:
+    """同一份色块划分，按新的分色结果重算每块打哪一色（m15721 第 1 条）。
+
+    「按当前色块重新匹配」按一次要重新分色，但色块的划分和编号不许动：用户在色块模式里
+    点过、改过的那些块还得在原处，块级编辑（按像素掩码）才贴得回去。 所以这里拿旧划分
+    的标签图 ``labels`` 和新分色的索引图 ``indices`` 拼一份 :class:`BlockMap`：块数和
+    编号照旧，每块的颜色仍按 :func:`_block_values` 那条规矩取 —— 光栅序里第一个像素的
+    颜色，和没重新分色时一样，块的颜色不会因为换了一套分色就换个取法。
+
+    ``previous`` 是这几块本来的那份 :class:`BlockMap`：新分色里某一块的格子全成了「不
+    打印」（``-1``）时，它没有颜色可取了，就留本来那一种，而不是从别人那里顺手拿一个。
+
+    尺寸对不上（用户改过「最大边长」）就别调这个：那样两套块根本不是同一张图上的东西，
+    调用方该退回重新分块。
+    """
+    grid = np.asarray(indices)
+    tag = np.asarray(labels)
+    if grid.shape != tag.shape:
+        raise ValueError("色块划分和新的分色结果不是同一个尺寸。")
+    count = int(tag.max()) + 1 if tag.size else 0
+    sizes = np.bincount(
+        tag[tag >= 0].ravel(), minlength=max(0, count)
+    )[:count].astype(np.int64)
+    values = _block_values(grid.astype(np.int32, copy=False), tag, count)
+    if previous is not None and count:
+        # 这一块在新分色里还有没有一格是有颜色的？ 没有就留原来那一种。
+        live = np.bincount(tag[grid >= 0].ravel(), minlength=count)[:count]
+        silent = live == 0
+        keep = np.asarray(previous.values)
+        limit = min(count, int(keep.size))
+        if silent[:limit].any():
+            values[:limit] = np.where(silent[:limit], keep[:limit], values[:limit])
+    return BlockMap(labels=tag.copy(), sizes=sizes, values=values.astype(np.int32))
+
+
 def _keep_every_colour(
     work: np.ndarray, labels: np.ndarray, sizes: np.ndarray, original: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:

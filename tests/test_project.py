@@ -128,7 +128,9 @@ class ProjectRoundTripTests(unittest.TestCase):
             image_name="测试图",
             base=base,
             library=library,
-            plate=PlateSettings(target_width_mm=120.0, base_thickness_mm=1.0, base_index=1),
+            plate=PlateSettings(
+                cell_mm=2.0, base_thickness_mm=1.0, base_index=1
+            ),
             version="9.9.9",
         )
         self.assertTrue(written.name.endswith(PROJECT_SUFFIX), written)
@@ -153,7 +155,7 @@ class ProjectRoundTripTests(unittest.TestCase):
         self.assertEqual(state.base.settings.max_spools, 2)
         self.assertEqual(state.base.settings.max_dimension, 64)
         self.assertFalse(state.base.settings.dither)
-        self.assertEqual(state.plate.target_width_mm, 120.0)
+        self.assertEqual(state.plate.cell_mm, 2.0)
         self.assertEqual(state.plate.base_thickness_mm, 1.0)
         # The base colour was saved as a hex, because a palette position means
         # nothing after the user deletes a colour or swaps one out.
@@ -186,6 +188,48 @@ class ProjectRoundTripTests(unittest.TestCase):
                     payload = json.dumps(document, ensure_ascii=False).encode("utf-8")
                 target.writestr(name, payload)
         self.assertEqual(load_project(older, library=library).plan, "")
+
+    def test_an_older_project_keeps_its_total_thickness(self):
+        """1.6.41 及以前的工程：那是「底板色 + 颜色层」两个数，整块是两者之和。
+
+        1.6.42（m15721 第 3 条）起 ``base_thickness_mm`` 是**整块**的厚度，读盘时按和
+        换算，所以升级前后打出来的厚度一模一样。 那时候记的「打印宽度」不再认：板长宽
+        = 图片像素数 × 一格（0.4 mm），所以文件里那些键丢掉、cell_mm 用默认值。
+        """
+        library = _library()
+        written = save_project(
+            self._dir / "oldplate",
+            image=_picture(),
+            image_name="旧板",
+            base=_base_match(library),
+            library=library,
+            plate=PlateSettings(smooth_edges=False, image_on_bottom=False),
+        )
+        older = self._dir / "oldplate-1.6.41.bpproj"
+        with zipfile.ZipFile(written) as source, zipfile.ZipFile(
+            older, "w", zipfile.ZIP_DEFLATED
+        ) as target:
+            for name in source.namelist():
+                payload = source.read(name)
+                if name == "工程.json":
+                    document = json.loads(payload.decode("utf-8"))
+                    document["plate"] = {
+                        "target_width_mm": 120.0,
+                        "base_thickness_mm": 0.8,
+                        "colour_thickness_mm": 0.6,
+                        "max_footprint_mm": 250.0,
+                        "min_pixel_mm": 0.35,
+                        "smooth_edges": False,
+                        "image_on_bottom": False,
+                    }
+                    payload = json.dumps(document, ensure_ascii=False).encode("utf-8")
+                target.writestr(name, payload)
+        plate = load_project(older, library=library).plate
+        self.assertAlmostEqual(plate.base_thickness_mm, 1.4)
+        self.assertAlmostEqual(plate.colour_thickness_mm, 0.4)
+        self.assertAlmostEqual(plate.cell_mm, 0.4)
+        self.assertFalse(plate.smooth_edges)
+        self.assertFalse(plate.image_on_bottom)
 
     def test_the_edited_picture_and_its_badge_survive_the_round_trip(self):
         # 1.6.19 (m01566 的答复): 删除/合并 改的是原图本身，文件里存的就是改过的那张；
