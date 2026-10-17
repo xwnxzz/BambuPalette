@@ -70,6 +70,7 @@ from PySide6.QtWidgets import (
 
 from .. import __version__
 from ..core import paths
+from ..core.atomicio import atomic_path
 from ..core.blocks import BlockMap, label_blocks, min_block_pixels, revalue_blocks
 from ..core.image_matching import (
     BudgetOption,
@@ -2461,7 +2462,10 @@ class PicturePage(QWidget):
         if target.suffix.lower() != ".png":
             target = target.with_suffix(".png")
         try:
-            self._image.save(target)
+            # 先写临时文件再改名（1.6.50）：用户很可能就选了上次导出的那一张，直接
+            # 写会在中途出错时把原来那份弄成半张 PNG。
+            with atomic_path(target) as temporary:
+                self._image.save(temporary, format="PNG")
         except Exception as error:  # pragma: no cover - the dialog is interactive
             QMessageBox.warning(self, "导出原图失败", str(error))
             return

@@ -299,6 +299,24 @@ class SettingsFallbackTests(DataDirTestCase):
         self.assertEqual(settings.load_settings()["engine"], "spectral")
         self.assertEqual(settings.settings_path(), self.root / "BambuPalette" / "settings.json")
 
+    def test_a_failed_settings_save_keeps_the_previous_file(self) -> None:
+        """顶替那一步失败时，原来那份偏好一个字节都不能丢（1.6.50）。"""
+        from app.core import atomicio, settings
+
+        self.env(LOCALAPPDATA=self.root)
+        settings.save_settings({"engine": "spectral"})
+        target = settings.settings_path()
+        before = target.read_text(encoding="utf-8")
+
+        with mock.patch.object(
+            atomicio.os, "replace", side_effect=PermissionError(13, "被别的程序占着")
+        ):
+            with self.assertRaises(OSError):
+                settings.save_settings({"engine": "srgb"})
+
+        self.assertEqual(target.read_text(encoding="utf-8"), before)
+        self.assertEqual(settings.load_settings()["engine"], "spectral")
+
     def test_an_unknown_engine_id_is_ignored(self) -> None:
         from app.core import settings
 

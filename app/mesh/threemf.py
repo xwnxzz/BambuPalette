@@ -59,6 +59,7 @@ from typing import Mapping, Sequence
 from xml.sax.saxutils import escape
 
 from .. import __version__
+from ..core.atomicio import atomic_path
 from .plate import PlateModel
 
 __all__ = [
@@ -781,7 +782,6 @@ def write_3mf(
     target = Path(path)
     if target.suffix.lower() != ".3mf":
         target = target.with_suffix(".3mf")
-    target.parent.mkdir(parents=True, exist_ok=True)
 
     # Centre the footprint on the bed.  The plate is built in millimetres with
     # its own origin at a corner, so the shift is half the leftover space.
@@ -802,37 +802,46 @@ def write_3mf(
             f"超过 Bambu Studio 能识别的 {MAX_PAINTED_FILAMENTS} 种。"
         )
 
-    with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("[Content_Types].xml", CONTENT_TYPES)
-        archive.writestr("_rels/.rels", RELS)
-        archive.writestr(
-            "3D/3dmodel.model", _model_document(painted, translate, project.slots)
-        )
-        archive.writestr(
-            "Metadata/model_settings.config",
-            _model_settings(painted, name, project.count),
-        )
-        # The project config is what carries the colours — and the recipes behind
-        # the mixed ones — into Bambu Studio's own filament list.  See the
-        # comment above for what it has to contain.
-        archive.writestr(
-            "Metadata/project_settings.config",
-            _project_settings(project.slots, project.mixed),
-        )
-        archive.writestr(
-            "Metadata/filament_sequence.json",
-            json.dumps(
-                {"plate_1": {"nozzle_sequence": [], "optimal_assignment": [], "sequence": []}}
-            ),
-        )
-        archive.writestr(
-            "Metadata/slice_info.config",
-            '<?xml version="1.0" encoding="UTF-8"?>\n'
-            "<config><header>"
-            # Free-text provenance.  Bambu Studio writes "slicer" here; naming
-            # the real program costs nothing, because nothing reads this field.
-            f'<header_item key="X-BBL-Client-Type" value="{_attr(THREEMF_GENERATOR)}" />'
-            f'<header_item key="X-BBL-Client-Version" value="{_attr(THREEMF_APP_VERSION)}" />'
-            "</header></config>\n",
-        )
+    # 先写同目录的临时文件再改名（1.6.50）：导出常常是覆盖上一次那份，直接以写入
+    # 模式打开目标文件，中途出错就只剩一个被截断的 3MF。
+    with atomic_path(target) as temporary:
+        with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("[Content_Types].xml", CONTENT_TYPES)
+            archive.writestr("_rels/.rels", RELS)
+            archive.writestr(
+                "3D/3dmodel.model", _model_document(painted, translate, project.slots)
+            )
+            archive.writestr(
+                "Metadata/model_settings.config",
+                _model_settings(painted, name, project.count),
+            )
+            # The project config is what carries the colours — and the recipes behind
+            # the mixed ones — into Bambu Studio's own filament list.  See the
+            # comment above for what it has to contain.
+            archive.writestr(
+                "Metadata/project_settings.config",
+                _project_settings(project.slots, project.mixed),
+            )
+            archive.writestr(
+                "Metadata/filament_sequence.json",
+                json.dumps(
+                    {
+                        "plate_1": {
+                            "nozzle_sequence": [],
+                            "optimal_assignment": [],
+                            "sequence": [],
+                        }
+                    }
+                ),
+            )
+            archive.writestr(
+                "Metadata/slice_info.config",
+                '<?xml version="1.0" encoding="UTF-8"?>\n'
+                "<config><header>"
+                # Free-text provenance.  Bambu Studio writes "slicer" here; naming
+                # the real program costs nothing, because nothing reads this field.
+                f'<header_item key="X-BBL-Client-Type" value="{_attr(THREEMF_GENERATOR)}" />'
+                f'<header_item key="X-BBL-Client-Version" value="{_attr(THREEMF_APP_VERSION)}" />'
+                "</header></config>\n",
+            )
     return target

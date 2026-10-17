@@ -20,6 +20,7 @@ import json
 from pathlib import Path
 
 from . import paths
+from .atomicio import atomic_write_text
 from .engines import DEFAULT_ENGINE, resolve_engine_id
 
 __all__ = [
@@ -109,7 +110,9 @@ def save_settings(values: dict) -> Path:
     merged["version"] = SETTINGS_VERSION
     target = settings_path()
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(
-        json.dumps(merged, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    # 先写临时文件再改名（1.6.50）：偏好是一份小 JSON，但被截断也等于「设置全丢」，
+    # 而这条路径在窗口构造与每次切页时都会走到。
+    atomic_write_text(
+        target, json.dumps(merged, ensure_ascii=False, indent=2) + "\n"
     )
     return target

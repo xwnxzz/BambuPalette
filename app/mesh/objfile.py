@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from ..core.atomicio import atomic_path
 from .plate import PlateModel, merge_parts
 
 __all__ = ["write_obj"]
@@ -74,8 +75,9 @@ def write_obj(plate: PlateModel, path: str | Path) -> Path:
         *face_lines,
         "",
     ]
-    target.write_text("\n".join(body), encoding="utf-8")
-
+    # 两份都先写临时文件、都写完才改名（1.6.50）：导出常常是覆盖上一次那一对，直接以
+    # 写入模式打开目标文件，中途出错就只剩半份。内层先退出 ⇒ .mtl 先到位，外层 .obj
+    # 随后 ⇒ .obj 永远不会指向一份还没写好的 .mtl。
     mtl_lines = ["# BambuPalette — one material per colour region", ""]
     for part in plate.parts:
         red, green, blue = _rgb_floats(part.color_hex)
@@ -92,5 +94,8 @@ def write_obj(plate: PlateModel, path: str | Path) -> Path:
                 "",
             ]
         )
-    target.with_suffix(".mtl").write_text("\n".join(mtl_lines), encoding="utf-8")
+    with atomic_path(target) as obj_temporary:
+        obj_temporary.write_text("\n".join(body), encoding="utf-8")
+        with atomic_path(target.with_suffix(".mtl")) as mtl_temporary:
+            mtl_temporary.write_text("\n".join(mtl_lines), encoding="utf-8")
     return target

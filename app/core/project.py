@@ -35,6 +35,7 @@ from PIL import Image
 
 from ..mesh.plate import PlateSettings, smooth_factor, smooth_indices
 from ..spectral import color as _color
+from .atomicio import atomic_path
 from .image_matching import (
     MatchResult,
     MatchSettings,
@@ -429,18 +430,21 @@ def save_project(
     )
 
     preview_image = preview if preview is not None else render_preview(shown)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr(_DOCUMENT, json.dumps(document, ensure_ascii=False, indent=2))
-        archive.writestr(_INDICES, _indices_bytes(base.indices))
-        if layer is not None:
-            archive.writestr(_LAYER, _indices_bytes(layer))
-        source_buffer = io.BytesIO()
-        image.convert("RGBA").save(source_buffer, format="PNG")
-        archive.writestr(_SOURCE, source_buffer.getvalue())
-        preview_buffer = io.BytesIO()
-        preview_image.convert("RGBA").save(preview_buffer, format="PNG")
-        archive.writestr(_PREVIEW, preview_buffer.getvalue())
+    # 先写同目录的临时文件，写完再改名顶上去（1.6.50）。这份工程多半是在**覆盖**用户
+    # 原来那份：直接以写入模式打开目标文件，中途出错（磁盘满、盘被拔、异常）留下的是一个
+    # 被截断的旧档，用户原来存的编辑就没了。
+    with atomic_path(target) as temporary:
+        with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr(_DOCUMENT, json.dumps(document, ensure_ascii=False, indent=2))
+            archive.writestr(_INDICES, _indices_bytes(base.indices))
+            if layer is not None:
+                archive.writestr(_LAYER, _indices_bytes(layer))
+            source_buffer = io.BytesIO()
+            image.convert("RGBA").save(source_buffer, format="PNG")
+            archive.writestr(_SOURCE, source_buffer.getvalue())
+            preview_buffer = io.BytesIO()
+            preview_image.convert("RGBA").save(preview_buffer, format="PNG")
+            archive.writestr(_PREVIEW, preview_buffer.getvalue())
     return target
 
 

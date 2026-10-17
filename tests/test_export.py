@@ -19,6 +19,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 import numpy as np
 from PIL import Image
@@ -31,6 +32,7 @@ from app.core.engines import ENGINE_BAMBU  # noqa: E402
 from app.core.image_matching import MatchSettings, build_palette, match_image  # noqa: E402
 from app.core.library import Filament, FilamentLibrary  # noqa: E402
 from app.core.mixes import MixCatalog  # noqa: E402
+from app.mesh import objfile, threemf  # noqa: E402
 from app.mesh.objfile import write_obj  # noqa: E402
 from app.mesh.plate import (  # noqa: E402
     PlateSettings,
@@ -86,6 +88,11 @@ def _quadrant_image(size: int = 20) -> Image.Image:
     return image
 
 
+def _leftover_temporaries(folder: Path) -> list[Path]:
+    """落盘用到的一半文件：名字里带 ``.tmp`` 的都不该留下。"""
+    return sorted(Path(folder).rglob("*.tmp"))
+
+
 class ExportTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.library = _library()
@@ -107,6 +114,23 @@ class ThreeMfTests(ExportTestCase):
         path = write_3mf(self.plate, self.tmp / "no-extension")
         self.assertEqual(path.suffix, ".3mf")
         self.assertTrue(zipfile.is_zipfile(path))
+
+    def test_a_failed_export_keeps_the_previous_file(self):
+        """覆盖上一次那份导出时，中途出错不能把旧的 3MF 弄成半截（1.6.50）。"""
+        path = self._write()
+        before = path.read_bytes()
+
+        def explode(*args, **kwargs):
+            raise OSError("磁盘满了")
+
+        # _model_settings 是在压缩包打开之后才求值的：老实现以写入模式直接打开目标，
+        # 走到这里磁盘上已经只剩一个写了一半的 zip。
+        with mock.patch.object(threemf, "_model_settings", explode):
+            with self.assertRaises(OSError):
+                self._write()
+
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(_leftover_temporaries(self.tmp), [])
 
     def test_the_required_parts_are_present(self):
         with zipfile.ZipFile(self._write()) as archive:
@@ -436,6 +460,29 @@ class ObjTests(ExportTestCase):
         path = self._write()
         self.assertTrue(path.exists())
         self.assertTrue(path.with_suffix(".mtl").exists())
+
+    def test_a_failed_export_keeps_the_previous_pair(self):
+        """两份都写完才改名：中途出错，磁盘上还是上一次那一对（1.6.50）。"""
+        path = self._write()
+        before = (path.read_bytes(), path.with_suffix(".mtl").read_bytes())
+
+        real_open = objfile.atomic_path
+        calls = []
+
+        def second_call_fails(target, **kwargs):
+            calls.append(Path(target))
+            if len(calls) >= 2:
+                raise OSError("磁盘满了")
+            return real_open(target, **kwargs)
+
+        with mock.patch.object(objfile, "atomic_path", second_call_fails):
+            with self.assertRaises(OSError):
+                self._write()
+
+        self.assertEqual(len(calls), 2, calls)
+        self.assertEqual(path.read_bytes(), before[0])
+        self.assertEqual(path.with_suffix(".mtl").read_bytes(), before[1])
+        self.assertEqual(_leftover_temporaries(self.tmp), [])
 
     def test_the_obj_references_the_material_library(self):
         text = self._write().read_text(encoding="utf-8")

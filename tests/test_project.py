@@ -20,6 +20,7 @@ import zipfile
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 from PIL import Image
@@ -28,6 +29,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from app.core import atomicio, project  # noqa: E402
 from app.core.engines import ENGINE_BAMBU  # noqa: E402
 from app.core.image_matching import (  # noqa: E402
     MatchResult,
@@ -738,6 +740,130 @@ class ProjectErrorTests(unittest.TestCase):
         with self.assertRaises(ProjectError) as caught:
             load_project(bumped)
         self.assertIn("这个版本只认 1", str(caught.exception))
+
+
+class AtomicWriteTests(unittest.TestCase):
+    """``app.core.atomicio``：先写同目录的临时文件，写完再改名顶替。
+
+    放在 test_project.py 里是因为闸门的模块清单是固定的：为这几条新建一个测试模块，
+    得同时改 AGENTS.md 与每一版发版说明，不值当。
+    """
+
+    def setUp(self) -> None:
+        self._dir = Path(self.enterContext(_temp_dir()))
+
+    def test_writes_the_content_creates_the_folder_and_leaves_no_temporary(self):
+        target = self._dir / "子目录" / "值.txt"
+        atomicio.atomic_write_text(target, "第一版")
+        self.assertEqual(target.read_text(encoding="utf-8"), "第一版")
+        self.assertEqual(_temporaries(self._dir), [])
+
+    def test_bytes_round_trip(self):
+        target = self._dir / "值.bin"
+        atomicio.atomic_write_bytes(target, b"\x00\x01\x02")
+        self.assertEqual(target.read_bytes(), b"\x00\x01\x02")
+        self.assertEqual(_temporaries(self._dir), [])
+
+    def test_a_failure_inside_the_write_keeps_the_old_file_and_cleans_up(self):
+        target = self._dir / "值.txt"
+        target.write_text("原来的内容", encoding="utf-8")
+        real_write_text = Path.write_text
+
+        def explode(self, *args, **kwargs):
+            if self.name.endswith(".tmp"):
+                raise OSError("磁盘满了")
+            return real_write_text(self, *args, **kwargs)
+
+        with mock.patch.object(Path, "write_text", explode):
+            with self.assertRaises(OSError):
+                atomicio.atomic_write_text(target, "新内容")
+
+        self.assertEqual(target.read_text(encoding="utf-8"), "原来的内容")
+        self.assertEqual(_temporaries(self._dir), [])
+
+    def test_a_blocked_swap_names_the_temporary_that_still_holds_the_new_content(self):
+        target = self._dir / "值.txt"
+        target.write_text("原来的内容", encoding="utf-8")
+        with mock.patch.object(
+            atomicio.os, "replace", side_effect=PermissionError(13, "拒绝访问")
+        ):
+            with self.assertRaises(OSError) as caught:
+                atomicio.atomic_write_text(target, "新内容")
+
+        self.assertEqual(target.read_text(encoding="utf-8"), "原来的内容")
+        leftovers = _temporaries(self._dir)
+        self.assertEqual(len(leftovers), 1, leftovers)
+        self.assertIn(leftovers[0].name, str(caught.exception))
+        self.assertEqual(leftovers[0].read_text(encoding="utf-8"), "新内容")
+
+
+class SaveDurabilityTests(unittest.TestCase):
+    """覆盖保存：中途出错，用户原来那份工程必须一个字节都不动。"""
+
+    def setUp(self) -> None:
+        self._dir = Path(self.enterContext(_temp_dir()))
+
+    def _save(self, path, library, **kwargs):
+        return save_project(
+            path,
+            image=_picture(),
+            image_name="测试图",
+            base=_base_match(library),
+            library=library,
+            **kwargs,
+        )
+
+    def test_a_failed_save_keeps_the_previous_project(self):
+        library = _library()
+        path = self._dir / "工程.bpproj"
+        self._save(path, library)
+        before = path.read_bytes()
+
+        # 基线表这一张就炸：此时压缩包已经打开、工程.json 也写进去了。以写入模式直接
+        # 打开目标的旧实现走到这里，目标已经是 0 字节。
+        with mock.patch.object(project, "_indices_bytes", side_effect=OSError("磁盘满了")):
+            with self.assertRaises(OSError):
+                self._save(path, library)
+
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(load_project(path, library=library).image_name, "测试图")
+        self.assertEqual(_temporaries(self._dir), [])
+
+    def test_a_save_swaps_a_same_directory_temporary_in_by_rename(self):
+        library = _library()
+        path = self._dir / "工程.bpproj"
+        self._save(path, library)
+
+        seen = []
+        real_replace = atomicio.os.replace
+
+        def record(source, destination):
+            seen.append((Path(source), Path(destination)))
+            return real_replace(source, destination)
+
+        with mock.patch.object(atomicio.os, "replace", record):
+            self._save(path, library, version="1.2.3")
+
+        self.assertEqual(len(seen), 1, seen)
+        source, destination = seen[0]
+        self.assertEqual(destination, path)
+        # 同目录才保证 os.replace 是改名而不是跨卷复制。
+        self.assertEqual(source.parent, path.parent)
+        self.assertTrue(source.name.endswith(".tmp"), source.name)
+        self.assertFalse(source.exists())
+        self.assertEqual(load_project(path, library=library).version, "1.2.3")
+        self.assertEqual(_temporaries(self._dir), [])
+
+    def test_saving_into_a_fresh_folder_creates_it(self):
+        library = _library()
+        written = self._save(self._dir / "新目录" / "工程", library)
+        self.assertEqual(written, self._dir / "新目录" / "工程.bpproj")
+        self.assertTrue(written.exists())
+
+
+def _temporaries(folder) -> list[Path]:
+    """落盘用到的一半文件：名字里带 ``.tmp`` 的都不该留下。"""
+    return sorted(Path(folder).rglob("*.tmp"))
 
 
 def _temp_dir():
