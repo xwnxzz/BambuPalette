@@ -54,6 +54,19 @@ DEFAULT_SETTINGS: dict = {
     "pick_mode": DEFAULT_PICK_MODE,
     "material": "",
     "version": SETTINGS_VERSION,
+    # 1.6.53（m21616 第 8 条）：「设置」里能改的默认参数与快捷键。把它们放进这份
+    # 偏好文件，是因为它们的意思和 engine / pick_mode 一样 —— 「下次打开还是这样」。
+    "picture_colours": 32,
+    "picture_spools": 4,
+    "picture_dither": False,
+    "picture_only_spools": False,
+    "picture_base_mm": 1.4,
+    "model_colours": 32,
+    "model_spools": 4,
+    "model_only_spools": False,
+    "model_flip_rotate": True,
+    "shortcut_export_glb": "Ctrl+S",
+    "sort": "rgb",
 }
 
 #: 上次按哪种耗材配色 (m05557 item 1). 空串＝不按材质过滤，和库层的
@@ -100,6 +113,28 @@ def load_settings() -> dict:
     values["engine"] = _migrate_engine(raw.get("engine"), raw.get("version"))
     values["pick_mode"] = resolve_pick_mode(raw.get("pick_mode"))
     values["material"] = str(raw.get("material") or "").strip()
+    # 1.6.53：「设置」里那些默认值。只认 DEFAULT_SETTINGS 里有的键，值类型跟着默认值走，
+    # 于是手改坏一个数字（写成字符串、负数、null）不会把页面初始化弄炸。
+    for key, fallback in DEFAULT_SETTINGS.items():
+        if key in ("engine", "pick_mode", "material", "version"):
+            continue
+        if key not in raw:
+            continue
+        stored = raw[key]
+        if isinstance(fallback, bool):
+            values[key] = bool(stored)
+        elif isinstance(fallback, int):
+            try:
+                values[key] = int(stored)
+            except (TypeError, ValueError):
+                continue
+        elif isinstance(fallback, float):
+            try:
+                values[key] = float(stored)
+            except (TypeError, ValueError):
+                continue
+        else:
+            values[key] = str(stored)
     return values
 
 

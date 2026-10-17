@@ -11,7 +11,7 @@ def build_application(argv=None):
     from PySide6.QtWidgets import QApplication
 
     from .core.paths import resource_path
-    from .ui import selectable, theme
+    from .ui import selectable, theme, tips
 
     app = QApplication.instance() or QApplication(argv if argv is not None else sys.argv)
     # Hints, recipes and status lines all end up pasted into Bambu Studio, so
@@ -19,6 +19,9 @@ def build_application(argv=None):
     # that only come into existence after a colour is picked.  An app-level
     # filter catches those; see app/ui/selectable.py.
     selectable.install(app)
+    # 悬停时的黄色小方框全部吃掉（1.6.53，m21616 第 3 条）。放在这里而不是逐个控件删
+    # setToolTip()：漏一个就还会弹，用户看到的就是「你说删了怎么还有」。见 app/ui/tips.py。
+    tips.disable_tooltips()
     app.setApplicationName("BambuPalette")
     app.setOrganizationName("BambuPalette")
     app.setStyle("Fusion")

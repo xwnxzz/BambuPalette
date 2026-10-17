@@ -4241,7 +4241,13 @@ def main() -> int:
                 "文件 / 视图 / 帮助 are gone — there is no menu bar left",
             )
             check(window._help_button.text() == "帮助", "「帮助」 is a plain button now")
-            check(window._help_button.isVisible(), "「帮助」 sits where the menus used to be")
+            # 1.6.53（m21616 第 6/8 条）：帮助 / 设置 / 添加耗材从标题栏搬到了
+            # 「目标颜色」那一行的右端 —— 判据改成「和颜色输入框同一个父控件」。
+            check(
+                window._help_button.parentWidget() is window._target_color.parentWidget()
+                and window._settings_button.parentWidget() is window._target_color.parentWidget(),
+                "帮助 / 设置 / 添加耗材 与「目标颜色」在同一行",
+            )
             check(
                 "BambuPalette" in window._about_text(),
                 "帮助 still says what the program is, and where the algorithms come from",
@@ -4518,11 +4524,24 @@ def main() -> int:
     check(all(len(value) == 7 and value.startswith("#") for value in preview_hexes),
           f"预览色都是 #RRGGBB：{preview_hexes}")
     check(model_match is not None and model_match.spool_count >= 1, "配色至少用了一卷耗材")
-    check("ΔE00" in model_page.statusText(), f"状态行带 ΔE00：{model_page.statusText()[:90]!r}")
+    # 1.6.53（m21616 第 13 条）：那句「N 种颜色，平均 ΔE00 …」搬进了「耗材方案」，
+    # 状态行现在只说「左边是原模型、右边是预览」。
+    check("ΔE00" in model_page._summary.text(), f"耗材方案里带 ΔE00：{model_page._summary.text()[:90]!r}")
     check("三角形" in model_page._model_label.text(), "模型名字行带三角形数")
     check(not hasattr(model_page, "_export_button"), "「导出配色表」按钮已经删了（m21496 第 9 条）")
     check(isinstance(model_page._source_view.hasOpenGL(), bool), "三维视图能回答有没有 OpenGL")
     check(isinstance(model_page._source_view.available(), str), "三维视图能给出不可用原因")
+
+    # --- 1.6.53（m21616）：整套界面不再弹黄色悬停框 --------------------------
+    from app.ui import tips as _tips
+
+    check(_tips.tooltips_disabled(), "悬停提示框全程序关掉了（ToolTip 事件被吃掉）")
+    check(model_page._source_view.flipOrbit() is True, "模型配色页默认左右翻转")
+    check(model_page._plan_list.count() == len(model_page._plans),
+          f"耗材方案列表行数等于方案数，got {model_page._plan_list.count()}")
+    if model_page._plans:
+        row = model_page._plan_list.item(0).text()
+        check("ΔE00" in row and "卷" in row, f"方案行写的是数字：{row!r}")
 
     # --- 1.6.52：只匹配耗材 / 筛选 / 换色撤销 / 三个出口 -----------------------
     check(model_page._colour_count.value() == 32,

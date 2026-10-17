@@ -42,7 +42,8 @@ from ..core.image_matching import MatchSettings, PaletteEntry, TriplePalette, bu
 from ..core.library import FilamentLibrary
 from ..core.mixes import MixCatalog
 from ..core.model_export import plate_from_model, write_glb
-from ..core.model_matching import ModelMatch, match_model, summarise
+from ..core.model_matching import ModelMatch, match_model_plans, summarise
+from ..core.settings import load_settings
 from ..mesh.objfile import write_obj
 from ..mesh.threemf import slots_from_palette, write_3mf
 from .colour_picker import ColourPickerDialog, entry_recipe_text
@@ -99,6 +100,9 @@ class ModelPage(QWidget):
         self._overrides: dict[str, PaletteEntry] = {}
         self._undo: list[dict[str, PaletteEntry]] = []
         self._redo: list[dict[str, PaletteEntry]] = []
+        #: 这一次算出来的所有耗材方案（1.6.53，m21616 第 5 条）。
+        self._plans: list[ModelMatch] = []
+        self._plan_index = 0
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -106,16 +110,14 @@ class ModelPage(QWidget):
 
         layout.addLayout(self._build_toolbar())
 
-        blurb = QLabel(PAGE_HELP)
-        blurb.setProperty("role", "hint")
-        blurb.setWordWrap(True)
-        blurb.setMaximumHeight(56)
-        layout.addWidget(blurb)
-
+        # 1.6.53（m21616 第 12 条）：那大段操作说明从页面上撤了，挪进「帮助」窗口
+        # （主窗口的 _help_text 里）；页面顶上只留工具栏，布局整体上移一格。
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(8)
         views = QSplitter(Qt.Orientation.Horizontal)
         views.setChildrenCollapsible(False)
+        views.setHandleWidth(8)
         self._source_view = ModelView("原模型")
         self._preview_view = ModelView("预览（配色后）")
         views.addWidget(self._source_view)
@@ -141,6 +143,7 @@ class ModelPage(QWidget):
         self._save_shortcut.activated.connect(self._on_export_glb)
 
         self._set_enabled(False)
+        self.apply_settings(load_settings())
 
     # -- 界面 -------------------------------------------------------------
     def _build_toolbar(self) -> QHBoxLayout:
@@ -187,7 +190,6 @@ class ModelPage(QWidget):
         self._filter_button = QPushButton("筛选耗材")
         self._filter_button.setToolTip("指定必须有哪几卷、不许用哪几卷")
         self._filter_button.clicked.connect(self._on_filter)
-        row.addWidget(self._filter_button)
 
         row.addStretch(1)
         self._model_label = QLabel("还没有打开模型")
@@ -195,15 +197,36 @@ class ModelPage(QWidget):
         row.addWidget(self._model_label)
         return row
 
+    def _panel(self, title: str) -> tuple[QWidget, QVBoxLayout]:
+        """跟图像转换页同款的白底分组框（1.6.53，m21616 第 13 条）。"""
+        from PySide6.QtWidgets import QFrame
+
+        frame = QFrame()
+        frame.setProperty("panel", "true")
+        box = QVBoxLayout(frame)
+        box.setContentsMargins(10, 8, 10, 8)
+        box.setSpacing(6)
+        heading = QLabel(title)
+        heading.setProperty("role", "sectionTitle")
+        box.addWidget(heading)
+        return frame, box
+
     def _build_bottom_row(self) -> QHBoxLayout:
+        # 1.6.53（m21616 第 14 / 15 条）：两个视图的「前 / 后 / 左 / 右 / 顶 / 底 /
+        # 透视 / 自适应」从视图顶上搬到这里，与三个出口排成一行；出口的次序也按用户
+        # 要的来：导出 GLB → 生成 OBJ + MTL → 生成 3MF。
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(8)
-        self._filter_hint = QLabel("")
-        self._filter_hint.setProperty("role", "hint")
-        self._filter_hint.setWordWrap(True)
-        self._update_filter_hint()
-        row.addWidget(self._filter_hint, 1)
+        row.addWidget(self._source_view.takeBar())
+        row.addSpacing(6)
+        row.addWidget(self._preview_view.takeBar())
+        row.addStretch(1)
+
+        self._export_glb_button = QPushButton("导出 GLB")
+        self._export_glb_button.setToolTip("存成带配色的 GLB（Ctrl+S），下次导入回来接着改")
+        self._export_glb_button.clicked.connect(self._on_export_glb)
+        row.addWidget(self._export_glb_button)
 
         self._export_obj = QPushButton("生成 OBJ + MTL")
         self._export_obj.setToolTip("导出成 OBJ，颜色分在 MTL 里")
@@ -215,11 +238,6 @@ class ModelPage(QWidget):
         self._export_3mf.setToolTip("导出成 Bambu Studio 工程，耗材按配色结果配好")
         self._export_3mf.clicked.connect(lambda: self._on_export_plate("3mf"))
         row.addWidget(self._export_3mf)
-
-        self._export_glb_button = QPushButton("导出 GLB")
-        self._export_glb_button.setToolTip("存成带配色的 GLB（Ctrl+S），下次导入回来接着改")
-        self._export_glb_button.clicked.connect(self._on_export_glb)
-        row.addWidget(self._export_glb_button)
         return row
 
     def _build_side_panel(self) -> QWidget:
@@ -228,24 +246,41 @@ class ModelPage(QWidget):
         panel.setMaximumWidth(480)
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
+        layout.setSpacing(8)
 
-        title = QLabel("模型上色块的颜色")
-        title.setProperty("role", "sectionTitle")
-        layout.addWidget(title)
+        # -- 耗材方案（跟图像转换页一样：筛选 + 一句话 + 方案列表）----------
+        plans_box, plans_inside = self._panel("耗材方案")
+        filter_row = QHBoxLayout()
+        filter_row.setSpacing(6)
+        filter_row.addWidget(self._filter_button)
+        self._filter_hint = QLabel("每一卷都可以用。")
+        self._filter_hint.setProperty("role", "hint")
+        self._filter_hint.setWordWrap(True)
+        filter_row.addWidget(self._filter_hint, 1)
+        plans_inside.addLayout(filter_row)
 
         self._summary = QLabel("还没有配色。")
         self._summary.setProperty("role", "hint")
         self._summary.setWordWrap(True)
         selectable_text(self._summary)
-        layout.addWidget(self._summary)
+        plans_inside.addWidget(self._summary)
 
+        self._plan_list = QListWidget()
+        self._plan_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._plan_list.setWordWrap(True)
+        self._plan_list.setMaximumHeight(120)
+        self._plan_list.currentRowChanged.connect(self._on_plan_changed)
+        plans_inside.addWidget(self._plan_list)
+        layout.addWidget(plans_box, 0)
+
+        # -- 模型上色块的颜色 -------------------------------------------------
+        colours_box, colours_inside = self._panel("模型上色块的颜色")
         self._list = QListWidget()
         self._list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self._list.setIconSize(QSize(44, 20))
         self._list.setWordWrap(True)
         self._list.currentRowChanged.connect(self._on_row_changed)
-        layout.addWidget(self._list, 1)
+        colours_inside.addWidget(self._list, 1)
 
         buttons = QHBoxLayout()
         buttons.setSpacing(6)
@@ -259,15 +294,18 @@ class ModelPage(QWidget):
         self._redo_button = QPushButton("恢复")
         self._redo_button.clicked.connect(self._on_redo)
         buttons.addWidget(self._redo_button)
-        layout.addLayout(buttons)
+        colours_inside.addLayout(buttons)
+        layout.addWidget(colours_box, 1)
+        self._update_filter_hint()
         return panel
 
     def _set_enabled(self, enabled: bool) -> None:
+        # 「只匹配耗材」不在这里（1.6.53，m21616 第 2 条）：它只是决定用哪张候选表，
+        # 没打开模型时也该能勾；勾上再打开模型就按它算。
         for widget in (
             self._rematch_button,
             self._colour_count,
             self._spool_cap,
-            self._only_spools,
             self._filter_button,
             self._export_obj,
             self._export_3mf,
@@ -435,7 +473,7 @@ class ModelPage(QWidget):
             self._status.setText("这个模型里没有读得出颜色的面。")
             return False
         try:
-            self._match = match_model(
+            self._plans = match_model_plans(
                 colours,
                 self._match_palette(),
                 self._settings(),
@@ -445,19 +483,76 @@ class ModelPage(QWidget):
             )
         except Exception as error:  # pragma: no cover - 防守
             self._status.setText(f"配不出来：{error}")
+            self._plans = []
             return False
+        self._plan_index = max(0, min(self._plan_index, len(self._plans) - 1))
+        self._match = self._plans[self._plan_index]
+        self._refresh_plan_list()
         self._refresh_preview()
         self._fill_list()
-        self._summary.setText(
-            f"平均 ΔE00 {self._match.mean_delta_e:.2f}、最差 {self._match.worst_delta_e:.2f}，"
-            f"用 {self._match.spool_count} 卷耗材。"
-        )
+        self._summary.setText(summarise(self._match, self._spool_names()) + "。")
         self._status.setText(
-            summarise(self._match, self._spool_names())
-            + "。左边的原模型是按模型自己的颜色画的，右边是配色后的预览。"
+            "左边的原模型是按模型自己的颜色画的，右边是配色后的预览。"
+            "方案换了、颜色换过，都可以用「撤销 / 恢复」退回来。"
         )
         self._update_history_buttons()
         return True
+
+    def _refresh_plan_list(self) -> None:
+        self._plan_list.blockSignals(True)
+        self._plan_list.clear()
+        for index, plan in enumerate(self._plans):
+            title = plan.title or f"方案 {index + 1}"
+            # 只写数字（1.6.53）：`option.note` 是那一类方案的做法说明，八行会一模一样地
+            # 重复八遍，看一眼什么也分不出来。要读做法就去「帮助」。
+            row = QListWidgetItem(
+                f"{title}　平均 ΔE00 {plan.mean_delta_e:.2f}、最差 {plan.worst_delta_e:.2f}，"
+                f"用 {plan.spool_count} 卷"
+            )
+            row.setData(Qt.ItemDataRole.UserRole, index)
+            self._plan_list.addItem(row)
+        self._plan_list.blockSignals(False)
+        if self._plans:
+            self._plan_list.setCurrentRow(self._plan_index)
+
+    def _on_plan_changed(self, row: int) -> None:
+        if not (0 <= row < len(self._plans)):
+            return
+        if row == self._plan_index and self._match is self._plans[row]:
+            return
+        self._plan_index = row
+        self._match = self._plans[row]
+        self._refresh_preview()
+        self._fill_list()
+        self._summary.setText(summarise(self._match, self._spool_names()) + "。")
+        self._update_history_buttons()
+
+    def apply_settings(self, values: dict) -> None:
+        """把「设置」里的默认值灌进来（1.6.53，m21616 第 8 条）。
+
+        只改控件，不主动重算：正在看的图 / 模型不该因为保存了一次设置就被重新配一遍。
+        改完切页、或者按「重新匹配」「打开」才按新值算。
+        """
+        for box, key in (
+            (self._colour_count, "model_colours"),
+            (self._spool_cap, "model_spools"),
+        ):
+            if key in values:
+                box.blockSignals(True)
+                box.setValue(int(values[key]))
+                box.blockSignals(False)
+        only = bool(values.get("model_only_spools", self._only_spools.isChecked()))
+        if only != self._only_spools.isChecked():
+            self._only_spools.blockSignals(True)
+            self._only_spools.setChecked(only)
+            self._only_spools.blockSignals(False)
+            self._update_filter_hint()
+        flip = bool(values.get("model_flip_rotate", True))
+        self._source_view.setFlipOrbit(flip)
+        self._preview_view.setFlipOrbit(flip)
+        sequence = str(values.get("shortcut_export_glb") or "Ctrl+S")
+        # QShortcut 没有 setKeySequence，换键要重新 setKey（Qt 6 的写法）。
+        self._save_shortcut.setKey(QKeySequence(sequence))
 
     # -- 换色 / 撤销 ---------------------------------------------------------
     def _shown_entry(self, colour_hex: str) -> PaletteEntry | None:
@@ -585,7 +680,8 @@ class ModelPage(QWidget):
                 f"{item.color_hex}  {item.share * 100:.1f}%  →  {_hex(rgb)}   ΔE00 {delta:.2f}"
             )
             row = QListWidgetItem(swatch_pixmap(_hex(rgb), 44, 20), text)
-            row.setToolTip(f"{recipe}\n原色 {item.color_hex}，现在画成 {_hex(rgb)}")
+            # 不挂悬停提示（1.6.53，m21616 第 3 条）：配方就在下一行的灰字里，
+            # 那层黄框除了挡视线没别的作用。
             row.setData(Qt.ItemDataRole.UserRole, item.color_hex)
             self._list.addItem(row)
             detail = QListWidgetItem(recipe)
@@ -720,6 +816,10 @@ class ModelPage(QWidget):
         )
 
     # -- 给主窗口 / 闸门用 ------------------------------------------------
+    def help_text(self) -> str:
+        """「帮助」窗口里「模型配色」那一节（1.6.53，m21616 第 12 条）。"""
+        return "模型配色：\n" + PAGE_HELP
+
     @property
     def model(self) -> GlbModel | None:
         return self._model

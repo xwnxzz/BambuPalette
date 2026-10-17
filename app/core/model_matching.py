@@ -65,6 +65,10 @@ class ModelMatch:
     worst_delta_e: float = 0.0
     spools: tuple[str, ...] = ()
     result: MatchResult | None = None
+    #: 这是一套什么方案（1.6.53 起模型页也有「耗材方案」列表，m21616 第 5 条）。
+    key: str = ""
+    title: str = ""
+    note: str = ""
 
     @property
     def spool_count(self) -> int:
@@ -103,21 +107,9 @@ def _hex(rgb: tuple[int, int, int]) -> str:
     return "#{:02X}{:02X}{:02X}".format(*(int(max(0, min(255, c))) for c in rgb))
 
 
-def match_model(
-    colours: list[ModelColour],
-    palette: list[PaletteEntry],
-    settings: MatchSettings | None = None,
-    *,
-    require: frozenset[str] | set[str] = frozenset(),
-    avoid: frozenset[str] | set[str] = frozenset(),
-    progress: ProgressFn | None = None,
-) -> ModelMatch:
-    """给模型的每种颜色找一套能打印的混色。
-
-    ``require`` / ``avoid`` 是「筛选耗材」那两条规矩（必须用哪几卷、不许用哪几卷），
-    交给 :func:`app.core.image_matching.match_options` —— 和图像转换页同一套判据，
-    连「大色差色块优先 / 总体最近」那些方案排序都是同一份代码。
-    """
+def _chart_picture(
+    colours: list[ModelColour], settings: MatchSettings | None
+) -> tuple[Image.Image, list[tuple[int, int]], MatchSettings]:
     config = (settings or MatchSettings()).clamped()
     picture, ranges = chart_image(colours)
     config = MatchSettings(
@@ -129,18 +121,16 @@ def match_model(
         smooth_radius=0,  # 带子之间有硬边界，平滑只会把颜色洗淡
         max_spools=config.max_spools,
     ).clamped()
-    options = match_options(
-        picture,
-        palette,
-        config,
-        require=require,
-        avoid=avoid,
-        progress=progress,
-    )
-    if not options:
-        raise ValueError("这套筛选下没有任何颜色可用：放宽「必须有」或「不要用」再试。")
-    result = options[0].result
+    return picture, ranges, config
 
+
+def _match_from_result(
+    colours: list[ModelColour],
+    ranges: list[tuple[int, int]],
+    picture: Image.Image,
+    result: MatchResult,
+) -> ModelMatch:
+    """把一张色卡的匹配结果翻成「模型里每种颜色配到了谁」。"""
     total_area = float(sum(max(0.0, item.area) for item in colours)) or 1.0
     matches: list[ModelColourMatch] = []
     row = picture.height // 2
@@ -184,6 +174,70 @@ def match_model(
         spools=tuple(spools),
         result=result,
     )
+
+
+def match_model_plans(
+    colours: list[ModelColour],
+    palette: list[PaletteEntry],
+    settings: MatchSettings | None = None,
+    *,
+    require: frozenset[str] | set[str] = frozenset(),
+    avoid: frozenset[str] | set[str] = frozenset(),
+    limit: int = 8,
+    progress: ProgressFn | None = None,
+) -> list[ModelMatch]:
+    """每一种「耗材方案」各配一遍，按 ``match_options`` 的次序返回。
+
+    1.6.53（m21616 第 5 条）：模型页也要像图像转换页那样摆出一串方案让人挑，所以把
+    「色卡 → match_options → 逐色回读」这条链拆出来，一次算完所有方案。
+    """
+    if not colours:
+        raise ValueError("模型里没有颜色")
+    picture, ranges, config = _chart_picture(colours, settings)
+    options = match_options(
+        picture,
+        palette,
+        config,
+        require=require,
+        avoid=avoid,
+        progress=progress,
+    )
+    if not options:
+        raise ValueError("这套筛选下没有任何颜色可用：放宽「必须有」或「不要用」再试。")
+    plans: list[ModelMatch] = []
+    for option in options[: max(1, int(limit))]:
+        match = _match_from_result(colours, ranges, picture, option.result)
+        match.key = str(getattr(option, "key", "") or "")
+        match.title = str(getattr(option, "title", "") or "")
+        match.note = str(getattr(option, "note", "") or "")
+        plans.append(match)
+    return plans
+
+
+def match_model(
+    colours: list[ModelColour],
+    palette: list[PaletteEntry],
+    settings: MatchSettings | None = None,
+    *,
+    require: frozenset[str] | set[str] = frozenset(),
+    avoid: frozenset[str] | set[str] = frozenset(),
+    progress: ProgressFn | None = None,
+) -> ModelMatch:
+    """给模型的每种颜色找一套能打印的混色。
+
+    ``require`` / ``avoid`` 是「筛选耗材」那两条规矩（必须用哪几卷、不许用哪几卷），
+    交给 :func:`app.core.image_matching.match_options` —— 和图像转换页同一套判据，
+    连「大色差色块优先 / 总体最近」那些方案排序都是同一份代码。
+    """
+    return match_model_plans(
+        colours,
+        palette,
+        settings,
+        require=require,
+        avoid=avoid,
+        limit=1,
+        progress=progress,
+    )[0]
 
 
 def summarise(match: ModelMatch, names: dict[str, str]) -> str:

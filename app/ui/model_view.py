@@ -215,6 +215,9 @@ class _GLView(QOpenGLWidget):
         self._failed = ""
         self._last: QPointF | None = None
         self._mode = "orbit"
+        # 1.6.53（m21616 第 4 条）：左右拖动时模型旋转的方向。默认「翻转」——拖右往左转，
+        # 也就是抓着模型转过来，而不是抓着相机绕着它走；设置里可以关掉。
+        self._flip_orbit = True
         self.setMinimumSize(280, 220)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMouseTracking(False)
@@ -416,7 +419,8 @@ class _GLView(QOpenGLWidget):
         elif self._mode == "zoom":
             self.camera.zoom(-delta.y() / 40.0)
         else:
-            self.camera.orbit(delta.x() * 0.4, delta.y() * 0.4)
+            step = delta.x() * 0.4
+            self.camera.orbit(-step if self._flip_orbit else step, delta.y() * 0.4)
         self.update()
         event.accept()
 
@@ -500,6 +504,13 @@ class _GLView(QOpenGLWidget):
         self.camera.ortho = bool(ortho)
         self.update()
 
+    def setFlipOrbit(self, flip: bool) -> None:
+        self._flip_orbit = bool(flip)
+
+    def flipOrbit(self) -> bool:
+        """拖动时是否把左右方向反过来（闸门与设置对话框都要能读回来）。"""
+        return self._flip_orbit
+
     def frameAll(self) -> None:
         self.camera.frame()
         self.update()
@@ -512,12 +523,17 @@ class ModelView(QWidget):
         super().__init__(parent)
         self._model: GlbModel | None = None
         self._colours: list[tuple[int, int, int]] = []
+        # 翻转标志留在面板自己身上：没有 OpenGL 时（离屏、老显卡）也要能读写它。
+        self._flip_orbit = True
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
 
-        bar = QHBoxLayout()
+        # 1.6.53（m21616 第 15 条）：这一排被做成独立控件，页面可以用 takeBar() 把它
+        # 挪到视图下面，跟「导出 GLB / 生成 OBJ + MTL / 生成 3MF」排成一行。
+        self._bar = QWidget(self)
+        bar = QHBoxLayout(self._bar)
         bar.setContentsMargins(0, 0, 0, 0)
         bar.setSpacing(4)
         if title:
@@ -539,7 +555,8 @@ class ModelView(QWidget):
         self._frame_button = self._make_button("自适应", "把整只模型放到画面里（Home）")
         self._frame_button.clicked.connect(lambda: self.frameAll())
         bar.addWidget(self._frame_button)
-        layout.addLayout(bar)
+        bar.addStretch(0)
+        layout.addWidget(self._bar)
 
         self._fallback: _FallbackView | None = None
         self._gl: _GLView | None = None
@@ -565,6 +582,24 @@ class ModelView(QWidget):
         return button
 
     # -- 内容 -------------------------------------------------------------
+    def takeBar(self) -> QWidget:
+        """把预设视角那一排交出去，由页面决定摆在哪（1.6.53，m21616 第 15 条）。"""
+        layout = self.layout()
+        if layout is not None:
+            layout.removeWidget(self._bar)
+        self._bar.setParent(None)
+        return self._bar
+
+    def setFlipOrbit(self, flip: bool) -> None:
+        """左右拖动时是否翻转旋转方向（1.6.53，m21616 第 4 条）。"""
+        self._flip_orbit = bool(flip)
+        if self._gl is not None:
+            self._gl.setFlipOrbit(flip)
+
+    def flipOrbit(self) -> bool:
+        """当前是不是翻转着转。"""
+        return self._flip_orbit
+
     def setModel(self, model: GlbModel | None, colours: list[tuple[int, int, int]] | None = None) -> None:
         self._model = model
         self._colours = list(colours) if colours else []

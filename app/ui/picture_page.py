@@ -2202,10 +2202,40 @@ class PicturePage(QWidget):
         layout.addWidget(splitter, 1)
         layout.addLayout(status_row)
         layout.addLayout(bottom)
+        # 1.6.53（m21616 第 8 条）：开机就按「设置」里的默认值摆好。
+        self.apply_settings(load_settings())
 
     def help_text(self) -> str:
         """这一页怎么用，「帮助」窗口里的头一节（m01885 第 6 条）。"""
         return self._help
+
+    def apply_settings(self, values: dict) -> None:
+        """把「设置」里图像转换页的默认值灌进来（1.6.53，m21616 第 8 条）。
+
+        只改控件、不重算：正在看的那张图不该因为保存了一次设置就被重新配一遍。
+        """
+        for box, key in (
+            (self._colour_count, "picture_colours"),
+            (self._spool_cap, "picture_spools"),
+        ):
+            if key in values:
+                box.blockSignals(True)
+                box.setValue(int(values[key]))
+                box.blockSignals(False)
+        if "picture_dither" in values:
+            self._dither.blockSignals(True)
+            self._dither.setChecked(bool(values["picture_dither"]))
+            self._dither.blockSignals(False)
+        if "picture_base_mm" in values:
+            self._base_spin.blockSignals(True)
+            self._base_spin.setValue(float(values["picture_base_mm"]))
+            self._base_spin.blockSignals(False)
+        only = bool(values.get("picture_only_spools", self._only_spools.isChecked()))
+        if only != self._only_spools.isChecked():
+            self._only_spools.blockSignals(True)
+            self._only_spools.setChecked(only)
+            self._only_spools.blockSignals(False)
+            self._on_only_spools(only)
 
     def _wrap(self, widget: QWidget, title: str, badge: str | None = None) -> QWidget:
         frame = QFrame()
@@ -2234,6 +2264,8 @@ class PicturePage(QWidget):
         return frame
 
     def _set_controls_enabled(self, enabled: bool) -> None:
+        # 「只匹配耗材」不在这个表里（1.6.53，m21616 第 1 条）：它是一句「这次用哪
+        # 张候选表」的偏好，空图时也该点得动，勾上以后再导图片就按它算。
         for widget in (
             self._rematch_blocks_button,
             self._filter_button,
@@ -2242,7 +2274,6 @@ class PicturePage(QWidget):
             self._base_button,
             self._side_combo,
             self._smooth_box,
-            self._only_spools,
             self._export_3mf,
             self._export_obj,
         ):
@@ -3547,12 +3578,18 @@ class PicturePage(QWidget):
         the row in the list.  Clicking a block that is already in the selection
         takes it back out — and then the block must not stay highlighted (m01411
         item 3: 列表说没选中的东西，预览不能还画着它).
+
+        1.6.53（m21616 第 9/10 条）：单选时点「已经选中的那一种颜色」或「已经选中的
+        那一块」，也是取消选中 —— 和列表里再点一行同一个动作，不再只是把高亮刷新一遍。
         """
         if self._multi_button.isChecked():
             self._list.toggle(index)
             if index not in self._list.selected_indices():
                 self._show_colour(-1, keep_picked=True)
                 return
+        elif self._shown >= 0 and int(index) == self._shown:
+            self._on_colour_deselected(int(index))
+            return
         self._select(index)
 
     def _on_colour_activated(self, index: int) -> None:

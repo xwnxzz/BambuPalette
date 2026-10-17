@@ -3560,6 +3560,36 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         "图像转换页取消勾选后混色回来了",
     )
 
+    # --- 1.6.53（m21616）：设置对话框、默认值不触发重算、翻转 -------------------
+    from .core import settings as _settings_api
+    from .ui import settings_dialog as _settings_dialog
+    from .ui import tips as _tips
+
+    check(_tips.tooltips_disabled(), "悬停提示框全程序关掉了（ToolTip 事件被吃掉）")
+
+    settings_dialog = _settings_dialog.SettingsDialog(dict(_settings_api.DEFAULT_SETTINGS))
+    values = settings_dialog.values()
+    check(values["model_colours"] == 32, "设置里模型配色颜色数量的默认值是 32")
+    check(values["model_spools"] == 4, "设置里模型配色耗材上限的默认值是 4")
+    check(values["model_flip_rotate"] is True, "设置里「左右翻转」默认勾着")
+    check(values["shortcut_export_glb"] == "Ctrl+S", "设置里模型配色的保存快捷键默认 Ctrl+S")
+    settings_dialog._model_colours.setValue(24)
+    check(settings_dialog.values()["model_colours"] == 24, "改设置里的颜色数量会写进 values()")
+    settings_dialog._on_reset()
+    check(settings_dialog.values()["model_colours"] == 32, "「恢复默认」把颜色数量改回 32")
+    settings_dialog.deleteLater()
+
+    # 把默认参数下发到页面上：不该因此触发一次重算（1.6.53 里 apply_settings 用
+    # blockSignals 掐掉 valueChanged），所以颜色数量会变、方案数不会变。
+    before = len(model_page._plans)
+    model_page.apply_settings(dict(_settings_api.DEFAULT_SETTINGS))
+    check(model_page._colour_count.value() == 32, "设置里的颜色数量下发到了模型配色页")
+    check(len(model_page._plans) == before, "下发默认参数不会触一次重算")
+    check(model_page._source_view.flipOrbit() is True, "模型配色页默认按「左右翻转」转模型")
+    model_page._source_view.setFlipOrbit(False)
+    check(model_page._source_view.flipOrbit() is False, "左右翻转可以关掉")
+    model_page._source_view.setFlipOrbit(True)
+
     # Render the real window once, so a broken Qt platform plugin or a missing
     # font shows up here rather than in front of the user.
     shot = None

@@ -70,7 +70,7 @@ from ..core.triples import (
     save_triple_cache,
     triple_cache_key,
 )
-from . import theme
+from . import theme, tips
 from .filament_dialog import FilamentDialog
 from .help import HelpDialog
 from .mix_detail import MixDetail
@@ -78,6 +78,7 @@ from .mix_grid import MixGrid
 from .picture_page import PicturePage
 from .model_page import ModelPage
 from .selectable import selectable_text
+from .settings_dialog import SettingsDialog
 from .swatch import ColorField, swatch_icon
 
 _HEX_QUERY = re.compile(r"^[0-9a-fA-F]{1,6}$")
@@ -105,6 +106,9 @@ class MainWindow(QMainWindow):
         auto_triples: bool = True,
     ) -> None:
         super().__init__(parent)
+        # 探针与闸门直接造 MainWindow（不走 app.main.build_application），所以在这里
+        # 也装一次：悬停提示在 1.6.53 起全程序都不许再弹（m21616 第 3 条）。
+        tips.disable_tooltips()
         loaded_from_disk = library is None
         self.library = library if library is not None else self._load_library()
         if loaded_from_disk:
@@ -179,14 +183,13 @@ class MainWindow(QMainWindow):
     def _build_ui(self) -> None:
         title = QLabel("BambuPalette")
         title.setStyleSheet(f"font-size: 14px; font-weight: 650; color: {theme.TEXT};")
-        subtitle = QLabel("混色耗材色彩管理器 · 每两种耗材 81 个混色，每三种耗材 2556 个混色")
-        subtitle.setProperty("role", "hint")
 
+        # 1.6.53（m21616 第 7 条）删掉了标题下面那行「混色耗材色彩管理器 · 每两种耗材 81 个
+        # 混色…」：它在标题栏里已经有一份（窗口标题就写着），顶栏留着只会把下面的布局往下推。
         head = QVBoxLayout()
         head.setContentsMargins(0, 0, 0, 0)
         head.setSpacing(1)
         head.addWidget(title)
-        head.addWidget(subtitle)
 
         self._add_button = QPushButton("添加耗材")
         self._add_button.setProperty("accent", "true")
@@ -203,16 +206,19 @@ class MainWindow(QMainWindow):
         self._help_button.clicked.connect(self._on_help)
         self._help_window: HelpDialog | None = None
 
+        # 1.6.53（m21616 第 8 条）：设置。它和帮助、添加耗材一起放在「目标颜色」那一行的
+        # 右端，顺序就是用户要的 帮助 → 设置 → 添加耗材。
+        self._settings_button = QPushButton("设置")
+        self._settings_button.clicked.connect(self._on_settings)
+
         # Lumina Studio's topbar: the brand block on the left, the primary action
         # on the right, on a white bar closed by a hairline.
         topbar = QFrame()
         topbar.setObjectName("topbar")
         head_row = QHBoxLayout(topbar)
-        head_row.setContentsMargins(16, 10, 16, 10)
+        head_row.setContentsMargins(16, 8, 16, 8)
         head_row.setSpacing(10)
         head_row.addLayout(head, 1)
-        head_row.addWidget(self._help_button, 0, Qt.AlignmentFlag.AlignVCenter)
-        head_row.addWidget(self._add_button, 0, Qt.AlignmentFlag.AlignVCenter)
 
         # engine / sort / search controls
         self._engine_combo = QComboBox()
@@ -266,6 +272,10 @@ class MainWindow(QMainWindow):
         target_row.addWidget(self._target_color)
         target_row.addWidget(self._find_button)
         target_row.addStretch(1)
+        # 1.6.53（m21616 第 6/8 条）：帮助 → 设置 → 添加耗材，贴着「目标颜色」这一行的右端。
+        target_row.addWidget(self._help_button, 0, Qt.AlignmentFlag.AlignVCenter)
+        target_row.addWidget(self._settings_button, 0, Qt.AlignmentFlag.AlignVCenter)
+        target_row.addWidget(self._add_button, 0, Qt.AlignmentFlag.AlignVCenter)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self._build_library_panel())
@@ -1563,6 +1573,7 @@ class MainWindow(QMainWindow):
         """
         return (
             f"{self._picture_page.help_text()}\n\n"
+            f"{self._model_page.help_text()}\n\n"
             f"{plan_help()}\n\n"
             "算法与版本：\n"
             f"{self._about_text()}"
@@ -1576,3 +1587,26 @@ class MainWindow(QMainWindow):
         self._help_window.show()
         self._help_window.raise_()
         self._help_window.activateWindow()
+
+    def _on_settings(self) -> None:
+        """「设置」：三页的默认参数与快捷键（1.6.53，m21616 第 8 条）。
+
+        保存之后除了落盘，还当场灌进两个页面 —— 用户刚改完「颜色数量 24」，切回图像转换
+        却看到还是 32，那是最容易让人以为设置没生效的一种错。已经在屏幕上的图不会被重算：
+        页面只接值，不下命令（`apply_settings` 里写清了）。
+        """
+        dialog = SettingsDialog(settings.load_settings(), self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        values = dialog.values()
+        try:
+            settings.save_settings(values)
+        except OSError as error:
+            QMessageBox.warning(self, "设置没能保存", f"写不进偏好文件：{error}")
+            return
+        self._picture_page.apply_settings(values)
+        self._model_page.apply_settings(values)
+        index = self._sort_combo.findData(str(values.get("sort") or "rgb"))
+        if index >= 0 and index != self._sort_combo.currentIndex():
+            self._sort_combo.setCurrentIndex(index)
+        self._status.setText("设置已保存，下次打开按这一套来。")
