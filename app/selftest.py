@@ -642,8 +642,10 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     app.processEvents()
 
     check(
-        window._picture_page is not None and window._tabs.count() == 2,
-        "both pages are present",
+        window._picture_page is not None
+        and window._tabs.count() == 3
+        and window._tabs.tabText(2) == "模型配色",
+        f"the three pages are present ({window._tabs.count()} tabs)",
     )
 
     # m00940 #1: 刚打开软件时，耗材方案面板里那两句解释文本要同时出现、而且是面板开头
@@ -754,10 +756,14 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     from .core.settings import load_settings as _load_settings
     from .ui import picture_page as _pp
 
-    def _mouse(kind, pos, *, buttons=_Qt.MouseButtons.NoButton):
-        return _QMouse(
-            kind, pos, pos, _Qt.MouseButton.LeftButton, buttons, _Qt.KeyboardModifier.NoModifier
-        )
+    def _mouse(
+        kind,
+        pos,
+        *,
+        button=_Qt.MouseButton.LeftButton,
+        buttons=_Qt.MouseButtons.NoButton,
+    ):
+        return _QMouse(kind, pos, pos, button, buttons, _Qt.KeyboardModifier.NoModifier)
 
     probe = _pp.PictureView()
     probe.resize(400, 300)
@@ -785,21 +791,42 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     probe.zoom_by(50.0, focus)
     check(abs(probe.zoom() - _pp.ZOOM_MAX) < 1e-9, f"zoom stops at {_pp.ZOOM_MAX:g}×")
 
-    # 拖动平移：按下、移动超过阈值、松手 —— 只平移，不挑颜色。
+    # 平移改成中键（1.6.51，m20572 item 1）：左键只挑颜色。中键按下、移动、松手 —— 只平移。
     picked: list[int] = []
     probe.regionClicked.connect(picked.append)
     start = _QPointF(probe.width() / 2.0, probe.height() / 2.0)
     dragged_to = _QPointF(start.x() + 60.0, start.y() + 45.0)
     probe.mousePressEvent(
-        _mouse(_QEvent.Type.MouseButtonPress, start, buttons=_Qt.MouseButtons.LeftButton)
+        _mouse(
+            _QEvent.Type.MouseButtonPress,
+            start,
+            button=_Qt.MouseButton.MiddleButton,
+            buttons=_Qt.MouseButtons.MiddleButton,
+        )
     )
+    check(probe._panning, "middle-button press starts a pan")
     probe.mouseMoveEvent(
-        _mouse(_QEvent.Type.MouseMove, dragged_to, buttons=_Qt.MouseButtons.LeftButton)
+        _mouse(_QEvent.Type.MouseMove, dragged_to, buttons=_Qt.MouseButtons.MiddleButton)
     )
+    probe.mouseReleaseEvent(
+        _mouse(
+            _QEvent.Type.MouseButtonRelease,
+            dragged_to,
+            button=_Qt.MouseButton.MiddleButton,
+        )
+    )
+    app.processEvents()
+    check(not probe._panning, "releasing the middle button ends the pan")
+    check(not picked, "panning never picks a colour on the way")
+    check(probe._pan != _QPointF(0.0, 0.0), "the middle button moves the picture inside the panel")
+    middle_pan = _QPointF(probe._pan)
+    probe.mousePressEvent(_mouse(_QEvent.Type.MouseButtonPress, start))
+    probe.mouseMoveEvent(_mouse(_QEvent.Type.MouseMove, dragged_to, buttons=_Qt.MouseButtons.LeftButton))
     probe.mouseReleaseEvent(_mouse(_QEvent.Type.MouseButtonRelease, dragged_to))
     app.processEvents()
-    check(not picked, "dragging to pan never picks a colour on the way")
-    check(probe._pan != _QPointF(0.0, 0.0), "dragging moves the picture inside the panel")
+    check(probe._pan == middle_pan, "a left-button drag no longer pans")
+    check(len(picked) == 1, "a left-button press-and-drag counts as a plain click now")
+    picked.clear()
     limit_x = max(0.0, (probe._draw_size()[0] - probe.width()) / 2.0)
     check(
         abs(probe._pan.x()) <= limit_x + 0.5,

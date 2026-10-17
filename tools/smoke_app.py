@@ -4382,6 +4382,149 @@ def main() -> int:
         _paths_module.library_path = saved_library_path
         ours_missing.unlink(missing_ok=True)
 
+    # --- 1.6.51：图像转换改成中键平移；模型配色页 -------------------------------
+    import json as _json  # noqa: E402
+    import struct as _struct  # noqa: E402
+
+    from PIL import Image as _PILImage  # noqa: E402
+
+    from app.ui.model_page import ModelPage  # noqa: E402
+    from app.ui.picture_page import PicturePage  # noqa: E402
+
+    pan_file = TEMP / "pan-probe.png"
+    _PILImage.new("RGB", (400, 300), (30, 120, 220)).save(pan_file)
+    # 平移要用主窗口里那一个（它才带耗材库）；空库的 PicturePage 连匹配都算不出来。
+    for pan_name, pan_hex in (("探针白", "#F2F0EB"), ("探针蓝", "#2F5BB8")):
+        window.library.create(brand="探针", material_type="PETG HF", color_hex=pan_hex, name=pan_name)
+    window._reload_library()
+    pan_page = window._picture_page
+    pan_page.resize(240, 200)
+    pan_page.show()
+    pan_page.loadImage(pan_file)
+    for _ in range(6):
+        app.processEvents()
+    check(pan_page._result is not None, "图像转换：探针图匹配出来了")
+    pan_view = pan_page._view
+    pan_view.zoom_by(2.5, QPointF(120, 100))
+    app.processEvents()
+    start_pan = QPointF(pan_view._pan)
+
+    def _send(widget, event_type, x, y, button, buttons, modifier=Qt.KeyboardModifier.NoModifier):
+        event = QMouseEvent(event_type, QPointF(x, y), QPointF(x, y), button, buttons, modifier)
+        if event_type == QEvent.Type.MouseMove:
+            widget.mouseMoveEvent(event)
+        elif event_type == QEvent.Type.MouseButtonRelease:
+            widget.mouseReleaseEvent(event)
+        else:
+            widget.mousePressEvent(event)
+
+    _send(pan_view, QEvent.Type.MouseButtonPress, 100, 80, Qt.MouseButton.MiddleButton, Qt.MouseButtons.MiddleButton)
+    check(pan_view._panning, "图像转换：按住中键开始平移")
+    _send(pan_view, QEvent.Type.MouseMove, 124, 96, Qt.MouseButton.NoButton, Qt.MouseButtons.MiddleButton)
+    _send(pan_view, QEvent.Type.MouseButtonRelease, 124, 96, Qt.MouseButton.MiddleButton, Qt.MouseButtons.NoButton)
+    check(not pan_view._panning, "图像转换：松开中键结束平移")
+    check(pan_view._pan != start_pan, f"图像转换：中键拖拽把视图平移了 {start_pan} -> {pan_view._pan}")
+    check(not hasattr(pan_view, "_dragged"), "图像转换：左键不再兼任平移")
+    left_pan = QPointF(pan_view._pan)
+    _send(pan_view, QEvent.Type.MouseButtonPress, 60, 60, Qt.MouseButton.LeftButton, Qt.MouseButtons.LeftButton)
+    _send(pan_view, QEvent.Type.MouseMove, 90, 90, Qt.MouseButton.NoButton, Qt.MouseButtons.LeftButton)
+    _send(pan_view, QEvent.Type.MouseButtonRelease, 90, 90, Qt.MouseButton.LeftButton, Qt.MouseButtons.NoButton)
+    check(pan_view._pan == left_pan, "图像转换：左键拖不改平移")
+
+    def _write_probe_glb(path) -> None:
+        corners = np.array(
+            [
+                [-0.5, -0.5, -0.5], [0.5, -0.5, -0.5], [0.5, 0.5, -0.5], [-0.5, 0.5, -0.5],
+                [-0.5, -0.5, 0.5], [0.5, -0.5, 0.5], [0.5, 0.5, 0.5], [-0.5, 0.5, 0.5],
+            ],
+            dtype="<f4",
+        )
+        faces = np.array(
+            [
+                [0, 1, 2], [0, 2, 3], [4, 6, 5], [4, 7, 6], [0, 4, 5], [0, 5, 1],
+                [1, 5, 6], [1, 6, 2], [2, 6, 7], [2, 7, 3], [3, 7, 4], [3, 4, 0],
+            ],
+            dtype="<u4",
+        )
+        blob = bytearray(corners.tobytes()) + bytearray(faces.tobytes())
+        views = [
+            {"buffer": 0, "byteOffset": 0, "byteLength": int(corners.nbytes)},
+            {"buffer": 0, "byteOffset": int(corners.nbytes), "byteLength": int(faces.nbytes)},
+        ]
+        accessors = [
+            {"bufferView": 0, "componentType": 5126, "count": int(len(corners)), "type": "VEC3"},
+            {"bufferView": 1, "componentType": 5125, "count": int(faces.size), "type": "SCALAR"},
+        ]
+        document = {
+            "asset": {"version": "2.0"},
+            "scene": 0,
+            "scenes": [{"nodes": [0]}],
+            "nodes": [{"mesh": 0, "name": "probe"}],
+            "meshes": [
+                {
+                    "name": "probe",
+                    "primitives": [
+                        {"attributes": {"POSITION": 0}, "indices": 1, "material": 0}
+                    ],
+                }
+            ],
+            "materials": [{"pbrMetallicRoughness": {"baseColorFactor": [0.8, 0.06, 0.06, 1.0]}}],
+            "accessors": accessors,
+            "bufferViews": views,
+            "buffers": [{"byteLength": len(blob)}],
+        }
+        payload = _json.dumps(document).encode("utf-8")
+        while len(payload) % 4:
+            payload += b" "
+        while len(blob) % 4:
+            blob += b"\x00"
+        total = 12 + 8 + len(payload) + 8 + len(blob)
+        path.write_bytes(
+            _struct.pack("<4sII", b"glTF", 2, total)
+            + _struct.pack("<II", len(payload), 0x4E4F534A)
+            + payload
+            + _struct.pack("<II", len(blob), 0x004E4942)
+            + bytes(blob)
+        )
+
+    check(window._tabs.count() == 3, f"主窗口有 3 个页签，got {window._tabs.count()}")
+    check(window._tabs.tabText(2) == "模型配色", f"第三个页签是「模型配色」，got {window._tabs.tabText(2)!r}")
+    from app.core.mixes import MixCatalog as _MixCatalog  # noqa: E402
+    from app.core.library import FilamentLibrary as _FilamentLibrary  # noqa: E402
+
+    probe_library = _FilamentLibrary()
+    for name, hex_value in (
+        ("探针白", "#F2F0EB"),
+        ("探针黑", "#17181C"),
+        ("探针红", "#C8342E"),
+        ("探针绿", "#2FA84F"),
+    ):
+        probe_library.create(brand="探针", material_type="PETG HF", color_hex=hex_value, name=name)
+    probe_catalog = _MixCatalog(probe_library.visible).build()
+    model_page = ModelPage()
+    model_page.setLibrary(probe_library, probe_catalog)
+    glb_file = TEMP / "probe-model.glb"
+    _write_probe_glb(glb_file)
+    check(model_page.loadModel(glb_file), "模型配色页能打开 GLB")
+    loaded_model = model_page.model
+    check(loaded_model is not None and loaded_model.triangle_count == 12,
+          f"GLB 读出 12 个三角形，got {None if loaded_model is None else loaded_model.triangle_count}")
+    check(loaded_model is not None and len(loaded_model.primitives) == 1, "GLB 读出 1 个图元")
+    model_match = model_page.match
+    check(model_match is not None and len(model_match.colours) >= 1, "读出了模型上的颜色")
+    preview_hexes = model_page.previewHexes()
+    check(len(preview_hexes) == len(model_match.colours) if model_match else False,
+          "预览色数等于配色色数")
+    check(all(len(value) == 7 and value.startswith("#") for value in preview_hexes),
+          f"预览色都是 #RRGGBB：{preview_hexes}")
+    check(model_match is not None and model_match.spool_count >= 1, "配色至少用了一卷耗材")
+    check("ΔE00" in model_page.statusText(), f"状态行带 ΔE00：{model_page.statusText()[:90]!r}")
+    check("三角形" in model_page._model_label.text(), "模型名字行带三角形数")
+    check(bool(model_page.table_text().strip()), "配色表有内容")
+    check(isinstance(model_page._source_view.hasOpenGL(), bool), "三维视图能回答有没有 OpenGL")
+    check(isinstance(model_page._source_view.available(), str), "三维视图能给出不可用原因")
+    model_page.close()
+
     window.close()
 
     print(f"checks: {CHECKS}")

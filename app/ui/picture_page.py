@@ -145,10 +145,8 @@ ZOOM_MIN = 1.0
 ZOOM_MAX = 12.0
 #: One wheel notch multiplies the zoom by this much.
 ZOOM_STEP = 1.25
-#: A press that moves fewer than this many pixels counts as a click, not a drag.
-DRAG_SLOP = 3.0
 #: The two picture panels are panned and zoomed the same way.
-ZOOM_HINT = "滚轮缩放，按住左键拖动平移，双击还原成整张。"
+ZOOM_HINT = "滚轮缩放，按住鼠标中键拖动平移，双击还原成整张。"
 
 #: 图片匹配默认值。颜色数量直接顶到 Bambu Studio 的天花板：混色就是为了用少数
 #: 几卷料凑出一整张图，用户既然在用混色，就没有理由再自己往回缩。
@@ -595,7 +593,7 @@ class PictureView(QWidget):
         self._pan = QPointF(0.0, 0.0)
         self._press_pos: QPointF | None = None
         self._last_pos: QPointF | None = None
-        self._dragged = False
+        self._panning = False
         #: 「按颜色选择」 or 「按色块边缘选择」 — owned by the page, saved in settings.
         self._pick_mode = DEFAULT_PICK_MODE
         #: 「按色块边缘选择」下的色块编号图（``-1`` = 没打印），点图片时用它找块。
@@ -922,47 +920,45 @@ class PictureView(QWidget):
         event.accept()
 
     def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt naming
-        if event.button() != Qt.MouseButton.LeftButton or self._result is None:
+        if self._result is None:
             return
-        # 「点一下挑颜色」和「按住拖动平移」共用左键，所以按下时只记录起点，
-        # 究竟算哪一种，等松手时按移动距离判断。
-        position = event.position()
-        self._press_pos = QPointF(position)
-        self._last_pos = QPointF(position)
-        self._dragged = False
-        if self._zoom > ZOOM_MIN:
+        button = event.button()
+        if button == Qt.MouseButton.MiddleButton:
+            # 平移专用中键（1.6.51，m20572 item 1）。在此之前左键既挑颜色又平移，
+            # 只能靠移动距离猜用户想干哪一件；现在左键只挑颜色，中键只平移。
+            self._panning = True
+            self._last_pos = QPointF(event.position())
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
+        if button != Qt.MouseButton.LeftButton:
+            return
+        self._press_pos = QPointF(event.position())
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802 - Qt naming
-        if self._press_pos is None or self._last_pos is None:
+        if not self._panning or self._last_pos is None:
             return
         position = event.position()
-        if not self._dragged:
-            moved = position - self._press_pos
-            if abs(moved.x()) + abs(moved.y()) < DRAG_SLOP:
-                return
-            self._dragged = True
-        if self._zoom <= ZOOM_MIN:
-            return
         self._target_rect()  # refreshes _fit_scale before the pan is clamped
         draw_w, draw_h = self._draw_size()
         self._pan = self._clamped_pan(self._pan + (position - self._last_pos), draw_w, draw_h)
         self._last_pos = QPointF(position)
         self.update()
+        event.accept()
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        if event.button() == Qt.MouseButton.MiddleButton:
+            if self._panning:
+                self._panning = False
+                self._last_pos = None
+                self.unsetCursor()
+                event.accept()
+            return
         if event.button() != Qt.MouseButton.LeftButton:
             return
         press = self._press_pos
-        dragged = self._dragged
         self._press_pos = None
-        self._last_pos = None
-        self._dragged = False
-        self.unsetCursor()
         if press is None:
-            return
-        if dragged:
-            # 这是一次平移：画面动过了，鼠标下已经不是用户当初点的那个像素。
             return
         self._pick_at(event.position())
 
@@ -972,8 +968,6 @@ class PictureView(QWidget):
         # 双击 = 「我看够了，还我整张」。顺手丢掉这次按下留下的状态，免得松手时
         # 又当成一次点选。
         self._press_pos = None
-        self._last_pos = None
-        self._dragged = False
         self.unsetCursor()
         self.reset_zoom()
 

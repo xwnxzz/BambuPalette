@@ -76,6 +76,9 @@ VERSION_INFO = VSVersionInfo(
 EXCLUDES = [
     # Qt modules this application never touches.  Trimming them keeps the
     # bundle around 90 MB instead of 250 MB+.
+    # QtOpenGL / QtOpenGLWidgets used to be in this list; 1.6.51's 「模型配色」
+    # page draws with QOpenGLWidget, so freezing them out made the packaged exe
+    # fail at import time (a windowed build shows that as a dead dialog).
     "PySide6.Qt3DAnimation",
     "PySide6.Qt3DCore",
     "PySide6.Qt3DExtras",
@@ -92,8 +95,6 @@ EXCLUDES = [
     "PySide6.QtMultimedia",
     "PySide6.QtMultimediaWidgets",
     "PySide6.QtNfc",
-    "PySide6.QtOpenGL",
-    "PySide6.QtOpenGLWidgets",
     "PySide6.QtPdf",
     "PySide6.QtPdfWidgets",
     "PySide6.QtPositioning",

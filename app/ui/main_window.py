@@ -76,6 +76,7 @@ from .help import HelpDialog
 from .mix_detail import MixDetail
 from .mix_grid import MixGrid
 from .picture_page import PicturePage
+from .model_page import ModelPage
 from .selectable import selectable_text
 from .swatch import ColorField, swatch_icon
 
@@ -304,10 +305,12 @@ class MainWindow(QMainWindow):
         mix_layout.addWidget(splitter, 1)
 
         self._picture_page = PicturePage()
+        self._model_page = ModelPage()
 
         tabs = QTabWidget()
         tabs.addTab(mix_page, "颜色配方")
         tabs.addTab(self._picture_page, "图像转换")
+        tabs.addTab(self._model_page, "模型配色")
         self._tabs = tabs
         # Connected only once _tabs exists: adding the first tab already emits
         # currentChanged, and the slot reads self._tabs.
@@ -983,6 +986,8 @@ class MainWindow(QMainWindow):
         self._detail.setContext(self.library, self._catalog.engine)
         if getattr(self, "_picture_page", None) is not None:
             self._picture_page.setLibrary(self.library, self._catalog)
+        if getattr(self, "_model_page", None) is not None:
+            self._model_page.setLibrary(self.library, self._catalog)
         if self._pair_filter is not None:
             a_id, b_id = self._pair_filter
             if self.library.get(a_id) is None or self.library.get(b_id) is None:
@@ -1121,6 +1126,8 @@ class MainWindow(QMainWindow):
         # rather than at each of the three call sites above.
         ready = self._triples if self._triples is not None and self._triples.built else None
         self._picture_page.setTriples(ready, self.library)
+        if getattr(self, "_model_page", None) is not None:
+            self._model_page.setTriples(ready, self.library)
 
     def _ordered_combined(self, sort_key: str):
         """当前排序下的懒视图；排好的那一次留着，来回切设置不再重排。"""
