@@ -1764,8 +1764,9 @@ def main() -> int:
     app.processEvents()
 
     # --- 导入 SVG 当原图（m13907 item 2）---------------------------------
-    # 矢量图没有分辨率，按它在文件里声明的那一档（这里是 60×30）渲染成位图，再走后面的
-    # 全流程；渲染器和屏幕上是同一个 Qt 渲染器，所以颜色与透明度都不用自己解释。
+    # 矢量图没有分辨率：导入时弹窗问「渲成多少像素」（1.6.49，m20069），默认值就是它在文件
+    # 里声明的那一档（这里是 60×30），所以直接回车就是 1.6.48 的行为。冒烟里没有人能点那个
+    # 框，所以把 `_ask_vector_size` 换成一个脚本，再走后面的全流程。
     vector_target = TEMP / "vector.svg"
     vector_target.write_text(
         '<svg xmlns="http://www.w3.org/2000/svg" width="60" height="30" viewBox="0 0 60 30">'
@@ -1775,11 +1776,27 @@ def main() -> int:
         "</svg>",
         encoding="utf-8",
     )
-    page.loadImage(vector_target)
-    app.processEvents()
+    vector_asked = []
+
+    def _vector_size_from_script(parent, path, declared):
+        vector_asked.append((path.name, tuple(declared)))
+        return (120, 60)
+
+    real_ask_vector_size = _picture_page._ask_vector_size
+    _picture_page._ask_vector_size = _vector_size_from_script
+    try:
+        page.loadImage(vector_target)
+        app.processEvents()
+    finally:
+        _picture_page._ask_vector_size = real_ask_vector_size
     check(
-        page._image is not None and page._image.size == (60, 30),
-        f"导入 SVG 会按它在文件里声明的尺寸渲染成位图（m16941 第 1 条），"
+        vector_asked == [("vector.svg", (60, 30))],
+        f"导入 SVG 会先弹窗问「渲成多少像素」，默认值就是它在文件里声明的那一档（1.6.49），"
+        f"got {vector_asked}",
+    )
+    check(
+        page._image is not None and page._image.size == (120, 60),
+        f"弹窗里写 120×60，渲出来就是 120×60 的位图（1.6.49），"
         f"got {None if page._image is None else page._image.size}",
     )
     check(
@@ -1790,8 +1807,24 @@ def main() -> int:
         page._image is not None and page._span == max(page._image.size),
         f"导入之后匹配栅格取图片自己的像素数，got {page._span}",
     )
+    bitmap_before = len(vector_asked)
     page.loadImage(sample)
     app.processEvents()
+    check(
+        len(vector_asked) == bitmap_before,
+        f"位图导入不弹那个框 —— 放大只是插值（1.6.49），got {len(vector_asked)} 次",
+    )
+    kept = (page._image, page._image_name, page._span)
+    _picture_page._ask_vector_size = lambda parent, path, declared: None
+    try:
+        page.loadImage(vector_target)
+        app.processEvents()
+    finally:
+        _picture_page._ask_vector_size = real_ask_vector_size
+    check(
+        (page._image, page._image_name, page._span) == kept,
+        "弹窗里按「取消」⇒ 这张 SVG 不导入，原图、图名、栅格一个都不动（1.6.49）",
+    )
 
     # --- 删除「最大边长」：导入即按图片自身的像素数（m16941 第 1 条）-------------
     # 界面上不再有这个数字框：位图一进来栅格就是它自己的最长边，状态行写「一格就是一个

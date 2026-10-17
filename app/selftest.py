@@ -2912,7 +2912,8 @@ def run_selftest(*, report_path: Path | None = None) -> int:
             f"状态栏说明导出了原图：{page._status.text()[:28]}",
         )
 
-        # m13907 item 2：矢量图（SVG）先按「最大边长」渲染成位图再走全流程。
+        # m13907 item 2：矢量图（SVG）先渲染成位图再走全流程；1.6.49（m20069）起渲成
+        # 多少像素由导入弹窗里的用户定，`_load_vector(..., size=…)` 明着给尺寸。
         vector_target = scratch / "vector.svg"
         vector_target.write_text(
             '<svg xmlns="http://www.w3.org/2000/svg" width="60" height="30" viewBox="0 0 60 30">'
@@ -2929,6 +2930,51 @@ def run_selftest(*, report_path: Path | None = None) -> int:
             rendered_vector.convert("RGB").getpixel((60, 30)) == (232, 199, 189),
             f"SVG 的颜色按 Qt 的渲染来：{rendered_vector.convert('RGB').getpixel((60, 30))}",
         )
+        check(
+            _pp._vector_declared_size(vector_target) == (60, 30),
+            f"弹窗的默认值读的是 SVG 自己声明的尺寸：{_pp._vector_declared_size(vector_target)}",
+        )
+        check(
+            _pp._load_vector(vector_target, 1, size=(90, 45)).size == (90, 45),
+            f"弹窗写了 90×45 就渲成 90×45（宽长各自独立）："
+            f"{_pp._load_vector(vector_target, 1, size=(90, 45)).size}",
+        )
+
+        # 弹窗自己：默认值、范围、锁定长宽比、实时写出来的板尺寸。
+        size_dialog = _pp.SvgSizeDialog((60, 30), name="vector.svg")
+        check(
+            size_dialog.chosen() == (60, 30),
+            f"弹窗默认填声明尺寸，直接回车就是 1.6.48 的行为：{size_dialog.chosen()}",
+        )
+        check(
+            (size_dialog._width.minimum(), size_dialog._width.maximum()) == (16, 4096)
+            and (size_dialog._height.minimum(), size_dialog._height.maximum()) == (16, 4096),
+            f"宽长两个框都能写 16～4096："
+            f"{size_dialog._width.minimum()}～{size_dialog._width.maximum()} / "
+            f"{size_dialog._height.minimum()}～{size_dialog._height.maximum()}",
+        )
+        check(size_dialog._lock.isChecked(), "「锁定长宽比」默认勾着")
+        size_dialog._width.setValue(120)
+        check(
+            size_dialog.chosen() == (120, 60),
+            f"锁着的时候改宽，长按原比例跟着走：{size_dialog.chosen()}",
+        )
+        size_dialog._height.setValue(90)
+        check(
+            size_dialog.chosen() == (180, 90),
+            f"锁着的时候改长，宽按原比例跟着走：{size_dialog.chosen()}",
+        )
+        size_dialog._lock.setChecked(False)
+        size_dialog._width.setValue(200)
+        check(
+            size_dialog.chosen() == (200, 90),
+            f"取消锁定之后两边各自独立（能拉成不等比）：{size_dialog.chosen()}",
+        )
+        check(
+            "80.0 × 36.0 mm" in size_dialog._note.text(),
+            f"框里实时写着这么渲出来是多大的板（一格 0.4 mm）：{size_dialog._note.text()}",
+        )
+        size_dialog.deleteLater()
 
         if zipfile.is_zipfile(three_mf):
             with zipfile.ZipFile(three_mf) as archive:

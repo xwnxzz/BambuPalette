@@ -134,6 +134,11 @@ PNG_FILTER = "PNG 图片 (*.png);;所有文件 (*)"
 #: 像素可认。1.6.44 起渲染不再设上限 —— 拿来一个图标渲染成多大，由它自己的尺寸和栅格决定（m17910 第 2 条）。
 SVG_SUFFIXES = frozenset({".svg"})
 
+#: 导入 SVG 时那个弹窗里能写的像素数（1.6.49）。小到 16 已经和图标差不多大，大到 4096
+#: 一格 0.4 mm 就是 1638 mm 的板；中间任何一档都合法，默认值是它在文件里声明的那一档。
+VECTOR_MIN_PX = 16
+VECTOR_MAX_PX = 4096
+
 #: Wheel zoom runs between 「整张铺满面板」 (1.0) and this many times the fit.
 ZOOM_MIN = 1.0
 ZOOM_MAX = 12.0
@@ -277,8 +282,13 @@ PAGE_HELP = (
     "1.6.42 起导入时按图片自己的像素数定栅格，所以上面的数字只剩在「打开的是老工程」时才会出现；"
     "那种情况下状态行会写着原图尺寸、匹配栅格和缩小了几倍。\n"
     "· 导入图片时按图片自己的像素数建匹配栅格（1.6.43 起不再有「最大边长」数字框，1.6.44 起连上限"
-    "也没有）：一格 0.4 mm，板的长宽就是像素数 × 0.4。 图片多少像素就按多少像素分（没有上限），"
-    "SVG 也按它在文件里声明的那一档渲。 图越大匹配越慢，那是像素数本身的事。\n"
+    "也没有）：一格 0.4 mm，板的长宽就是像素数 × 0.4。 图片多少像素就按多少像素分（没有上限）。"
+    "图越大匹配越慢，那是像素数本身的事。\n"
+    "· 导入 SVG（矢量图）时会先弹一个框问「渲成多少像素」（1.6.49 起）：默认填的正是它在文件里声明"
+    "的那一档，所以直接回车就是老行为；渲得大一点，细笔画（猪尾巴那种一两像素的卷）才有像素，颜色"
+    "也分得更开。 框里能写 16～4096，勾着「锁定长宽比」时改一边另一边按原比例跟着走，取消它就能拉"
+    "成不等比，下面实时写着这么渲出来是多大的板。 按「取消」这张图就不导入，原来那张原图不动。"
+    "位图不弹这个框 —— 放大只是插值，多不出细节。\n"
     "· 「底板颜色」点「更换底板颜色」可以从**整套混色**里挑任意一种当底板（1.6.43 起，跟「更换颜色」用同"
     "一个框，能按 ΔE00 排序、也能搜）：挑的正好是图上某一卷时，底板跟那一卷共用一个耗材槽；"
     "不在图上时它自己占一个槽写进 3MF，那一片的混色配方才带得过去；不挑就跟着占像素最多的那一块"
@@ -489,13 +499,11 @@ def _to_qimage(image: Image.Image) -> QImage:
     return qimage.copy()
 
 
-def _load_vector(path: Path, target: int) -> Image.Image:
-    """SVG → 位图（m13907 item 2）。
+def _vector_declared_size(path: Path) -> tuple[int, int]:
+    """这张 SVG 在文件里声明的宽 × 长（弹窗的默认值，1.6.49）。
 
-    用 Qt 自己的 QSvgRenderer：跟屏幕上画的是同一个渲染器，颜色和透明度不用自己解释，
-    也不多一个依赖。渲染边长取「SVG 自己声明的尺寸」与调用方要的 ``target`` 里较大的那个：
-    矢量图放大不掉细节，渲得大一点，细笔画才落在像素上。 1.6.44 起不再设上限 —— 渲多大由
-    图片自己的尺寸与调用方要的栅格决定。
+    只做「打开、问一句」这一件事，渲染留给 ``_load_vector``；两者用的是同一个
+    ``QSvgRenderer``，所以弹窗里写下的数就是真渲出来的数。
     """
     if QSvgRenderer is None:  # pragma: no cover - 只有打包漏收 QtSvg 才会走到这里
         raise ValueError("这个版本没带上 SVG 支持（缺 QtSvg），请先导出成 PNG 再导入。")
@@ -503,10 +511,37 @@ def _load_vector(path: Path, target: int) -> Image.Image:
     if not renderer.isValid():
         raise ValueError(f"这张 SVG 读不出来：{path.name}")
     declared = renderer.defaultSize()
-    span = max(1, declared.width(), declared.height())
-    scale = max(1.0, float(target) / span)
-    width = max(1, round(max(1, declared.width()) * scale))
-    height = max(1, round(max(1, declared.height()) * scale))
+    return (max(1, declared.width()), max(1, declared.height()))
+
+
+def _load_vector(
+    path: Path, target: int = 1, *, size: tuple[int, int] | None = None
+) -> Image.Image:
+    """SVG → 位图（m13907 item 2）。
+
+    用 Qt 自己的 QSvgRenderer：跟屏幕上画的是同一个渲染器，颜色和透明度不用自己解释，
+    也不多一个依赖。
+
+    ``size`` 是用户在导入弹窗里写下的「宽 × 长」像素数（1.6.49，m20069），给了就照它渲
+    —— 宽和长各自独立，用户锁了长宽比的话弹窗已经替他算好。没给就按 ``target``：渲染
+    边长取「SVG 自己声明的尺寸」与 ``target`` 里较大的那个 —— 矢量图放大不掉细节，渲得
+    大一点，细笔画才落在像素上。1.6.44 起不再设上限 —— 渲多大由图片自己的尺寸与调用方
+    要的栅格决定（m17910 第 2 条）。
+    """
+    if QSvgRenderer is None:  # pragma: no cover - 只有打包漏收 QtSvg 才会走到这里
+        raise ValueError("这个版本没带上 SVG 支持（缺 QtSvg），请先导出成 PNG 再导入。")
+    renderer = QSvgRenderer(QByteArray(path.read_bytes()))
+    if not renderer.isValid():
+        raise ValueError(f"这张 SVG 读不出来：{path.name}")
+    declared = renderer.defaultSize()
+    if size is None:
+        span = max(1, declared.width(), declared.height())
+        scale = max(1.0, float(target) / span)
+        width = max(1, round(max(1, declared.width()) * scale))
+        height = max(1, round(max(1, declared.height()) * scale))
+    else:
+        width = max(1, int(size[0]))
+        height = max(1, int(size[1]))
     canvas = QImage(width, height, QImage.Format.Format_RGBA8888)
     canvas.fill(0)
     painter = QPainter(canvas)
@@ -1563,6 +1598,131 @@ class MergeDialog(QDialog):
         return int(item.data(Qt.ItemDataRole.UserRole))
 
 
+class SvgSizeDialog(QDialog):
+    """导入 SVG 时问一句「渲成多少像素」（1.6.49，m20069）。
+
+    为什么只对矢量图问：位图有多少像素就多少像素 —— 放大只是插值。m19452 量过：240 px
+    的图插到 512，第一行平均 ΔE00 从 4.82 掉到 7.00（最差 7.46→13.35、差块 4→6、颜色
+    7→9），插出来的过渡色只会让四卷耗材去追更多颜色。矢量图没有分辨率，渲得大出来的是
+    **真**细节：同一张声明 240×240 的 SVG（m20031 那张猪），渲成 512 时第一行 21 种颜色、
+    预览顺滑，渲成 240 时细笔画只剩 1 px 宽，灰色描边和背景渐变被并成 7 种颜色。
+
+    默认值就是它在文件里声明的宽 × 长，所以直接回车等于 1.6.48 的行为；「锁定长宽比」默认
+    勾着（改一边另一边按原始比例跟着走，取整到整数像素），想要非等比拉伸就取消它。
+    """
+
+    def __init__(
+        self, declared: tuple[int, int], *, name: str = "", parent: QWidget | None = None
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("这张 SVG 渲成多少像素")
+        self._ratio = (declared[1] / declared[0]) if declared[0] else 1.0
+        self._syncing = False
+
+        self._width = QSpinBox()
+        self._height = QSpinBox()
+        for box, value in ((self._width, declared[0]), (self._height, declared[1])):
+            box.setRange(VECTOR_MIN_PX, VECTOR_MAX_PX)
+            box.setSuffix(" px")
+            box.setAccelerated(True)
+            box.setValue(min(VECTOR_MAX_PX, max(VECTOR_MIN_PX, int(value))))
+        self._width.valueChanged.connect(self._on_width)
+        self._height.valueChanged.connect(self._on_height)
+
+        self._lock = QCheckBox("锁定长宽比")
+        self._lock.setChecked(True)
+        self._lock.toggled.connect(lambda _on: self._sync_note())
+
+        hint = QLabel(
+            f"{name} 是矢量图，没有分辨率：渲得大一点，细笔画才有像素。"
+            "位图不弹这个框 —— 放大只是插值，多不出细节。"
+        )
+        hint.setProperty("role", "hint")
+        hint.setWordWrap(True)
+
+        self._note = QLabel()
+        self._note.setProperty("role", "hint")
+        self._note.setWordWrap(True)
+        self._sync_note()
+
+        row_width = QHBoxLayout()
+        row_width.addWidget(QLabel("宽度"))
+        row_width.addWidget(self._width)
+        row_width.addStretch(1)
+        row_height = QHBoxLayout()
+        row_height.addWidget(QLabel("长度"))
+        row_height.addWidget(self._height)
+        row_height.addStretch(1)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        ok = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        ok.setText("用这个尺寸导入")
+        ok.setProperty("accent", "true")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        box = QVBoxLayout(self)
+        box.setContentsMargins(14, 14, 14, 14)
+        box.setSpacing(10)
+        box.addWidget(hint)
+        box.addLayout(row_width)
+        box.addLayout(row_height)
+        box.addWidget(self._lock)
+        box.addWidget(self._note)
+        box.addWidget(buttons)
+        self.resize(430, 230)
+        selectable_text(self)
+
+    def chosen(self) -> tuple[int, int]:
+        """用户写下的宽 × 长（px）。"""
+        return (int(self._width.value()), int(self._height.value()))
+
+    def _on_width(self, value: int) -> None:
+        if self._syncing:
+            return
+        if self._lock.isChecked():
+            self._syncing = True
+            self._height.setValue(self._clamp(round(value * self._ratio)))
+            self._syncing = False
+        self._sync_note()
+
+    def _on_height(self, value: int) -> None:
+        if self._syncing:
+            return
+        if self._lock.isChecked() and self._ratio:
+            self._syncing = True
+            self._width.setValue(self._clamp(round(value / self._ratio)))
+            self._syncing = False
+        self._sync_note()
+
+    @staticmethod
+    def _clamp(value: int) -> int:
+        return max(VECTOR_MIN_PX, min(VECTOR_MAX_PX, int(value)))
+
+    def _sync_note(self) -> None:
+        width, height = self.chosen()
+        self._note.setText(
+            f"匹配 {width * height:,} 个像素：板 {width * CELL_MM:.1f} × {height * CELL_MM:.1f} mm"
+            f"（一格 {CELL_MM} mm），渲出来的就是 {width} × {height} 像素的位图。"
+        )
+
+
+def _ask_vector_size(
+    parent: QWidget | None, path: Path, declared: tuple[int, int]
+) -> tuple[int, int] | None:
+    """导入 SVG 之前弹窗问一次（1.6.49）。用户按「取消」返回 ``None`` —— 这张图就不导入。
+
+    单独抽成一个函数是为了让闸门脚本能把它换掉：冒烟与自检里没有人能点那个框。
+    """
+    dialog = SvgSizeDialog(declared, name=path.name, parent=parent)
+    if dialog.exec() != QDialog.DialogCode.Accepted:
+        return None
+    return dialog.chosen()
+
+
 class PicturePage(QWidget):
     """Import a picture, match it against the filament library, export a plate."""
 
@@ -2137,25 +2297,33 @@ class PicturePage(QWidget):
     # -- matching ---------------------------------------------------------
     def loadImage(self, source) -> None:
         """Load ``source`` (path or PIL image) and match it straight away.
+
+        矢量图（SVG）先弹窗问「渲成多少像素」（1.6.49）；位图按它自己的像素导入。
         """
         if isinstance(source, (str, Path)):
             path = Path(source)
-            self._image_name = path.stem or "混色底板"
             if path.suffix.lower() in SVG_SUFFIXES:
-                # 矢量图先渲染成位图（m13907 item 2）：按它在文件里声明的那一档渲，细笔画
-                # 才有像素；之后整条流程（匹配、删除/合并、导出）跟位图导入完全一样。
-                # m16941 第 1 条去掉了「最大边长」输入框，这里就传 1：_load_vector 取
-                # 「SVG 自己声明的尺寸」与 target 里较大的那个，于是正好是它写的尺寸。
-                image = _load_vector(path, 1)
+                # 矢量图先渲染成位图（m13907 item 2）。渲成多少像素由用户在弹窗里定
+                # （1.6.49，m20069）：矢量没有分辨率，渲得大出来的是真细节，渲得小细笔画
+                # 就只剩一两像素宽（见 SvgSizeDialog 那张猪的实测）。弹窗的默认值是它在
+                # 文件里声明的那一档，所以直接回车就是 1.6.48 的行为。之后整条流程
+                # （匹配、删除/合并、导出）跟位图导入完全一样。
+                declared = _vector_declared_size(path)
+                chosen = _ask_vector_size(self, path, declared)
+                if chosen is None:
+                    return  # 用户取消：这张图不导入，原来那张原图一个像素都不动
+                image = _load_vector(path, 1, size=chosen)
             else:
                 image = Image.open(source)
+            self._image_name = path.stem or "混色底板"
         else:
             image = source
         self._source_size = (int(image.width), int(image.height))
-        # 图比框小的时候**不插值**（m19452 实测的结论）：240 px 的图插到 512，第一行从
-        # 平均 ΔE00 4.82 掉到 7.00（最差 7.46→13.35、差块 4→6、颜色从 7 变 9 —— 插出来的
-        # 过渡色让四卷耗材去追更多颜色）。所以这里一个像素都不动；1.6.48 起连那两个像素框
-        # 也没有了，用户再也写不出比原图大的数（m19523）。
+        # 位图一个像素都不插值（m19452 实测的结论）：240 px 的图插到 512，第一行从平均
+        # ΔE00 4.82 掉到 7.00（最差 7.46→13.35、差块 4→6、颜色 7→9）—— 插出来的过渡色
+        # 让四卷耗材去追更多颜色。所以位图按它自己的像素导入，界面上没有能写出更大数字的
+        # 地方（m19523 撤掉了那两个像素框）；矢量图不一样，1.6.49 起在导入时弹窗问一次
+        # 「渲成多少像素」（m20069），因为矢量放大是真细节，不是插值。
         # 位图按它自己的像素导入（m15721 第 2 条，m16941 第 1 条）：从前这里固定缩到最长边
         # 512，于是 2363 px 的照片一进来就只剩 512，细笔画全糊进格子里；后来改成一个要用户
         # 自己调的「最大边长」框，现在连框也没有了 —— 一格 0.4 mm，图多大板就多大。
