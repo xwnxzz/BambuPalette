@@ -65,7 +65,21 @@ DEFAULT_SETTINGS: dict = {
     "model_spools": 4,
     "model_only_spools": False,
     "model_flip_rotate": True,
+    #: 三维视图底色（1.6.54，m22211 第 6 条）：默认是 SolidWorks 视口那种浅蓝灰。
+    "model_background": "#B4C6D2",
     "shortcut_export_glb": "Ctrl+S",
+    # 1.6.54（m22211 第 7 条）：每个页自己的快捷键。允许跨页重复（同一时刻只有一页
+    # 在屏幕上），但同一个页里不许撞车 —— 撞了 settings_dialog 会拒绝保存。
+    "shortcut_picture_import": "Ctrl+O",
+    "shortcut_picture_rematch": "Ctrl+R",
+    "shortcut_picture_save_project": "Ctrl+S",
+    "shortcut_picture_export_png": "Ctrl+E",
+    "shortcut_model_open": "Ctrl+O",
+    "shortcut_model_rematch": "Ctrl+R",
+    "shortcut_model_export_obj": "Ctrl+Shift+E",
+    "shortcut_model_export_3mf": "Ctrl+Shift+M",
+    "shortcut_recipe_find": "Ctrl+F",
+    "shortcut_recipe_add": "Ctrl+N",
     "sort": "rgb",
 }
 

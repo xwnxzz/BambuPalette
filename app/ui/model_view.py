@@ -24,6 +24,9 @@ from ..core.glb import GlbModel
 
 #: Blender 默认相机是 50 mm 镜头，竖直视角约 39.6°。
 CAMERA_FOV = 39.6
+#: 视图底色默认值（1.6.54，m22211 第 6 条）：照 SolidWorks 视口的浅蓝灰。
+#: 想换颜色在「模型配色」页底行的「背景颜色」按钮里挑，挑完记在设置的 model_background。
+DEFAULT_BACKGROUND: tuple[int, int, int] = (180, 198, 210)
 #: 每次 4/6/8/2 转多少度（Blender 是 15°）。
 VIEW_STEP = 15.0
 #: 正/右/顶这些基准视角，单位是（yaw, pitch，度，Z 轴朝上）。
@@ -218,6 +221,8 @@ class _GLView(QOpenGLWidget):
         # 1.6.53（m21616 第 4 条）：左右拖动时模型旋转的方向。默认「翻转」——拖右往左转，
         # 也就是抓着模型转过来，而不是抓着相机绕着它走；设置里可以关掉。
         self._flip_orbit = True
+        #: 视图底色（1.6.54，m22211 第 6 条）。默认照 SolidWorks 的浅蓝灰。
+        self._background: tuple[int, int, int] = DEFAULT_BACKGROUND
         self.setMinimumSize(280, 220)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMouseTracking(False)
@@ -233,6 +238,11 @@ class _GLView(QOpenGLWidget):
         surface.setDepthBufferSize(24)
         surface.setSamples(4)
         self.setFormat(surface)
+
+    def setBackground(self, rgb: tuple[int, int, int]) -> None:
+        """改底色；下一帧 paintGL 就按它清屏。"""
+        self._background = (int(rgb[0]), int(rgb[1]), int(rgb[2]))
+        self.update()
 
     def setModel(self, model: GlbModel | None, colours: list[tuple[int, int, int]] | None = None) -> None:
         """顶点按三角形展开（不建索引缓冲）：``glDrawElements`` 在 PySide6 里要一个
@@ -354,7 +364,10 @@ class _GLView(QOpenGLWidget):
 
     def paintGL(self) -> None:  # noqa: N802 - Qt naming
         functions = self.context().functions()
-        functions.glClearColor(0.118, 0.122, 0.133, 1.0)
+        # 1.6.54（m22211 第 6 条）：底色可换，默认是 SolidWorks 那种浅蓝灰
+        # （DEFAULT_BACKGROUND，见下）。这里每帧从 _background 读，换色只要 setBackground。
+        red, green, blue = self._background
+        functions.glClearColor(red / 255.0, green / 255.0, blue / 255.0, 1.0)
         functions.glClear(0x4000 | 0x0100)  # GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT
         if self._program is None or not self._vertex_count or self._vertex_buffer is None:
             return
@@ -599,6 +612,19 @@ class ModelView(QWidget):
     def flipOrbit(self) -> bool:
         """当前是不是翻转着转。"""
         return self._flip_orbit
+
+    def setBackground(self, rgb: tuple[int, int, int]) -> None:
+        """换视图底色（1.6.54，m22211 第 6 条）。"""
+        self._background = (int(rgb[0]), int(rgb[1]), int(rgb[2]))
+        if self._gl is not None:
+            self._gl.setBackground(self._background)
+        if self._fallback is not None:
+            red, green, blue = self._background
+            self._fallback.setStyleSheet(f"background: rgb({red}, {green}, {blue});")
+
+    def background(self) -> tuple[int, int, int]:
+        """当前底色。"""
+        return self._background
 
     def setModel(self, model: GlbModel | None, colours: list[tuple[int, int, int]] | None = None) -> None:
         self._model = model

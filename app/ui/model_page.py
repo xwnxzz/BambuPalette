@@ -13,15 +13,17 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QEventLoop, QSize, Qt
-from PySide6.QtGui import QKeySequence, QShortcut
+from PySide6.QtGui import QColor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QCheckBox,
+    QColorDialog,
     QDialog,
     QFileDialog,
     QHBoxLayout,
@@ -43,11 +45,11 @@ from ..core.library import FilamentLibrary
 from ..core.mixes import MixCatalog
 from ..core.model_export import plate_from_model, write_glb
 from ..core.model_matching import ModelMatch, match_model_plans, summarise
-from ..core.settings import load_settings
+from ..core.settings import load_settings, save_settings
 from ..mesh.objfile import write_obj
 from ..mesh.threemf import slots_from_palette, write_3mf
 from .colour_picker import ColourPickerDialog, entry_recipe_text
-from .model_view import ModelView
+from .model_view import DEFAULT_BACKGROUND, ModelView
 from .plan_filter import SpoolFilterDialog
 from .selectable import selectable_text
 from .swatch import swatch_pixmap
@@ -132,20 +134,44 @@ class ModelPage(QWidget):
 
         layout.addLayout(self._build_bottom_row())
 
-        self._status = QLabel("打开一个 GLB 之后，这里会说明这次配色的结果。")
+        # 1.6.54（m22211 第 3 条）：这一行不再常驻那句「左边的原模型是按模型自己的颜色画的…」，
+        # 只在真有事要说（正在配色 / 出错 / 刚写完文件）时才出现；空着就整行收起来，
+        # 省下的高度归上面的三维视图。
+        self._status = QLabel("")
         self._status.setProperty("role", "hint")
         self._status.setWordWrap(True)
         selectable_text(self._status)
+        self._status.hide()
         layout.addWidget(self._status)
 
         self._save_shortcut = QShortcut(QKeySequence.StandardKey.Save, self)
         self._save_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         self._save_shortcut.activated.connect(self._on_export_glb)
 
+        # 1.6.54（m22211 第 7 条）：这一页另外四个动作也绑上按键，键值在「设置 → 模型配色」里改。
+        self._open_shortcut = QShortcut(QKeySequence("Ctrl+O"), self)
+        self._open_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self._open_shortcut.activated.connect(self._on_open_model)
+        self._rematch_shortcut = QShortcut(QKeySequence("Ctrl+R"), self)
+        self._rematch_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self._rematch_shortcut.activated.connect(lambda: self._on_rematch())
+        self._obj_shortcut = QShortcut(QKeySequence("Ctrl+Shift+E"), self)
+        self._obj_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self._obj_shortcut.activated.connect(lambda: self._on_export_plate("obj"))
+        self._three_mf_shortcut = QShortcut(QKeySequence("Ctrl+Shift+M"), self)
+        self._three_mf_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self._three_mf_shortcut.activated.connect(lambda: self._on_export_plate("3mf"))
+
         self._set_enabled(False)
         self.apply_settings(load_settings())
 
     # -- 界面 -------------------------------------------------------------
+    def _say(self, text: str) -> None:
+        """写状态行：有字就露出来，空字就整行收起来（1.6.54，m22211 第 3 条）。"""
+        text = text or ""
+        self._status.setText(text)
+        self._status.setVisible(bool(text.strip()))
+
     def _build_toolbar(self) -> QHBoxLayout:
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
@@ -223,6 +249,13 @@ class ModelPage(QWidget):
         row.addWidget(self._preview_view.takeBar())
         row.addStretch(1)
 
+        # 1.6.54（m22211 第 6 条）：三维视图的底色。点一下弹色盘，默认是 SolidWorks
+        # 那种浅蓝灰（DEFAULT_BACKGROUND）；选过的颜色记在设置的 model_background 里。
+        self._background_button = QPushButton("背景颜色")
+        self._background_button.setToolTip("换三维视图的底色（默认照 SolidWorks 的浅蓝灰）")
+        self._background_button.clicked.connect(self._on_pick_background)
+        row.addWidget(self._background_button)
+
         self._export_glb_button = QPushButton("导出 GLB")
         self._export_glb_button.setToolTip("存成带配色的 GLB（Ctrl+S），下次导入回来接着改")
         self._export_glb_button.clicked.connect(self._on_export_glb)
@@ -241,12 +274,14 @@ class ModelPage(QWidget):
         return row
 
     def _build_side_panel(self) -> QWidget:
-        panel = QWidget()
+        # 1.6.54（m22211 第 2 条）：「耗材方案」与「模型上色块的颜色」两块改成一个纵向
+        # 分割条的两半，跟图像转换页一样能拖 —— 之前是 0 / 1 的伸缩比，上面那块想吃
+        # 多少就吃多少，方案一多就把颜色列表压没了。
+        panel = QSplitter(Qt.Orientation.Vertical)
+        panel.setChildrenCollapsible(False)
+        panel.setHandleWidth(8)
         panel.setMinimumWidth(340)
-        panel.setMaximumWidth(480)
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
+        panel.setMaximumWidth(560)
 
         # -- 耗材方案（跟图像转换页一样：筛选 + 一句话 + 方案列表）----------
         plans_box, plans_inside = self._panel("耗材方案")
@@ -268,10 +303,9 @@ class ModelPage(QWidget):
         self._plan_list = QListWidget()
         self._plan_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self._plan_list.setWordWrap(True)
-        self._plan_list.setMaximumHeight(120)
         self._plan_list.currentRowChanged.connect(self._on_plan_changed)
         plans_inside.addWidget(self._plan_list)
-        layout.addWidget(plans_box, 0)
+        panel.addWidget(plans_box)
 
         # -- 模型上色块的颜色 -------------------------------------------------
         colours_box, colours_inside = self._panel("模型上色块的颜色")
@@ -295,7 +329,10 @@ class ModelPage(QWidget):
         self._redo_button.clicked.connect(self._on_redo)
         buttons.addWidget(self._redo_button)
         colours_inside.addLayout(buttons)
-        layout.addWidget(colours_box, 1)
+        panel.addWidget(colours_box)
+        panel.setStretchFactor(0, 0)
+        panel.setStretchFactor(1, 1)
+        panel.setSizes([380, 520])
         self._update_filter_hint()
         return panel
 
@@ -352,7 +389,11 @@ class ModelPage(QWidget):
 
     def _match_palette(self):
         head = self._candidate_palette()
-        if self._only_spools.isChecked() or self._triples is None:
+        if self._only_spools.isChecked():
+            # 1.6.54（m22211 第 4 条）：勾着就一个混色都不许进匹配器（兜底过滤，
+            # 与图像转换页同一套写法）。
+            return [entry for entry in head if entry.kind == "filament"]
+        if self._triples is None:
             return head
         if self._triple_palette is None or self._triple_head is not head:
             self._triple_palette = TriplePalette(head, self._triples, self._library)
@@ -406,7 +447,9 @@ class ModelPage(QWidget):
         self._on_rematch(drop_edits=True)
 
     def _on_only_spools(self, checked: bool) -> None:
-        self._candidates_plain = None if checked else self._candidates_plain
+        # 两张缓存都作废（1.6.54，m22211 第 4 条），跟图像转换页同一套写法。
+        self._candidates = None
+        self._candidates_plain = None
         self._triple_palette = None
         self._triple_head = None
         self._update_filter_hint()
@@ -426,7 +469,7 @@ class ModelPage(QWidget):
         try:
             model = load_model(path)
         except (OSError, ValueError) as error:
-            self._status.setText(f"这个文件读不出来：{error}")
+            self._say(f"这个文件读不出来：{error}")
             return False
         self._path = path
         self._model = model
@@ -440,14 +483,14 @@ class ModelPage(QWidget):
         )
         self._set_enabled(not model.is_empty)
         if model.is_empty:
-            self._status.setText("这个模型里没有三角形（点、线、面片之外的东西都会被跳过）。")
+            self._say("这个模型里没有三角形（点、线、面片之外的东西都会被跳过）。")
             self._list.clear()
             return False
         if model.skipped:
-            self._status.setText("；".join(model.skipped)[:400])
+            self._say("；".join(model.skipped)[:400])
         unavailable = self._source_view.available()
         if unavailable:
-            self._status.setText(f"{unavailable}；配色照常可用，只是画不出三维预览。")
+            self._say(f"{unavailable}；配色照常可用，只是画不出三维预览。")
         return self._on_rematch()
 
     def _on_setting_changed(self) -> None:
@@ -455,14 +498,14 @@ class ModelPage(QWidget):
             self._on_rematch(drop_edits=True)
 
     def _report(self, message: str, fraction: float) -> None:
-        self._status.setText(f"正在配色：{message}…")
+        self._say(f"正在配色：{message}…")
         QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
 
     def _on_rematch(self, *, drop_edits: bool = False) -> bool:
         if self._model is None or self._model.is_empty:
             return False
         if self._library is None or len(self._library) == 0:
-            self._status.setText("请先在「颜色配方」页添加耗材，再给模型配色。")
+            self._say("请先在「颜色配方」页添加耗材，再给模型配色。")
             return False
         if drop_edits:
             self._overrides = {}
@@ -470,7 +513,7 @@ class ModelPage(QWidget):
             self._redo.clear()
         colours = model_colours(self._model)
         if not colours:
-            self._status.setText("这个模型里没有读得出颜色的面。")
+            self._say("这个模型里没有读得出颜色的面。")
             return False
         try:
             self._plans = match_model_plans(
@@ -482,7 +525,7 @@ class ModelPage(QWidget):
                 progress=self._report,
             )
         except Exception as error:  # pragma: no cover - 防守
-            self._status.setText(f"配不出来：{error}")
+            self._say(f"配不出来：{error}")
             self._plans = []
             return False
         self._plan_index = max(0, min(self._plan_index, len(self._plans) - 1))
@@ -491,10 +534,10 @@ class ModelPage(QWidget):
         self._refresh_preview()
         self._fill_list()
         self._summary.setText(summarise(self._match, self._spool_names()) + "。")
-        self._status.setText(
-            "左边的原模型是按模型自己的颜色画的，右边是配色后的预览。"
-            "方案换了、颜色换过，都可以用「撤销 / 恢复」退回来。"
-        )
+        # 1.6.54（m22211 第 3 条）：那句「左边的原模型是按模型自己的颜色画的…」撤了，
+        # 配色成功后不再往状态行写东西 —— 数字都在上面的「耗材方案」里，这一行只在
+        # 出错、正在算、刚写完文件的时候才出现。
+        self._say("")
         self._update_history_buttons()
         return True
 
@@ -553,6 +596,42 @@ class ModelPage(QWidget):
         sequence = str(values.get("shortcut_export_glb") or "Ctrl+S")
         # QShortcut 没有 setKeySequence，换键要重新 setKey（Qt 6 的写法）。
         self._save_shortcut.setKey(QKeySequence(sequence))
+        for editor, key, fallback in (
+            (self._open_shortcut, "shortcut_model_open", "Ctrl+O"),
+            (self._rematch_shortcut, "shortcut_model_rematch", "Ctrl+R"),
+            (self._obj_shortcut, "shortcut_model_export_obj", "Ctrl+Shift+E"),
+            (self._three_mf_shortcut, "shortcut_model_export_3mf", "Ctrl+Shift+M"),
+        ):
+            editor.setKey(QKeySequence(str(values.get(key) or fallback)))
+        # 1.6.54（m22211 第 6 条）：底色也归设置管。存的是 #RRGGBB 字符串。
+        self._apply_background(str(values.get("model_background") or ""))
+
+    def _apply_background(self, text: str) -> None:
+        """把 ``#RRGGBB``（或空）变成视图底色；坏值就退回 SolidWorks 那档。"""
+        rgb = DEFAULT_BACKGROUND
+        match = re.fullmatch(r"#?([0-9a-fA-F]{6})", text.strip())
+        if match:
+            value = match.group(1)
+            rgb = (int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16))
+        for view in (self._source_view, self._preview_view):
+            view.setBackground(rgb)
+
+    def _on_pick_background(self) -> None:
+        """点「背景颜色」：弹系统色盘，选完立刻应用到两个视图并写进设置。"""
+        current = QColor(*self._source_view.background())
+        chosen = QColorDialog.getColor(current, self, "三维视图的底色")
+        if not chosen.isValid():
+            return
+        text = chosen.name().upper()
+        self._apply_background(text)
+        values = load_settings()
+        values["model_background"] = text
+        save_settings(values)
+        self._say(f"三维视图的底色改成 {text}。")
+
+    def background_hex(self) -> str:
+        """当前底色的 ``#RRGGBB``（闸门与探针用）。"""
+        return "#%02X%02X%02X" % self._source_view.background()
 
     # -- 换色 / 撤销 ---------------------------------------------------------
     def _shown_entry(self, colour_hex: str) -> PaletteEntry | None:
@@ -607,7 +686,7 @@ class ModelPage(QWidget):
     def _on_replace(self) -> None:
         colour_hex = self._selected_hex()
         if self._match is None or colour_hex is None:
-            self._status.setText("先在右边点一行颜色，再按「更换颜色」。")
+            self._say("先在右边点一行颜色，再按「更换颜色」。")
             return
         current = self._shown_entry(colour_hex)
         target_rgb = current.rgb if current is not None else (255, 255, 255)
@@ -629,7 +708,7 @@ class ModelPage(QWidget):
         self._overrides[colour_hex] = entry
         self._refresh_preview()
         self._fill_list()
-        self._status.setText(f"{colour_hex} 换成了 {entry.color_hex}（{entry_recipe_text(entry, self._library)}）。")
+        self._say(f"{colour_hex} 换成了 {entry.color_hex}（{entry_recipe_text(entry, self._library)}）。")
         self._update_history_buttons()
 
     def _on_undo(self) -> None:
@@ -639,7 +718,7 @@ class ModelPage(QWidget):
         self._overrides = self._undo.pop()
         self._refresh_preview()
         self._fill_list()
-        self._status.setText("撤销上一次换色。")
+        self._say("撤销上一次换色。")
         self._update_history_buttons()
 
     def _on_redo(self) -> None:
@@ -649,7 +728,7 @@ class ModelPage(QWidget):
         self._overrides = self._redo.pop()
         self._refresh_preview()
         self._fill_list()
-        self._status.setText("恢复刚才撤销的换色。")
+        self._say("恢复刚才撤销的换色。")
         self._update_history_buttons()
 
     def _update_history_buttons(self) -> None:
@@ -765,7 +844,7 @@ class ModelPage(QWidget):
             return
         target = Path(name)
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        self._status.setText(f"正在写入 {target.name}…")
+        self._say(f"正在写入 {target.name}…")
         QApplication.processEvents()
         try:
             if kind == "3mf":
@@ -780,11 +859,11 @@ class ModelPage(QWidget):
         except Exception as error:
             QApplication.restoreOverrideCursor()
             QMessageBox.warning(self, "保存失败", str(error))
-            self._status.setText(f"写不进 {target.name}：{error}")
+            self._say(f"写不进 {target.name}：{error}")
             return
         QApplication.restoreOverrideCursor()
         stats = plate.stats()
-        self._status.setText(
+        self._say(
             f"已生成 {written.name}：{stats['width_mm']} × {stats['depth_mm']} mm，"
             f"{stats['triangles']:,} 个三角面。"
         )
@@ -808,10 +887,10 @@ class ModelPage(QWidget):
         except Exception as error:
             QApplication.restoreOverrideCursor()
             QMessageBox.warning(self, "保存失败", str(error))
-            self._status.setText(f"写不进 {name}：{error}")
+            self._say(f"写不进 {name}：{error}")
             return
         QApplication.restoreOverrideCursor()
-        self._status.setText(
+        self._say(
             f"已导出 {written.name}：{len(colours)} 块材质换成了配色结果，再导入回来就能接着改。"
         )
 

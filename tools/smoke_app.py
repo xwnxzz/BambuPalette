@@ -4592,6 +4592,45 @@ def main() -> int:
     shot._only_spools.setChecked(False)
     check(any(entry.kind != "filament" for entry in shot._candidate_palette()),
           "图像转换页取消勾选后混色回来了")
+
+    # --- 1.6.54（m22211）----------------------------------------------------
+    # 第 1 条：那条只剩标题的顶栏撤了；第 3 条：模型页的状态行默认收起；
+    # 第 2 条：右栏是一个纵向分割条；第 6 条：底色可换；第 7 条：设置里的快捷键与撞车检查。
+    from PySide6.QtCore import Qt as _Qt  # noqa: E402, PLC0415
+    from PySide6.QtGui import QShortcut as _QShortcut  # noqa: E402, PLC0415
+    from PySide6.QtWidgets import QSplitter as _QSplitter, QWidget as _QWidget  # noqa: E402, PLC0415
+
+    from app.ui.settings_dialog import SettingsDialog  # noqa: E402, PLC0415
+
+    check(window.findChild(_QWidget, "topbar") is None, "顶栏那个大标题撤了")
+    check("左边的原模型" not in model_page._status.text(),
+          f"模型页不再常驻那句「左边的原模型…」（现在是 {model_page._status.text()!r}）")
+    model_page._say("")
+    check(model_page._status.isHidden(), "状态行空着的时候整行收起来")
+    vertical = [
+        splitter
+        for splitter in model_page.findChildren(_QSplitter)
+        if splitter.orientation() == _Qt.Orientation.Vertical
+    ]
+    check(bool(vertical), "模型页右栏是可拖的纵向分割条")
+    check(model_page.background_hex() == "#B4C6D2",
+          f"三维视图默认底色是 SolidWorks 的浅蓝灰，got {model_page.background_hex()!r}")
+    model_page._apply_background("#101010")
+    check(model_page.background_hex() == "#101010", "底色换得掉")
+    model_page._apply_background("#b4c6d2")
+    check(model_page.background_hex() == "#B4C6D2", "底色换得回来")
+    settings_dialog = SettingsDialog()
+    check(settings_dialog.conflicts() == "", "出厂快捷键同页不撞车")
+    settings_dialog._shortcut_pic_import.setKeySequence(settings_dialog._shortcut_pic_rematch.keySequence())
+    check("图像转换" in settings_dialog.conflicts(), "同页两个动作抢一个键会被指出来")
+    settings_dialog.close()
+    window_keys = {
+        shortcut.key().toString()
+        for shortcut in model_page.findChildren(_QShortcut)
+        if shortcut.key().toString()
+    }
+    check({"Ctrl+O", "Ctrl+R"} <= window_keys, f"模型页打开了 Ctrl+O / Ctrl+R：{sorted(window_keys)}")
+
     model_page.close()
 
     window.close()

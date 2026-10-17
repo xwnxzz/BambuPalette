@@ -2030,6 +2030,13 @@ class PicturePage(QWidget):
         self._save_shortcut.activated.connect(lambda: self._on_save_project())
         self._save_as_shortcut = QShortcut(QKeySequence("Ctrl+Shift+S"), self)
         self._save_as_shortcut.activated.connect(lambda: self._on_save_project(ask=True))
+        # 1.6.54（m22211 第 7 条）：另外四个动作也绑上按键，键值在「设置 → 图像转换」里改。
+        self._import_shortcut = QShortcut(QKeySequence("Ctrl+O"), self)
+        self._import_shortcut.activated.connect(self._on_import)
+        self._rematch_blocks_shortcut = QShortcut(QKeySequence("Ctrl+R"), self)
+        self._rematch_blocks_shortcut.activated.connect(self._on_rematch_blocks)
+        self._export_original_shortcut = QShortcut(QKeySequence("Ctrl+E"), self)
+        self._export_original_shortcut.activated.connect(self._on_export_original)
 
         list_box = QWidget()
         list_layout = QVBoxLayout(list_box)
@@ -2236,6 +2243,16 @@ class PicturePage(QWidget):
             self._only_spools.setChecked(only)
             self._only_spools.blockSignals(False)
             self._on_only_spools(only)
+        # 1.6.54（m22211 第 7 条）：这一页自己的四个快捷键。
+        for editor, key, fallback in (
+            (self._import_shortcut, "shortcut_picture_import", "Ctrl+O"),
+            (self._rematch_blocks_shortcut, "shortcut_picture_rematch", "Ctrl+R"),
+            (self._save_shortcut, "shortcut_picture_save_project", "Ctrl+S"),
+            (self._export_original_shortcut, "shortcut_picture_export_png", "Ctrl+E"),
+        ):
+            sequence = str(values.get(key) or fallback)
+            # QShortcut 没有 setKeySequence，q6 里换键要重新 setKey。
+            editor.setKey(QKeySequence(sequence))
 
     def _wrap(self, widget: QWidget, title: str, badge: str | None = None) -> QWidget:
         frame = QFrame()
@@ -2798,7 +2815,10 @@ class PicturePage(QWidget):
 
     def _on_only_spools(self, checked: bool) -> None:
         """勾上 / 取消「只匹配耗材」：候选少了，手上那套搭配就得重算。"""
-        self._candidates_plain = None if checked else self._candidates_plain
+        # 两张缓存都作废（1.6.54，m22211 第 4 条）：勾着时只读了 `_candidates_plain`，
+        # 取消勾选时那张混色表也可能是在别的库里建的，一律重来一次更省心。
+        self._candidates = None
+        self._candidates_plain = None
         self._triple_palette = None
         self._triple_head = None
         if self._image is not None:
@@ -2820,7 +2840,12 @@ class PicturePage(QWidget):
         membership test — on every single match.
         """
         head = self._candidate_palette()
-        if self._only_spools.isChecked() or self._triples is None:
+        if self._only_spools.isChecked():
+            # 1.6.54（m22211 第 4 条）：勾着就一个混色都不许进匹配器。正常情况下
+            # `_candidate_palette()` 已经只给本色了，这里再滤一遍是兜底 —— 缓存或
+            # 撤销栈里漏进来的旧候选，不能让它把「只匹配耗材」变成一个摆设。
+            return [entry for entry in head if entry.kind == "filament"]
+        if self._triples is None:
             return head
         if self._triple_palette is None or self._triple_head is not head:
             self._triple_palette = TriplePalette(head, self._triples, self._library)

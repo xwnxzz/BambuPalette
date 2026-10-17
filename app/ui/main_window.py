@@ -181,15 +181,9 @@ class MainWindow(QMainWindow):
         return names[0] if names else ANY_MATERIAL
 
     def _build_ui(self) -> None:
-        title = QLabel("BambuPalette")
-        title.setStyleSheet(f"font-size: 14px; font-weight: 650; color: {theme.TEXT};")
-
-        # 1.6.53（m21616 第 7 条）删掉了标题下面那行「混色耗材色彩管理器 · 每两种耗材 81 个
-        # 混色…」：它在标题栏里已经有一份（窗口标题就写着），顶栏留着只会把下面的布局往下推。
-        head = QVBoxLayout()
-        head.setContentsMargins(0, 0, 0, 0)
-        head.setSpacing(1)
-        head.addWidget(title)
+        # 1.6.54（m22211 第 1 条）：整条顶栏（那个 「BambuPalette」 大标题）删了。
+        # 1.6.53 起帮助 / 设置 / 添加耗材都已经搬到「目标颜色」那一行的右端，
+        # 窗口标题栏里也写着名字与版本，这一条只剩一个重复的标题，白占一行高度。
 
         self._add_button = QPushButton("添加耗材")
         self._add_button.setProperty("accent", "true")
@@ -210,15 +204,6 @@ class MainWindow(QMainWindow):
         # 右端，顺序就是用户要的 帮助 → 设置 → 添加耗材。
         self._settings_button = QPushButton("设置")
         self._settings_button.clicked.connect(self._on_settings)
-
-        # Lumina Studio's topbar: the brand block on the left, the primary action
-        # on the right, on a white bar closed by a hairline.
-        topbar = QFrame()
-        topbar.setObjectName("topbar")
-        head_row = QHBoxLayout(topbar)
-        head_row.setContentsMargins(16, 8, 16, 8)
-        head_row.setSpacing(10)
-        head_row.addLayout(head, 1)
 
         # engine / sort / search controls
         self._engine_combo = QComboBox()
@@ -256,6 +241,12 @@ class MainWindow(QMainWindow):
         # It is also the only place that answers 「用的是哪个颜色」, which is why the
         # answer goes into the status line instead of a hover pop-up.
         self._find_button.clicked.connect(self._on_find_nearest)
+
+        # 1.6.54（m22211 第 7 条）：颜色配方页的两个动作绑上按键（键值在设置里改）。
+        self._find_shortcut = QShortcut(QKeySequence("Ctrl+F"), self)
+        self._find_shortcut.activated.connect(self._on_find_nearest)
+        self._add_shortcut = QShortcut(QKeySequence("Ctrl+N"), self)
+        self._add_shortcut.activated.connect(self._on_add)
 
         controls = QHBoxLayout()
         controls.setSpacing(8)
@@ -358,7 +349,6 @@ class MainWindow(QMainWindow):
         outer = QVBoxLayout(central)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
-        outer.addWidget(topbar)
         outer.addWidget(body, 1)
         self.setCentralWidget(central)
 
@@ -1606,6 +1596,12 @@ class MainWindow(QMainWindow):
             return
         self._picture_page.apply_settings(values)
         self._model_page.apply_settings(values)
+        # 1.6.54（m22211 第 7 条）：颜色配方页那两个快捷键也归设置管。
+        for shortcut, key, fallback in (
+            (self._find_shortcut, "shortcut_recipe_find", "Ctrl+F"),
+            (self._add_shortcut, "shortcut_recipe_add", "Ctrl+N"),
+        ):
+            shortcut.setKey(QKeySequence(str(values.get(key) or fallback)))
         index = self._sort_combo.findData(str(values.get("sort") or "rgb"))
         if index >= 0 and index != self._sort_combo.currentIndex():
             self._sort_combo.setCurrentIndex(index)
