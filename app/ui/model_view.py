@@ -128,7 +128,11 @@ class _Camera:
             self.target = np.zeros(3)
             self.radius = 1.0
         else:
-            self.target = (model.low + model.high) * 0.5
+            # 模型可以离原点很远（用户那只独角兽的包围盒在 x≈6.7 上），目标点必须跟着
+            # 包围盒走；而且包围盒是 glTF 的 Y 朝上坐标系，相机的 up 是 Z 朝上，所以
+            # 中心点要先转成显示坐标，否则模型会被推到画面外（1.6.52 修）。
+            centre = ((model.low + model.high) * 0.5).reshape(1, 3)
+            self.target = _to_display(centre)[0]
             self.radius = float(np.linalg.norm(model.size) * 0.5) or 1.0
         self.yaw = 32.0
         self.pitch = 18.0

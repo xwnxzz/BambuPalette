@@ -1789,6 +1789,8 @@ class PicturePage(QWidget):
         self._stale = False
         # Cache for _candidate_palette: the 全部颜色 list, dropped by setLibrary.
         self._candidates: list[PaletteEntry] | None = None
+        #: 反过来那一侧：勾了「只匹配耗材」时要的「只有耗材本色」那份（1.6.52）。
+        self._candidates_plain: list[PaletteEntry] | None = None
         #: The three-filament catalogue, pushed in by the main window whenever it
         #: is (re)built.  ``None`` means 「not ready」: matching then runs on the
         #: two-filament palette alone, and picks up the triples when they land.
@@ -1856,6 +1858,17 @@ class PicturePage(QWidget):
 
         self._dither = QCheckBox("抖动")
 
+        # 「只匹配耗材」（m21172 item 2）：勾上以后不拿预制混色去凑，只用我自己这几卷
+        # 耗材的本色 —— 也就是 Bambu Studio 里「一种颜色一卷」的打法。跨材质：耗材列表本来
+        # 就不分材质，PETG 的卷也在候选里，所以勾上照样能跨过去。比混色差多少，文档第 78
+        # 章有实测数字。
+        self._only_spools = QCheckBox("只匹配耗材")
+        self._only_spools.setToolTip(
+            "勾上就只用你自己这些耗材，不再拿两色 / 三色混色去凑（可以跨材质）。\n"
+            "颜色会差一些，但每一块就是一卷料，Bambu Studio 里不用配比。"
+        )
+        self._only_spools.toggled.connect(self._on_only_spools)
+
         top = QHBoxLayout()
         top.setSpacing(8)
         top.addWidget(self._import_button)
@@ -1867,6 +1880,7 @@ class PicturePage(QWidget):
         top.addWidget(QLabel("耗材上限:"))
         top.addWidget(self._spool_cap)
         top.addWidget(self._dither)
+        top.addWidget(self._only_spools)
         top.addWidget(self._rematch_blocks_button)
         top.addWidget(QLabel("点图片时:"))
         top.addWidget(self._pick_combo)
@@ -2228,6 +2242,7 @@ class PicturePage(QWidget):
             self._base_button,
             self._side_combo,
             self._smooth_box,
+            self._only_spools,
             self._export_3mf,
             self._export_obj,
         ):
@@ -2239,6 +2254,7 @@ class PicturePage(QWidget):
         self._library = library
         self._catalog = catalog
         self._candidates = None
+        self._candidates_plain = None
         self._triple_palette = None
         self._triple_head = None
         if self._image is None:
@@ -2739,9 +2755,23 @@ class PicturePage(QWidget):
         library without its 81-ratio mixes is not a smaller answer, it is half
         the palette, so that choice was never a real one.
         """
+        if self._only_spools.isChecked():
+            if self._candidates_plain is None:
+                self._candidates_plain = build_palette(
+                    self._library, self._catalog, include_mixes=False
+                )
+            return self._candidates_plain
         if self._candidates is None:
             self._candidates = build_palette(self._library, self._catalog, include_mixes=True)
         return self._candidates
+
+    def _on_only_spools(self, checked: bool) -> None:
+        """勾上 / 取消「只匹配耗材」：候选少了，手上那套搭配就得重算。"""
+        self._candidates_plain = None if checked else self._candidates_plain
+        self._triple_palette = None
+        self._triple_head = None
+        if self._image is not None:
+            self._on_rematch()
 
     def _match_palette(self) -> Sequence[PaletteEntry]:
         """What the matcher picks from: 耗材本色 + 两色 + 三色混色.
@@ -2759,7 +2789,7 @@ class PicturePage(QWidget):
         membership test — on every single match.
         """
         head = self._candidate_palette()
-        if self._triples is None:
+        if self._only_spools.isChecked() or self._triples is None:
             return head
         if self._triple_palette is None or self._triple_head is not head:
             self._triple_palette = TriplePalette(head, self._triples, self._library)

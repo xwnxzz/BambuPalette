@@ -3474,6 +3474,92 @@ def run_selftest(*, report_path: Path | None = None) -> int:
             "activating a two-colour mix no longer filters the grid to its pair",
         )
 
+    # --- 1.6.52：模型配色的三个出口；两页的「只匹配耗材」 ---------------------
+    # 前半截不进界面也能跑：GLB 写出 → 读回来，确认几何和颜色都在。
+    import tempfile as _tempfile
+
+    import numpy as _np
+
+    from app.core import model_export as _model_export
+    from app.core.glb import GlbModel as _GlbModel
+    from app.core.glb import GlbPrimitive as _GlbPrimitive
+    from app.core.glb import load_model as _load_glb
+    from app.core.model_export import glb_bytes as _glb_bytes
+    from app.core.model_export import plate_from_model as _plate_from_model
+
+    def _box(low, high, colour):
+        x0, y0, z0 = low
+        x1, y1, z1 = high
+        corners = _np.array(
+            [
+                [x0, y0, z0], [x1, y0, z0], [x1, y1, z0], [x0, y1, z0],
+                [x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1],
+            ],
+            dtype=_np.float64,
+        )
+        quads = [(0, 1, 2, 3), (4, 5, 6, 7), (0, 1, 5, 4), (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7)]
+        triangles = []
+        for a, b, c, d in quads:
+            triangles.extend([[a, b, c], [a, c, d]])
+        return _GlbPrimitive(
+            name="box",
+            material="m",
+            positions=corners,
+            normals=_np.zeros_like(corners),
+            triangles=_np.array(triangles, dtype=_np.int64),
+            colour=colour,
+        )
+
+    boxes = _GlbModel(
+        name="两只盒子",
+        primitives=[
+            _box((0, 0, 0), (0.01, 0.02, 0.03), (255, 0, 0)),
+            _box((0.02, 0, 0), (0.03, 0.02, 0.03), (0, 0, 255)),
+        ],
+        low=_np.zeros(3),
+        high=_np.array([0.03, 0.02, 0.03]),
+    )
+    payload = _glb_bytes(boxes, [(200, 40, 40), (40, 40, 200)])
+    check(payload[:4] == b"glTF", "导出的 GLB 带 glTF 头")
+    with _tempfile.TemporaryDirectory() as folder:
+        target = Path(folder) / "boxes.glb"
+        target.write_bytes(payload)
+        again = _load_glb(target)
+        check(again.triangle_count == 24, f"GLB 往返后还是 24 个三角形，got {again.triangle_count}")
+        check(
+            sorted(item.colour for item in again.primitives) == [(40, 40, 200), (200, 40, 40)],
+            "GLB 往返后颜色换成了给它的那两个",
+        )
+    plate = _plate_from_model(boxes, [(255, 0, 0), (0, 0, 255)])
+    check(len(plate.parts) == 2, f"两个图元摊成两个零件，got {len(plate.parts)}")
+    check(abs(plate.width_mm - 30.0) < 1e-6, f"板宽 30 mm，got {plate.width_mm}")
+    check(
+        abs(float(_np.vstack([part.vertices for part in plate.parts])[:, 2].min())) < 1e-6,
+        "摊出来的件站在 z=0 上",
+    )
+    check(hasattr(_model_export, "MM_PER_UNIT"), "模型导出认 1 单位 = 1 米")
+    with _tempfile.TemporaryDirectory() as folder:
+        written = _model_export.write_glb(boxes, [(1, 2, 3), (4, 5, 6)], Path(folder) / "m")
+        check(written.exists() and written.suffix == ".glb", "write_glb 写出了 .glb")
+        check(not list(Path(folder).rglob("*.tmp")), "write_glb 没留下临时文件")
+
+    model_page = window._model_page
+    check(model_page._colour_count.value() == 32, "模型配色页颜色数量默认 32")
+    check(not model_page._only_spools.isChecked(), "模型配色页「只匹配耗材」默认不勾")
+    check(model_page._filter_button.isEnabled() is False, "没有模型时「筛选耗材」是灰的")
+    check(model_page._save_shortcut is not None, "模型配色页绑了 Ctrl+S")
+    picture_page = window._picture_page
+    picture_page._only_spools.setChecked(True)
+    check(
+        {entry.kind for entry in picture_page._candidate_palette()} <= {"filament"},
+        "图像转换页勾上只匹配耗材后没有混色",
+    )
+    picture_page._only_spools.setChecked(False)
+    check(
+        any(entry.kind != "filament" for entry in picture_page._candidate_palette()),
+        "图像转换页取消勾选后混色回来了",
+    )
+
     # Render the real window once, so a broken Qt platform plugin or a missing
     # font shows up here rather than in front of the user.
     shot = None

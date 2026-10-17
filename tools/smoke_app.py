@@ -4520,9 +4520,59 @@ def main() -> int:
     check(model_match is not None and model_match.spool_count >= 1, "配色至少用了一卷耗材")
     check("ΔE00" in model_page.statusText(), f"状态行带 ΔE00：{model_page.statusText()[:90]!r}")
     check("三角形" in model_page._model_label.text(), "模型名字行带三角形数")
-    check(bool(model_page.table_text().strip()), "配色表有内容")
+    check(not hasattr(model_page, "_export_button"), "「导出配色表」按钮已经删了（m21496 第 9 条）")
     check(isinstance(model_page._source_view.hasOpenGL(), bool), "三维视图能回答有没有 OpenGL")
     check(isinstance(model_page._source_view.available(), str), "三维视图能给出不可用原因")
+
+    # --- 1.6.52：只匹配耗材 / 筛选 / 换色撤销 / 三个出口 -----------------------
+    check(model_page._colour_count.value() == 32,
+          f"颜色数量默认 32，got {model_page._colour_count.value()}")
+    check(model_page._only_spools.isChecked() is False, "「只匹配耗材」默认不勾")
+    mixed_kinds = {item.entry.kind for item in model_match.colours} if model_match else set()
+    model_page._only_spools.setChecked(True)
+    plain_match = model_page.match
+    plain_kinds = {item.entry.kind for item in plain_match.colours} if plain_match else set()
+    check(plain_kinds <= {"filament"}, f"只匹配耗材时全是本色，got {plain_kinds}")
+    check("只用耗材" in model_page._filter_hint.text(),
+          f"筛选行写明只用耗材：{model_page._filter_hint.text()!r}")
+    model_page._only_spools.setChecked(False)
+    check(model_page.match is not None and
+          {item.entry.kind for item in model_page.match.colours} == mixed_kinds,
+          "取消勾选后候选恢复成含混色的那一份")
+    check(model_page._filter_button.isEnabled(), "「筛选耗材」可用")
+
+    first_hex = model_page.match.colours[0].color_hex if model_page.match else ""
+    pool = model_page._candidate_palette()
+    spare = next((entry for entry in pool if entry.color_hex != model_page.override_of(first_hex)), None)
+    check(spare is not None, "调色板里找得到另一种颜色")
+    if spare is not None:
+        model_page.replace_colour(first_hex, spare)
+        check(model_page.override_of(first_hex) == spare.color_hex, "换色记在了这一种颜色上")
+        check(model_page.previewHexes()[0] == spare.color_hex, "预览立刻跟着换")
+        check(model_page.undo(), "撤销可用")
+        check(model_page.override_of(first_hex) is None, "撤销把换色退回去了")
+        check(model_page.redo(), "恢复可用")
+        check(model_page.override_of(first_hex) == spare.color_hex, "恢复把换色又拿回来")
+
+    plate = model_page.plate()
+    check(plate is not None and plate.parts, "模型能摊成板")
+    if plate is not None:
+        check(plate.width_mm > 0 and plate.depth_mm > 0,
+              f"板有尺寸：{plate.width_mm:.1f} × {plate.depth_mm:.1f} mm")
+    check(model_page.glb_payload()[:4] == b"glTF", "导出的 GLB 有 glTF 头")
+    check(model_page._export_3mf.text().startswith("生成 3MF"), "有生成 3MF 的按钮")
+    check(model_page._export_obj.text().startswith("生成 OBJ"), "有生成 OBJ 的按钮")
+    check(model_page._save_shortcut.key().toString() in ("Ctrl+S", "Ctrl+S "),
+          f"Ctrl+S 绑在导出 GLB 上，got {model_page._save_shortcut.key().toString()!r}")
+
+    shot = window._picture_page
+    shot._only_spools.setChecked(True)
+    plain_palette = shot._candidate_palette()
+    check({entry.kind for entry in plain_palette} <= {"filament"},
+          "图像转换页勾上只匹配耗材后候选里没有混色")
+    shot._only_spools.setChecked(False)
+    check(any(entry.kind != "filament" for entry in shot._candidate_palette()),
+          "图像转换页取消勾选后混色回来了")
     model_page.close()
 
     window.close()

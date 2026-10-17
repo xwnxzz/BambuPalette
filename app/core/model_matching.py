@@ -20,7 +20,7 @@ from .image_matching import (
     MatchSettings,
     PaletteEntry,
     match_fidelity,
-    match_image,
+    match_options,
     ProgressFn,
 )
 
@@ -108,9 +108,16 @@ def match_model(
     palette: list[PaletteEntry],
     settings: MatchSettings | None = None,
     *,
+    require: frozenset[str] | set[str] = frozenset(),
+    avoid: frozenset[str] | set[str] = frozenset(),
     progress: ProgressFn | None = None,
 ) -> ModelMatch:
-    """给模型的每种颜色找一套能打印的混色。"""
+    """给模型的每种颜色找一套能打印的混色。
+
+    ``require`` / ``avoid`` 是「筛选耗材」那两条规矩（必须用哪几卷、不许用哪几卷），
+    交给 :func:`app.core.image_matching.match_options` —— 和图像转换页同一套判据，
+    连「大色差色块优先 / 总体最近」那些方案排序都是同一份代码。
+    """
     config = (settings or MatchSettings()).clamped()
     picture, ranges = chart_image(colours)
     config = MatchSettings(
@@ -122,7 +129,17 @@ def match_model(
         smooth_radius=0,  # 带子之间有硬边界，平滑只会把颜色洗淡
         max_spools=config.max_spools,
     ).clamped()
-    result = match_image(picture, palette, config, progress=progress)
+    options = match_options(
+        picture,
+        palette,
+        config,
+        require=require,
+        avoid=avoid,
+        progress=progress,
+    )
+    if not options:
+        raise ValueError("这套筛选下没有任何颜色可用：放宽「必须有」或「不要用」再试。")
+    result = options[0].result
 
     total_area = float(sum(max(0.0, item.area) for item in colours)) or 1.0
     matches: list[ModelColourMatch] = []
