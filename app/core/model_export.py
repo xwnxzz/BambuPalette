@@ -121,11 +121,20 @@ def _linear(value: float) -> float:
     return value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4
 
 
-def glb_bytes(model: GlbModel, colours: list[tuple[int, int, int]]) -> bytes:
+def glb_bytes(
+    model: GlbModel,
+    colours: list[tuple[int, int, int]],
+    *,
+    extras: dict | None = None,
+) -> bytes:
     """把模型重新包成一个 GLB，材质换成配到的颜色。
 
     几何原样搬（glTF 坐标系，不挪不缩），所以再导入回来就是「带着配色的模型」，
     可以接着改。顶点色与贴图不写：这一版只认材质底色，导出的文件里一个颜色一块材质。
+
+    1.6.55（m25568 第 3 条）：``extras`` 会原样写进 glTF 文档顶层。模型配色页在那里
+    记下「这一块原来的颜色、配到的是哪个耗材条目、当前选的是哪套方案」，再导入时
+    照着摆回原样 —— 光靠材质底色只能把颜色带回来，方案和手动换色会丢。
     """
     blobs = bytearray()
     views: list[dict] = []
@@ -222,6 +231,8 @@ def glb_bytes(model: GlbModel, colours: list[tuple[int, int, int]]) -> bytes:
         "bufferViews": views,
         "buffers": [{"byteLength": len(blobs)}],
     }
+    if extras:
+        document["extras"] = extras
     text = json.dumps(document, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     while len(text) % 4:
         text += b" "
@@ -234,14 +245,20 @@ def glb_bytes(model: GlbModel, colours: list[tuple[int, int, int]]) -> bytes:
     return bytes(out)
 
 
-def write_glb(model: GlbModel, colours: list[tuple[int, int, int]], target: str | Path) -> Path:
+def write_glb(
+    model: GlbModel,
+    colours: list[tuple[int, int, int]],
+    target: str | Path,
+    *,
+    extras: dict | None = None,
+) -> Path:
     """写成一个 GLB 文件（同目录临时文件 + 改名，1.6.50 的规矩）。"""
     from .atomicio import atomic_path
 
     path = Path(target)
     if path.suffix.lower() != ".glb":
         path = path.with_suffix(".glb")
-    payload = glb_bytes(model, colours)
+    payload = glb_bytes(model, colours, extras=extras)
     with atomic_path(path) as temporary:
         with open(temporary, "wb") as handle:
             handle.write(payload)

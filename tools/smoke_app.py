@@ -4631,6 +4631,75 @@ def main() -> int:
     }
     check({"Ctrl+O", "Ctrl+R"} <= window_keys, f"模型页打开了 Ctrl+O / Ctrl+R：{sorted(window_keys)}")
 
+    # --- 1.6.55（m25568）----------------------------------------------------
+    # 第 1 条：没打开模型时也能改颜色数量 / 耗材上限；第 2 条：两个视图套同款卡片；
+    # 第 3 条：GLB 里记着方案与换色，再导入摆回来；第 4 条：能导入 3MF。
+    import json as _json  # noqa: E402, PLC0415
+    import zipfile as _zipfile  # noqa: E402, PLC0415
+    from pathlib import Path as _Path  # noqa: E402, PLC0415
+    from tempfile import TemporaryDirectory as _TemporaryDirectory  # noqa: E402, PLC0415
+
+    from app.ui.model_page import MODEL_FILTER as _MODEL_FILTER, ModelPage as _ModelPage  # noqa: E402, PLC0415
+
+    fresh = _ModelPage()
+    check(fresh._colour_count.isEnabled(), "模型页没打开模型时「颜色数量」也能改")
+    check(fresh._spool_cap.isEnabled(), "模型页没打开模型时「耗材上限」也能改")
+    fresh._colour_count.setValue(20)
+    check(fresh._colour_count.value() == 20, "没模型时改得动，不会弹错")
+    check(fresh._source_view.parent().objectName() == "panel", "原模型视图套在同一款白底卡片里")
+    check(fresh._preview_view.parent().objectName() == "panel", "预览视图套在同一款白底卡片里")
+    check(fresh._open_button.text() == "打开模型", "按钮改成「打开模型」，不再只认 GLB")
+    check("3mf" in _MODEL_FILTER, f"文件对话框认 3MF：{_MODEL_FILTER!r}")
+    fresh.close()
+
+    with _TemporaryDirectory() as folder:
+        folder_path = _Path(folder)
+        three_mf = folder_path / "two.3mf"
+        payload = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<model unit="millimeter" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">'
+            '<resources><basematerials id="1">'
+            '<base name="a" displaycolor="#C8342E"/><base name="b" displaycolor="#2FA84F"/>'
+            "</basematerials>"
+            '<object id="1" type="model" name="a" pid="1" pindex="0"><mesh><vertices>'
+            '<vertex x="-7.5" y="-7.5" z="-7.5"/><vertex x="7.5" y="-7.5" z="-7.5"/>'
+            '<vertex x="-7.5" y="7.5" z="-7.5"/><vertex x="7.5" y="7.5" z="7.5"/>'
+            "</vertices><triangles>"
+            '<triangle v1="0" v2="1" v3="2"/><triangle v1="1" v2="3" v3="2"/>'
+            "</triangles></mesh></object>"
+            '<object id="2" type="model" name="b" pid="1" pindex="1"><mesh><vertices>'
+            '<vertex x="12" y="-7.5" z="-7.5"/><vertex x="27" y="-7.5" z="-7.5"/>'
+            '<vertex x="12" y="7.5" z="-7.5"/><vertex x="27" y="7.5" z="7.5"/>'
+            "</vertices><triangles>"
+            '<triangle v1="0" v2="1" v3="2"/><triangle v1="1" v2="3" v3="2"/>'
+            "</triangles></mesh></object>"
+            "</resources><build><item objectid=\"1\"/><item objectid=\"2\"/></build></model>"
+        )
+        with _zipfile.ZipFile(three_mf, "w", _zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("[Content_Types].xml", "<Types/>")
+            archive.writestr("3D/3dmodel.model", payload)
+        check(model_page.loadModel(three_mf), "模型配色页能直接打开 3MF")
+        check(model_page.model is not None and model_page.model.triangle_count == 4,
+              "3MF 里的 4 个三角形都读到了")
+        check(len(model_page.model.primitives) == 2, "3MF 的两种颜色分成两块")
+        check(bool(model_page.previewHexes()), "3MF 的模型也能配色")
+
+        # GLB 往返：方案、颜色、设置都要跟着文件走
+        before_hexes = model_page.previewHexes()
+        before_plan = model_page._match.key if model_page._match else ""
+        before_count = model_page._colour_count.value()
+        exported = folder_path / "round.glb"
+        exported.write_bytes(model_page.glb_payload())
+        model_page._colour_count.setValue(8)
+        check(model_page.loadModel(exported), "导出的 GLB 能再导入回来")
+        check(model_page.previewHexes() == before_hexes, "再导入后每一块的颜色和导出前一致")
+        check(model_page._match is not None and model_page._match.key == before_plan,
+              "再导入后还停在导出前那一套方案上")
+        check(model_page._colour_count.value() == before_count,
+              f"再导入后颜色数量摆回 {before_count}（现在是 {model_page._colour_count.value()}）")
+        check(model_page.model is not None and model_page.model.saved is not None,
+              "读回来的模型里带着 extras 记录")
+
     model_page.close()
 
     window.close()

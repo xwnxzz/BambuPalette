@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
 
 from ..core import paths
 from ..core.glb import GlbModel, load_model, model_colours
+from ..core.threemf_import import THREEMF_SUFFIXES, load_3mf_model
 from ..core.image_matching import MatchSettings, PaletteEntry, TriplePalette, build_palette
 from ..core.library import FilamentLibrary
 from ..core.mixes import MixCatalog
@@ -57,7 +58,7 @@ from .swatch import swatch_pixmap
 __all__ = ["ModelPage", "MODEL_FILTER"]
 
 MODEL_FILTER = (
-    "三维模型 (*.glb *.gltf);;GLB (*.glb);;glTF (*.gltf);;所有文件 (*)"
+    "三维模型 (*.glb *.gltf *.3mf);;GLB (*.glb);;glTF (*.gltf);;3MF (*.3mf);;所有文件 (*)"
 )
 
 #: 色卡的宽度（与 model_matching.CHART_WIDTH 一致），显示在工具栏上给用户一个参照。
@@ -120,11 +121,15 @@ class ModelPage(QWidget):
         views = QSplitter(Qt.Orientation.Horizontal)
         views.setChildrenCollapsible(False)
         views.setHandleWidth(8)
-        self._source_view = ModelView("原模型")
-        self._preview_view = ModelView("预览（配色后）")
-        views.addWidget(self._source_view)
-        views.addWidget(self._preview_view)
-        views.setSizes([420, 420])
+        # 1.6.55（m25568 第 2 条）：两个三维视图各自套一层跟图像转换页同款的白底卡片，
+        # 标题挂在卡片上、不再挂在视图那一排按钮里 —— 这样三页的观感才是一套。
+        self._source_view = ModelView()
+        self._preview_view = ModelView()
+        for view, title in ((self._source_view, "原模型"), (self._preview_view, "预览（配色后）")):
+            card, box = self._panel(title)
+            box.addWidget(view, 1)
+            views.addWidget(card)
+        views.setSizes([520, 520])
         splitter.addWidget(views)
         splitter.addWidget(self._build_side_panel())
         splitter.setStretchFactor(0, 1)
@@ -177,9 +182,9 @@ class ModelPage(QWidget):
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(8)
 
-        self._open_button = QPushButton("打开 GLB")
+        self._open_button = QPushButton("打开模型")
         self._open_button.setProperty("accent", True)
-        self._open_button.setToolTip("打开一个 .glb / .gltf 文件（Ctrl+O）")
+        self._open_button.setToolTip("打开一个 .glb / .gltf / .3mf 文件（Ctrl+O）")
         self._open_button.clicked.connect(self._on_open_model)
         row.addWidget(self._open_button)
 
@@ -224,14 +229,19 @@ class ModelPage(QWidget):
         return row
 
     def _panel(self, title: str) -> tuple[QWidget, QVBoxLayout]:
-        """跟图像转换页同款的白底分组框（1.6.53，m21616 第 13 条）。"""
+        """跟图像转换页同款的白底分组框（1.6.53，m21616 第 13 条）。
+
+        1.6.55（m25568 第 2 条）：样式表是按 ``QFrame#panel``（对象名）上色的，
+        之前这里写的是 ``setProperty("panel", "true")``，属性选择器对不上，所以两页
+        看着不是一套 —— 改成 setObjectName，边距也照图像转换页的 10/8/10/10。
+        """
         from PySide6.QtWidgets import QFrame
 
         frame = QFrame()
-        frame.setProperty("panel", "true")
+        frame.setObjectName("panel")
         box = QVBoxLayout(frame)
-        box.setContentsMargins(10, 8, 10, 8)
-        box.setSpacing(6)
+        box.setContentsMargins(10, 8, 10, 10)
+        box.setSpacing(8)
         heading = QLabel(title)
         heading.setProperty("role", "sectionTitle")
         box.addWidget(heading)
@@ -339,10 +349,10 @@ class ModelPage(QWidget):
     def _set_enabled(self, enabled: bool) -> None:
         # 「只匹配耗材」不在这里（1.6.53，m21616 第 2 条）：它只是决定用哪张候选表，
         # 没打开模型时也该能勾；勾上再打开模型就按它算。
+        # 「颜色数量」「耗材上限」也不在这里（1.6.55，m25568 第 1 条）：它们是「下一次
+        # 匹配按什么来算」的偏好，图像转换页空白时就能改，模型页没道理锁住。
         for widget in (
             self._rematch_button,
-            self._colour_count,
-            self._spool_cap,
             self._filter_button,
             self._export_obj,
             self._export_3mf,
@@ -464,15 +474,23 @@ class ModelPage(QWidget):
         self.loadModel(path)
 
     def loadModel(self, source: str | Path) -> bool:
-        """读一个模型。闸门脚本直接调这个方法，绕开文件对话框。"""
+        """读一个模型。闸门脚本直接调这个方法，绕开文件对话框。
+
+        1.6.55（m25568 第 4 条）：``.3mf`` 也认。3MF 走 ``load_3mf_model``（它把几何、
+        逐面颜色和单位都读成同一个 ``GlbModel``），之后配色 / 三维 / 三个出口一条链不变。
+        """
         path = Path(source)
         try:
-            model = load_model(path)
+            if path.suffix.lower() in THREEMF_SUFFIXES:
+                model = load_3mf_model(path)
+            else:
+                model = load_model(path)
         except (OSError, ValueError) as error:
             self._say(f"这个文件读不出来：{error}")
             return False
         self._path = path
         self._model = model
+        saved = self._apply_saved(model)
         self._overrides = {}
         self._undo.clear()
         self._redo.clear()
@@ -491,7 +509,10 @@ class ModelPage(QWidget):
         unavailable = self._source_view.available()
         if unavailable:
             self._say(f"{unavailable}；配色照常可用，只是画不出三维预览。")
-        return self._on_rematch()
+        matched = self._on_rematch()
+        if matched:
+            self._restore_saved(saved)
+        return matched
 
     def _on_setting_changed(self) -> None:
         if self._model is not None:
@@ -883,7 +904,7 @@ class ModelPage(QWidget):
         colours = self._preview_colours()
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            written = write_glb(self._model, colours, name)
+            written = write_glb(self._model, colours, name, extras=self._saved_extras())
         except Exception as error:
             QApplication.restoreOverrideCursor()
             QMessageBox.warning(self, "保存失败", str(error))
@@ -891,8 +912,148 @@ class ModelPage(QWidget):
             return
         QApplication.restoreOverrideCursor()
         self._say(
-            f"已导出 {written.name}：{len(colours)} 块材质换成了配色结果，再导入回来就能接着改。"
+            f"已导出 {written.name}：{len(colours)} 块材质换成了配色结果，"
+            "方案和换过的颜色也一并记在文件里，再导入回来就接着改。"
         )
+
+    # -- 把「这次怎么配的」写进 GLB / 读回来（1.6.55，m25568 第 3 条）----------
+    def _saved_extras(self) -> dict | None:
+        """GLB 顶层 ``extras``：每一块原来的颜色、配到的耗材条目、当前方案、这次的设置。
+
+        按**图元下标**记（``primitives``），不按颜色记：两种原色可能被配成同一个颜色，
+        按颜色记回来就分不清谁是谁了（1.6.55 实测踩过）。
+        """
+        if self._match is None or self._model is None:
+            return None
+        shown = self._display_colours()
+        rows: list[dict] = []
+        for index, primitive in enumerate(self._model.primitives):
+            key = _hex(primitive.colour)
+            for extra in primitive.extra_colours:
+                if key in shown:
+                    break
+                if _hex(extra) in shown:
+                    key = _hex(extra)
+                    break
+            entry = self._shown_entry(key)
+            painted = shown.get(key, tuple(primitive.colour))
+            rows.append(
+                {
+                    "index": index,
+                    "original": key,
+                    "painted": _hex(painted),
+                    "entry": entry.key if entry is not None else "",
+                    "recipe": entry_recipe_text(entry, self._library) if entry is not None else "",
+                }
+            )
+        return {
+            "bambupalette": {
+                "version": 1,
+                "plan": self._match.key,
+                "title": self._match.title,
+                "settings": {
+                    "colours": self._colour_count.value(),
+                    "spools": self._spool_cap.value(),
+                    "only_spools": self._only_spools.isChecked(),
+                    "require": sorted(self._require),
+                    "avoid": sorted(self._avoid),
+                },
+                "primitives": rows,
+            }
+        }
+
+    def _saved_rows(self, saved: dict) -> list[dict]:
+        rows = saved.get("primitives")
+        return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+    def _apply_saved(self, model: GlbModel) -> dict | None:
+        """打开带 ``extras`` 的 GLB 时，先把设置与每一块的「原色」摆回去（配色前）。"""
+        saved = model.saved
+        if not saved:
+            return None
+        settings = saved.get("settings") or {}
+        try:
+            colours = int(settings.get("colours", self._colour_count.value()))
+            spools = int(settings.get("spools", self._spool_cap.value()))
+            only = bool(settings.get("only_spools", self._only_spools.isChecked()))
+            require = {str(item) for item in settings.get("require") or []}
+            avoid = {str(item) for item in settings.get("avoid") or []}
+        except (TypeError, ValueError):  # pragma: no cover - 防守
+            return saved
+        for widget, value in (
+            (self._colour_count, max(self._colour_count.minimum(), min(self._colour_count.maximum(), colours))),
+            (self._spool_cap, max(self._spool_cap.minimum(), min(self._spool_cap.maximum(), spools))),
+        ):
+            widget.blockSignals(True)
+            widget.setValue(value)
+            widget.blockSignals(False)
+        self._only_spools.blockSignals(True)
+        self._only_spools.setChecked(only)
+        self._only_spools.blockSignals(False)
+        self._require = require
+        self._avoid = avoid
+        self._update_filter_hint()
+
+        # 材质里存的是「配完的颜色」，配色要的是「原来的颜色」——按图元下标换回去，
+        # 这样 ΔE00、方案排序、列表里的原色都和导出前一致。
+        for row in self._saved_rows(saved):
+            index = row.get("index")
+            original = str(row.get("original") or "").upper()
+            if not isinstance(index, int) or not (0 <= index < len(model.primitives)):
+                continue
+            if len(original) != 7:
+                continue
+            try:
+                model.primitives[index].colour = (
+                    int(original[1:3], 16),
+                    int(original[3:5], 16),
+                    int(original[5:7], 16),
+                )
+            except ValueError:  # pragma: no cover - 防守
+                continue
+        return saved
+
+    def _restore_saved(self, saved: dict | None) -> None:
+        """配色算完以后，把手动换过的颜色与当时选的那套方案摆回去。"""
+        if not saved:
+            return
+        by_key = {entry.key: entry for entry in self._candidate_palette()}
+        # 只把「跟这次自然配出来不一样」的那些记成手动换色：全都记成 overrides 的话，
+        # 后面在「耗材方案」里换一套就等于白换（手动色永远盖着它）。
+        natural = (
+            {item.color_hex: item.matched_hex for item in self._match.colours}
+            if self._match is not None
+            else {}
+        )
+        restored: dict[str, PaletteEntry] = {}
+        for row in self._saved_rows(saved):
+            original = str(row.get("original") or "").upper()
+            entry = by_key.get(str(row.get("entry") or ""))
+            if not original or entry is None:
+                continue
+            if natural.get(original) == entry.color_hex:
+                continue
+            restored[original] = entry
+        if restored:
+            self._overrides = restored
+            self._undo.clear()
+            self._redo.clear()
+            self._refresh_preview()
+            self._fill_list()
+        wanted = str(saved.get("plan") or "")
+        if wanted:
+            for index, plan in enumerate(self._plans):
+                if plan.key == wanted:
+                    self._plan_index = index
+                    self._plan_list.blockSignals(True)
+                    self._plan_list.setCurrentRow(index)
+                    self._plan_list.blockSignals(False)
+                    self._match = plan
+                    self._refresh_preview()
+                    self._fill_list()
+                    self._summary.setText(summarise(self._match, self._spool_names()) + "。")
+                    break
+        self._say("这个 GLB 里带着上次的方案和换过的颜色，已经接着摆回来了。")
 
     # -- 给主窗口 / 闸门用 ------------------------------------------------
     def help_text(self) -> str:
@@ -956,7 +1117,7 @@ class ModelPage(QWidget):
 
         if self._model is None:
             raise ValueError("还没有打开模型。")
-        return glb_bytes(self._model, self._preview_colours())
+        return glb_bytes(self._model, self._preview_colours(), extras=self._saved_extras())
 
 
 def _hex(rgb) -> str:

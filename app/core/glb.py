@@ -74,6 +74,9 @@ class GlbModel:
     low: np.ndarray = field(default_factory=lambda: np.zeros(3))
     high: np.ndarray = field(default_factory=lambda: np.zeros(3))
     skipped: tuple[str, ...] = ()
+    #: 我们自己导出的 GLB 会把「当时怎么配的」写进 ``extras.bambupalette``，
+    #: 读回来就放在这里，让模型配色页restore 回原样（1.6.55，m25568 第 3 条）。
+    saved: dict | None = None
 
     @property
     def triangle_count(self) -> int:
@@ -416,12 +419,14 @@ def load_model(source: str | Path) -> GlbModel:
     else:
         low = np.zeros(3)
         high = np.zeros(3)
+    saved = (doc.get("extras") or {}).get("bambupalette") if isinstance(doc.get("extras"), dict) else None
     return GlbModel(
         name=path.stem,
         primitives=primitives,
         low=np.asarray(low, dtype=np.float64),
         high=np.asarray(high, dtype=np.float64),
         skipped=tuple(dict.fromkeys(skipped)),
+        saved=saved if isinstance(saved, dict) else None,
     )
 
 

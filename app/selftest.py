@@ -30,6 +30,28 @@ SPOOLS = (
     ("大简 PETG HF 红", "#C8342E"),
 )
 
+#: 自检里造的一个最小 3MF：两块、两种颜色、各两个三角形，15 mm 高（1.6.55）。
+_SELFTEST_3MF = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    '<model unit="millimeter" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">'
+    '<resources><basematerials id="1">'
+    '<base name="a" displaycolor="#C8342E"/><base name="b" displaycolor="#2FA84F"/>'
+    "</basematerials>"
+    '<object id="1" type="model" name="a" pid="1" pindex="0"><mesh><vertices>'
+    '<vertex x="-7.5" y="-7.5" z="-7.5"/><vertex x="7.5" y="-7.5" z="-7.5"/>'
+    '<vertex x="-7.5" y="7.5" z="-7.5"/><vertex x="7.5" y="7.5" z="7.5"/>'
+    "</vertices><triangles>"
+    '<triangle v1="0" v2="1" v3="2"/><triangle v1="1" v2="3" v3="2"/>'
+    "</triangles></mesh></object>"
+    '<object id="2" type="model" name="b" pid="1" pindex="1"><mesh><vertices>'
+    '<vertex x="12" y="-7.5" z="-7.5"/><vertex x="27" y="-7.5" z="-7.5"/>'
+    '<vertex x="12" y="7.5" z="-7.5"/><vertex x="27" y="7.5" z="7.5"/>'
+    "</vertices><triangles>"
+    '<triangle v1="0" v2="1" v3="2"/><triangle v1="1" v2="3" v3="2"/>'
+    "</triangles></mesh></object>"
+    '</resources><build><item objectid="1"/><item objectid="2"/></build></model>'
+)
+
 
 def run_selftest(*, report_path: Path | None = None) -> int:
     lines: list[str] = []
@@ -3589,6 +3611,52 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     model_page._source_view.setFlipOrbit(False)
     check(model_page._source_view.flipOrbit() is False, "左右翻转可以关掉")
     model_page._source_view.setFlipOrbit(True)
+
+    # --- 1.6.55（m25568）：导入前可改参数、3MF 能读、GLB 带走方案与换色 ---------
+    from .core.threemf_import import load_3mf_model as _load_3mf
+
+    model_page._set_enabled(False)
+    check(model_page._colour_count.isEnabled(), "没打开模型时「颜色数量」也能改")
+    check(model_page._spool_cap.isEnabled(), "没打开模型时「耗材上限」也能改")
+    model_page._set_enabled(True)
+    check(model_page._source_view.parent().objectName() == "panel", "三维视图套在跟图像转换页一样的卡片里")
+    check(model_page._preview_view.parent().objectName() == "panel", "预览也套在同一款卡片里")
+    check(model_page._open_button.text() == "打开模型", "按钮叫「打开模型」，3MF 也认")
+
+    three_mf = scratch / "selftest-two.3mf"
+    with zipfile.ZipFile(three_mf, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", "<Types/>")
+        archive.writestr("3D/3dmodel.model", _SELFTEST_3MF)
+    three_model = _load_3mf(three_mf)
+    check(three_model.triangle_count == 4, "3MF 里的 4 个三角形读到了")
+    check(len(three_model.primitives) == 2, "3MF 的两种颜色分成两块")
+    check(abs(float(three_model.size[1]) - 0.015) < 1e-6, "3MF 的毫米换成了 1 单位 = 1 米的坐标")
+
+    round_trip = scratch / "selftest-round.glb"
+    # 往返在核心层验证（页面级的往返由 tools\smoke_app.py 覆盖）：自检里往这个窗口的
+    # 模型页塞模型会让冻结版在退出时崩一次（0xC0000005，2026-10 实测），不值得。
+    from .core.glb import load_model as _load_glb
+    from .core.model_export import glb_bytes as _glb_bytes
+
+    extras = {
+        "bambupalette": {
+            "version": 1,
+            "plan": "colour:#C8342E",
+            "settings": {"colours": 16, "spools": 3},
+            "primitives": [{"index": 0, "original": "#C8342E", "painted": "#B34F50"}],
+        }
+    }
+    round_trip.write_bytes(
+        _glb_bytes(three_model, [(0xB3, 0x4F, 0x50), (0x2F, 0xA8, 0x4F)], extras=extras)
+    )
+    back = _load_glb(round_trip)
+    check(back.triangle_count == three_model.triangle_count, "GLB 往返后三角形数不变")
+    check(back.saved is not None and back.saved.get("plan") == "colour:#C8342E",
+          "GLB 往返后 extras 里的方案还在")
+    check(back.saved is not None and (back.saved.get("settings") or {}).get("colours") == 16,
+          "GLB 往返后 extras 里的设置还在")
+    check({tuple(item.colour) for item in back.primitives} == {(0xB3, 0x4F, 0x50), (0x2F, 0xA8, 0x4F)},
+          "GLB 往返后每块材质是配到的颜色")
 
     # Render the real window once, so a broken Qt platform plugin or a missing
     # font shows up here rather than in front of the user.
