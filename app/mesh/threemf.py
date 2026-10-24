@@ -596,10 +596,16 @@ def project_filaments(slots: Sequence[FilamentSlot]) -> ProjectFilaments:
     # The painted spools keep their relative order at the front of the list.
     for index, slot in enumerate(slots, start=1):
         if sum(max(0.0, component.percent) for component in slot.components) <= 0.0:
+            # 1.6.61（m28079 第 7 条）：两格涂的是同一卷时，工程耗材表里只该有一行。
+            # 以前每个 extruder 都 app 一行，于是「导出后又多出来耗材三、耗材四」——
+            # Bambu Studio 里那几行颜色一模一样，用户只能手动删掉。
+            key = _spool_key(slot.color_hex, slot.material_type, slot.vendor)
+            existing = index_of.get(key)
+            if existing is not None:
+                order[index] = existing + 1
+                continue
             order[index] = len(final) + 1
-            index_of.setdefault(
-                _spool_key(slot.color_hex, slot.material_type, slot.vendor), len(final)
-            )
+            index_of[key] = len(final)
             final.append(slot)
 
     # A recipe resolves against every painted spool, not only the ones above it in
@@ -618,7 +624,7 @@ def project_filaments(slots: Sequence[FilamentSlot]) -> ProjectFilaments:
         order[index] = len(final) + 1
         mixed[len(final)] = (tuple(parents), tuple(ratios))
         final.append(slots[index - 1])
-    return ProjectFilaments(final, mixed, len(final) - len(slots), order)
+    return ProjectFilaments(final, mixed, max(0, len(final) - len(slots)), order)
 
 
 def _remapped_extruders(plate: PlateModel, order: Mapping[int, int]) -> PlateModel:

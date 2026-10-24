@@ -661,6 +661,21 @@ class MixedFilamentTests(ExportTestCase):
         self.assertFalse(slots[0].is_mixed)
         self.assertEqual(project_filaments(slots).added, 0)
 
+    def test_two_extruders_painted_with_the_same_spool_share_one_row(self):
+        """1.6.61（m28079 第 7 条）：同一卷涂在两格上，工程耗材表里只留一行。
+
+        以前每个 extruder 都往列表里 app 一行，Bambu Studio 打开就是
+        「耗材1、耗材2」两块一模一样的颜色，用户只能手动删。
+        """
+        white = FilamentSlot(color_hex="#F2F0EB", material_type="PETG HF", vendor="大简", name="白")
+        black = FilamentSlot(color_hex="#17181C", material_type="PETG HF", vendor="大简", name="黑")
+        project = project_filaments([white, white, black])
+        self.assertEqual(project.count, 2)
+        self.assertEqual([slot.color_hex for slot in project.slots], ["#F2F0EB", "#17181C"])
+        # 两格都指向同一行，所以 paint 码要按 order 落到那一行上。
+        self.assertEqual(project.order, {1: 1, 2: 1, 3: 2})
+        self.assertEqual(project.added, 0)
+
     def test_the_settings_carry_the_mix_the_way_bambu_studio_writes_it(self):
         entry = self._mix()
         project = project_filaments(slots_from_palette([entry], self.library))

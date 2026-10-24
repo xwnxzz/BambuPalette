@@ -1508,25 +1508,24 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         # active and the list focused), so hand Qt's own double-click signal to the
         # view instead — that is the link the handler hangs off, and 合并 has relied
         # on the same signal since 1.6.x.
-        # 1.6.59（m26980 第 3 条）：详情改成三击才开，所以这里按三次
-        # itemPressed —— 前两下什么都不该发生，第三下才发 colourActivated。
-        page._list._on_row_pressed(target)
-        app.processEvents()
-        page._list._on_row_pressed(target)
-        app.processEvents()
+        # 1.6.61（m27752 第 5 条）：详情改成右键打开。三击要每一下都落在大约
+        # 0.5 s 内，手一快就变成「选中 / 取消选中」，用户直接说「太难按了」。
+        from PySide6.QtCore import Qt as _QtEnum  # noqa: PLC0415
+
         check(
-            fired == [],
-            f"连点两下不开颜色详情，got {fired}",
+            page._list._list.contextMenuPolicy()
+            == _QtEnum.ContextMenuPolicy.CustomContextMenu,
+            "颜色列表把右键留给上下文菜单（详情走右键）",
         )
-        page._list._on_row_pressed(target)
+        page._list._on_row_context_menu(spot)
         app.processEvents()
         check(
             fired == [0],
-            f"连点三下让列表说出选中的是哪种颜色，got {fired}",
+            f"右键那一行就让列表说出选中的是哪种颜色，got {fired}",
         )
         check(
             page._detail_dialog is not None and page._detail_dialog.isVisible(),
-            "连点三下颜色列表里的一行，弹出这个颜色的详情",
+            "右键颜色列表里的一行，弹出这个颜色的详情",
         )
         if page._detail_dialog is not None:
             check(

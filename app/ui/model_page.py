@@ -53,7 +53,7 @@ from ..core.image_matching import (
     build_palette,
     spool_usage,
 )
-from ..core.image_matching import HARD_COLOUR_LIMIT as NO_COLOUR_LIMIT
+from ..core.image_matching import HARD_COLOUR_LIMIT as NO_COLOUR_LIMIT  # noqa: F401
 from ..core.library import FilamentLibrary
 from ..core.mixes import MixCatalog
 from ..core.model_export import plate_from_model, write_glb
@@ -83,6 +83,9 @@ MODEL_FILTER = (
 CHART_WIDTH = 1024
 
 #: 模型最多配成多少种颜色 —— 与图像转换页同一个默认值（m21172 item 7）。
+#: 「实验性：没有颜色上限」时交给量化那一步的哨兵（1.6.61，m27752 第 1 条）：
+#: 真正收手的是模型自己的颜色数，这里写多大都不会凭空造出颜色。
+UNLIMITED_COLOURS = 4096
 DEFAULT_COLOURS = 32
 #: 最多用几卷耗材（0 = 不限）。
 DEFAULT_SPOOL_CAP = 4
@@ -243,8 +246,10 @@ class ModelPage(QWidget):
         self._only_spools.toggled.connect(self._on_only_spools)
         row.addWidget(self._only_spools)
 
-        #: 设置里的实验性开关（1.6.60，m27359 第 3 条）：不是控件，是旗标。
+        #: 设置里的实验性开关（1.6.60，m27359 第 3 条 / 1.6.61，m27752 第 6 条）：
+        #: 不是控件，是「这一版按不按颜色数量 / 耗材上限停手」的旗标。
         self._no_colour_limit = False
+        self._no_spool_limit = False
 
         self._filter_button = QPushButton("筛选耗材")
         self._filter_button.setToolTip("指定必须有哪几卷、不许用哪几卷")
@@ -506,15 +511,25 @@ class ModelPage(QWidget):
             max_colours=self._colour_limit(),
             max_dimension=CHART_WIDTH,
             dither=False,
-            max_spools=int(self._spool_cap.value()),
+            max_spools=self._spool_limit(),
             no_colour_limit=bool(self._no_colour_limit),
+            no_spool_limit=bool(self._no_spool_limit),
         ).clamped()
 
     def _colour_limit(self) -> int:
-        """这一版匹配最多分几种颜色（1.6.60，m27359 第 3 条）。"""
+        """这一版匹配最多分几种颜色（1.6.60 / 1.6.61，m27752 第 1 条）。
+
+        勾上实验开关就交一个「比任何图都多」的哨兵，真正收手的是模型自己的颜色数。
+        """
         if self._no_colour_limit:
-            return NO_COLOUR_LIMIT
+            return UNLIMITED_COLOURS
         return int(self._colour_count.value())
+
+    def _spool_limit(self) -> int:
+        """这一版匹配最多用几卷（1.6.61，m27752 第 6 条）。0 = 不限。"""
+        if self._no_spool_limit:
+            return 0
+        return int(self._spool_cap.value())
 
     # -- 筛选 -------------------------------------------------------------
     def _spool_name(self, filament_id: str) -> str:
@@ -756,11 +771,15 @@ class ModelPage(QWidget):
         flip = bool(values.get("model_flip_rotate", True))
         self._source_view.setFlipOrbit(flip)
         self._preview_view.setFlipOrbit(flip)
-        # 1.6.60（m27359 第 3 条）：实验性「没有颜色上限」——勾上就把「颜色数量」灰掉。
+        # 1.6.60 / 1.6.61（m27752 第 1、6 条）：实验性开关按页分开记。
         self._no_colour_limit = bool(
-            values.get("experimental_no_colour_limit", self._no_colour_limit)
+            values.get("model_no_colour_limit", self._no_colour_limit)
+        )
+        self._no_spool_limit = bool(
+            values.get("model_no_spool_limit", self._no_spool_limit)
         )
         self._colour_count.setEnabled(not self._no_colour_limit)
+        self._spool_cap.setEnabled(not self._no_spool_limit)
         sequence = str(values.get("shortcut_export_glb") or "Ctrl+S")
         # QShortcut 没有 setKeySequence，换键要重新 setKey（Qt 6 的写法）。
         self._save_shortcut.setKey(QKeySequence(sequence))

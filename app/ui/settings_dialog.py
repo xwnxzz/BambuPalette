@@ -76,14 +76,6 @@ class SettingsDialog(QDialog):
         self._current = dict(DEFAULT_SETTINGS)
         self._current.update(values or load_settings())
 
-        hint = QLabel(
-            "这里改的是「下次打开时先按这一套来」。已经在页面上的图 / 模型不会因为保存设置而重新算，"
-            "要它生效就按一次「重新匹配」（或者重新导入）。快捷键按页分开：同一页里不许重复，"
-            "不同页之间可以一样。"
-        )
-        hint.setProperty("role", "hint")
-        hint.setWordWrap(True)
-
         # -- 颜色配方 ---------------------------------------------------
         self._sort = QComboBox()
         for sort_id, label in SORT_CHOICES:
@@ -115,6 +107,17 @@ class SettingsDialog(QDialog):
         self._picture_dither.setChecked(bool(self._current.get("picture_dither", False)))
         self._picture_only = QCheckBox("打开时就勾上「只匹配耗材」")
         self._picture_only.setChecked(bool(self._current.get("picture_only_spools", False)))
+        # 1.6.61（m27752 第 1、2、6 条）：实验性开关按页分开，颜色与耗材各一个。
+        self._picture_no_colour = QCheckBox("实验性：没有颜色上限")
+        self._picture_no_colour.setChecked(bool(self._current.get("picture_no_colour_limit", False)))
+        self._picture_no_spool = QCheckBox("实验性：没有耗材上限")
+        self._picture_no_spool.setChecked(bool(self._current.get("picture_no_spool_limit", False)))
+        for box, spin in (
+            (self._picture_no_colour, self._picture_colours),
+            (self._picture_no_spool, self._picture_spools),
+        ):
+            spin.setEnabled(not box.isChecked())
+            box.toggled.connect(lambda on, widget=spin: widget.setEnabled(not on))
         self._picture_base = QDoubleSpinBox()
         self._picture_base.setRange(_BASE_MIN, _BASE_MAX)
         self._picture_base.setSingleStep(0.2)
@@ -133,6 +136,17 @@ class SettingsDialog(QDialog):
                 ("耗材上限", self._picture_spools, "0 表示不限；超过上限的色块会被合成更便宜的色。"),
                 ("", self._picture_dither, "抖动会把近似色打散成点，近距离看更细腻、远处更糊。"),
                 ("", self._picture_only, "只用你自己这些耗材的本色，不拿混色去凑。"),
+                (
+                    "",
+                    self._picture_no_colour,
+                    "实验性：勾上后「颜色数量」不再生效，能分出多少种颜色就分多少种。"
+                    "颜色一多，每块色对应的像素就少；超过 32 种时导出 3MF 会被拒绝。",
+                ),
+                (
+                    "",
+                    self._picture_no_spool,
+                    "实验性：勾上后「耗材上限」不再生效，方案里能用到多少卷就用多少卷。",
+                ),
                 ("底板厚度", self._picture_base, "生成 3MF / OBJ 时底板那一层的厚度。"),
                 ("「导入图片」快捷键", self._shortcut_pic_import, "等于按「导入图片」。"),
                 ("「按当前色块重新匹配」快捷键", self._shortcut_pic_rematch, "等于按那颗按钮。"),
@@ -153,9 +167,19 @@ class SettingsDialog(QDialog):
         self._model_flip = QCheckBox("旋转左右翻转（默认勾上）")
         self._model_flip.setChecked(bool(self._current.get("model_flip_rotate", True)))
 
-        # 1.6.60（m27359 第 3 条）：实验性开关。勾上以后两页都不再按「颜色数量」停手。
-        self._no_limit = QCheckBox("实验性：没有颜色上限")
-        self._no_limit.setChecked(bool(self._current.get("experimental_no_colour_limit", False)))
+        # 1.6.60（m27359 第 3 条）/ 1.6.61（m27752 第 6 条）：模型页也有这一对开关，
+        # 与图像转换页各自独立（旧版的单个 `experimental_no_colour_limit` 已在读设置时
+        # 迁移成两页都算勾过）。
+        self._model_no_colour = QCheckBox("实验性：没有颜色上限")
+        self._model_no_colour.setChecked(bool(self._current.get("model_no_colour_limit", False)))
+        self._model_no_spool = QCheckBox("实验性：没有耗材上限")
+        self._model_no_spool.setChecked(bool(self._current.get("model_no_spool_limit", False)))
+        for box, spin in (
+            (self._model_no_colour, self._model_colours),
+            (self._model_no_spool, self._model_spools),
+        ):
+            spin.setEnabled(not box.isChecked())
+            box.toggled.connect(lambda on, widget=spin: widget.setEnabled(not on))
 
         # 三维视图底色：一个能点的色块 + 十六进制，两边同步（1.6.54，m22211 第 6 条）。
         self._background = str(self._current.get("model_background") or "#B4C6D2")
@@ -185,9 +209,14 @@ class SettingsDialog(QDialog):
                 ("", self._model_only, "只用你自己这些耗材的本色。"),
                 (
                     "",
-                    self._no_limit,
-                    "实验性：勾上后两个页都不看「颜色数量」，能分出多少种颜色就分多少种。"
+                    self._model_no_colour,
+                    "实验性：勾上后「颜色数量」不再生效，能分出多少种颜色就分多少种。"
                     "颜色一多，每种颜色分到的像素就少，打印出来更碎，先小图试。",
+                ),
+                (
+                    "",
+                    self._model_no_spool,
+                    "实验性：勾上后「耗材上限」不再生效，方案里能用到多少卷就用多少卷。",
                 ),
                 (
                     "",
@@ -248,7 +277,6 @@ class SettingsDialog(QDialog):
         box = QVBoxLayout(self)
         box.setContentsMargins(12, 12, 12, 12)
         box.setSpacing(8)
-        box.addWidget(hint)
         box.addWidget(tabs, 1)
         box.addLayout(footer)
         selectable_text(self)
@@ -332,12 +360,15 @@ class SettingsDialog(QDialog):
         self._picture_spools.setValue(int(DEFAULT_SETTINGS["picture_spools"]))
         self._picture_dither.setChecked(bool(DEFAULT_SETTINGS["picture_dither"]))
         self._picture_only.setChecked(bool(DEFAULT_SETTINGS["picture_only_spools"]))
+        self._picture_no_colour.setChecked(bool(DEFAULT_SETTINGS["picture_no_colour_limit"]))
+        self._picture_no_spool.setChecked(bool(DEFAULT_SETTINGS["picture_no_spool_limit"]))
         self._picture_base.setValue(float(DEFAULT_SETTINGS["picture_base_mm"]))
         self._model_colours.setValue(int(DEFAULT_SETTINGS["model_colours"]))
         self._model_spools.setValue(int(DEFAULT_SETTINGS["model_spools"]))
         self._model_only.setChecked(bool(DEFAULT_SETTINGS["model_only_spools"]))
         self._model_flip.setChecked(bool(DEFAULT_SETTINGS["model_flip_rotate"]))
-        self._no_limit.setChecked(bool(DEFAULT_SETTINGS["experimental_no_colour_limit"]))
+        self._model_no_colour.setChecked(bool(DEFAULT_SETTINGS["model_no_colour_limit"]))
+        self._model_no_spool.setChecked(bool(DEFAULT_SETTINGS["model_no_spool_limit"]))
         self._background = str(DEFAULT_SETTINGS.get("model_background") or "#B4C6D2")
         self._background_edit.setText(self._background)
         self._paint_background_button()
@@ -358,7 +389,10 @@ class SettingsDialog(QDialog):
             "model_spools": int(self._model_spools.value()),
             "model_only_spools": bool(self._model_only.isChecked()),
             "model_flip_rotate": bool(self._model_flip.isChecked()),
-            "experimental_no_colour_limit": bool(self._no_limit.isChecked()),
+            "picture_no_colour_limit": bool(self._picture_no_colour.isChecked()),
+            "picture_no_spool_limit": bool(self._picture_no_spool.isChecked()),
+            "model_no_colour_limit": bool(self._model_no_colour.isChecked()),
+            "model_no_spool_limit": bool(self._model_no_spool.isChecked()),
             "model_background": self._background,
         }
         for _page, entries in self._page_shortcuts.items():

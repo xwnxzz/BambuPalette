@@ -27,6 +27,7 @@ from PySide6.QtCore import (
     QByteArray,
     QEvent,
     QEventLoop,
+    QPoint,
     QPointF,
     QRectF,
     Qt,
@@ -87,7 +88,7 @@ from ..core.image_matching import (
     rematch_options,
     spool_usage,
 )
-from ..core.image_matching import HARD_COLOUR_LIMIT as NO_COLOUR_LIMIT
+from ..core.image_matching import HARD_COLOUR_LIMIT as NO_COLOUR_LIMIT  # noqa: F401
 from ..core.library import FilamentLibrary
 from ..core.mixes import DEFAULT_ENGINE, MixCatalog
 from ..core.settings import (
@@ -154,6 +155,10 @@ ZOOM_HINT = "滚轮缩放，按住鼠标中键拖动平移，双击还原成整�
 #: 图片匹配默认值。颜色数量直接顶到 Bambu Studio 的天花板：混色就是为了用少数
 #: 几卷料凑出一整张图，用户既然在用混色，就没有理由再自己往回缩。
 DEFAULT_MAX_COLOURS = MAX_PAINTED_FILAMENTS
+#: 「实验性：没有颜色上限」时交给量化那一步的数（1.6.61，m27752 第 1 条）。它只是
+#: 一个「比任何图都多」的哨兵：真正收手的是图自己的颜色数 —— 聚类簇数不可能超过
+#: 「这张图里有几种不同的颜色」，所以这里写多大都不会凭空造出颜色。
+UNLIMITED_COLOURS = 4096
 #: 一次打印最常用的卷数（AMS 四槽）。0 才是「不限」，默认值必须是真数字。
 DEFAULT_SPOOL_CAP = 4
 
@@ -1168,14 +1173,10 @@ class ColourList(QWidget):
         self._list.currentRowChanged.connect(self._on_row_changed)
         self._list.itemSelectionChanged.connect(self._on_selection_changed)
         self._list.itemDoubleClicked.connect(self._on_row_double_clicked)
-        # 1.6.59（m26980 第 3 条）：颜色详情从双击改成三击，所以要自己数连击。
-        self._click_row = -1
-        self._click_time = 0.0
-        self._click_count = 0
-        self._triple_gap = max(
-            0.6, QApplication.doubleClickInterval() / 1000.0 * 1.2
-        )
-        self._list.itemPressed.connect(self._on_row_pressed)
+        # 1.6.61（m27752 第 5 条）：颜色详情改成右键打开。三击太难按 —— 连点三下要
+        # 每一下都落在大约 0.5 s 内，手指快一点就变成「选中 / 取消选中」。
+        self._list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._list.customContextMenuRequested.connect(self._on_row_context_menu)
         # 「再点一下同一个颜色就取消选中」: Qt moves the current row during the
         # press and only then emits itemPressed, so by the time the click signal
         # arrives the row has already changed and 「the same colour again」 is no
@@ -1609,32 +1610,23 @@ class ColourList(QWidget):
         self.selectionChanged.emit()
 
     def _on_row_double_clicked(self, item: QListWidgetItem) -> None:
-        """双击什么都不做（1.6.59，m26980 第 3 条）：颜色详情改成三击。
+        """双击什么都不做（1.6.59，m26980 第 3 条；1.6.61 起详情在右键上）。
 
         双击在「多选」和「连点换选中」两条路上太容易误触 —— 用户本来只是想连点
-        两下换一行，详情窗口就弹出来盖住半边。三击是故意「重」一点的动作，见
-        :meth:`_on_row_pressed`。
+        两下换一行，详情窗口就弹出来盖住半边。1.6.61 起详情改走右键，见
+        :meth:`_on_row_context_menu`。
         """
 
-    def _on_row_pressed(self, item: QListWidgetItem) -> None:
-        """连击计数：同一行在双击间隔内被按到第三次，就打开颜色详情。
+    def _on_row_context_menu(self, position: QPoint) -> None:
+        """右键一行就打开它的颜色详情（1.6.61，m27752 第 5 条）。
 
-        Qt 自己只到「双击」为止，三击要自己数。计数的时机是 ``itemPressed``
-        （按下就记），而不是 ``doubleClicked``（按下两下才算），所以三下之间
-        只要每一下都够快就会触发，中间被拖走一点也没关系。
+        原来要连点三下，间隔还得落在双击时间里，手一快就变成「选中 / 取消选中」。
+        右键是一步到位的动作，而且不会误碰列表的选中状态。
         """
-        index = int(item.data(Qt.ItemDataRole.UserRole))
-        now = time.monotonic()
-        if index == self._click_row and now - self._click_time <= self._triple_gap:
-            self._click_count += 1
-        else:
-            self._click_count = 1
-        self._click_row = index
-        self._click_time = now
-        if self._click_count >= 3:
-            self._click_count = 0
-            self._click_row = -1
-            self.colourActivated.emit(index)
+        item = self._list.itemAt(position)
+        if item is None:
+            return
+        self.colourActivated.emit(int(item.data(Qt.ItemDataRole.UserRole)))
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802 - Qt spelling
         """Remember the row and the shown colour from before the press landed.
@@ -2015,9 +2007,11 @@ class PicturePage(QWidget):
         )
         self._only_spools.toggled.connect(self._on_only_spools)
 
-        #: 设置里的实验性开关（1.6.60，m27359 第 3 条）。它不是一个控件，是
-        #: 「这一版按不按颜色数量停手」的旗标，由 apply_settings 灌进来。
+        #: 设置里的实验性开关（1.6.60，m27359 第 3 条 / 1.6.61，m27752 第 6 条）。
+        #: 它们不是控件，是「这一版按不按颜色数量 / 耗材上限停手」的旗标，由
+        #: apply_settings 灌进来。
         self._no_colour_limit = False
+        self._no_spool_limit = False
 
         top = QHBoxLayout()
         top.setSpacing(8)
@@ -2401,12 +2395,16 @@ class PicturePage(QWidget):
             self._only_spools.setChecked(only)
             self._only_spools.blockSignals(False)
             self._on_only_spools(only)
-        # 1.6.60（m27359 第 3 条）：实验性「没有颜色上限」——勾上就把「颜色数量」灰掉，
-        # 它这一版不参与计算（值还留着，取消勾选就恢复）。
+        # 1.6.60（m27359 第 3 条）/ 1.6.61（m27752 第 1、2、6 条）：实验性开关按页分开记。
+        # 勾上就把对应的数字框灰掉，它这一版不参与计算（值还留着，取消勾选就恢复）。
         self._no_colour_limit = bool(
-            values.get("experimental_no_colour_limit", self._no_colour_limit)
+            values.get("picture_no_colour_limit", self._no_colour_limit)
+        )
+        self._no_spool_limit = bool(
+            values.get("picture_no_spool_limit", self._no_spool_limit)
         )
         self._colour_count.setEnabled(not self._no_colour_limit)
+        self._spool_cap.setEnabled(not self._no_spool_limit)
         # 1.6.54（m22211 第 7 条）：这一页自己的四个快捷键。
         for editor, key, fallback in (
             (self._import_shortcut, "shortcut_picture_import", "Ctrl+O"),
@@ -2952,19 +2950,27 @@ class PicturePage(QWidget):
             max_colours=self._colour_limit(),
             max_dimension=int(self._span),
             dither=bool(self._dither.isChecked()),
-            max_spools=int(self._spool_cap.value()),
+            max_spools=self._spool_limit(),
             no_colour_limit=bool(self._no_colour_limit),
+            no_spool_limit=bool(self._no_spool_limit),
         ).clamped()
 
     def _colour_limit(self) -> int:
-        """这一版匹配最多分几种颜色（1.6.60，m27359 第 3 条）。
+        """这一版匹配最多分几种颜色（1.6.60，m27359 第 3 条 / 1.6.61，m27752 第 1 条）。
 
-        勾了「实验性：没有颜色上限」就交一个足够大的数，让量化按实际颜色数收手；
-        「颜色数量」那个框留着显示原来的值，只是灰掉不参与。
+        勾了「实验性：没有颜色上限」就交一个「比任何图都多」的数，真正的上限由量化那一步
+        按这张图**实际有几种颜色**决定（簇数不会超过它）；「颜色数量」那个框留着显示原来
+        的值，只是灰掉不参与。
         """
         if self._no_colour_limit:
-            return NO_COLOUR_LIMIT
+            return UNLIMITED_COLOURS
         return int(self._colour_count.value())
+
+    def _spool_limit(self) -> int:
+        """这一版匹配最多用几卷（1.6.61，m27752 第 6 条）。0 = 不限。"""
+        if self._no_spool_limit:
+            return 0
+        return int(self._spool_cap.value())
 
     def _candidate_palette(self) -> list[PaletteEntry]:
         """The full 全部颜色 list, built once per library.

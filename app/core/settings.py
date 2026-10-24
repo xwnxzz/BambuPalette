@@ -72,7 +72,14 @@ DEFAULT_SETTINGS: dict = {
     # 1.6.60（m27359 第 3 条）：「实验性：没有颜色上限」。勾上以后两页匹配都不再按
     # 「颜色数量」停手（默认 32），改用节目里能容纳的最大值 —— 板子颜色太多、
     # 32 种明显不够用时才值得开，颜色一多，每个色块对应的像素就少。
+    # 1.6.60（m27359 第 3 条）/ 1.6.61（m27752 第 1、2、6 条）：实验性开关按页分开记 ——
+    # 「图像转换」与「模型配色」各自决定要不要设限，也各自分颜色上限与耗材上限。
+    # ``experimental_no_colour_limit`` 是旧版的单个开关，只留作迁移来源。
     "experimental_no_colour_limit": False,
+    "picture_no_colour_limit": False,
+    "picture_no_spool_limit": False,
+    "model_no_colour_limit": False,
+    "model_no_spool_limit": False,
     "shortcut_export_glb": "Ctrl+S",
     # 1.6.54（m22211 第 7 条）：每个页自己的快捷键。允许跨页重复（同一时刻只有一页
     # 在屏幕上），但同一个页里不许撞车 —— 撞了 settings_dialog 会拒绝保存。
@@ -155,6 +162,12 @@ def load_settings() -> dict:
                 continue
         else:
             values[key] = str(stored)
+    # 1.6.61（m27752 第 1、2 条）：旧版只有一个「实验性：没有颜色上限」的开关，它对两页
+    # 一起生效。旧文件里勾过的人，两页都算勾过；新键一旦写过就以新键为准。
+    legacy = bool(raw.get("legacy_no_colour_limit", raw.get("experimental_no_colour_limit", False)))
+    for key in ("picture_no_colour_limit", "model_no_colour_limit"):
+        if key not in raw and legacy:
+            values[key] = True
     return values
 
 

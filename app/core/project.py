@@ -42,7 +42,7 @@ from .image_matching import (
     PaletteEntry,
     spool_usage,
 )
-from .library import FilamentLibrary
+from .library import Filament, FilamentLibrary
 from .mixes import DEFAULT_ENGINE, MixRecipe
 
 #: 工程文件的扩展名与文件对话框过滤器。扩展名不跟着版本走：一个工程文件就该在
@@ -355,6 +355,87 @@ def _paint_layer(
     return layer, entries
 
 
+def _used_filaments(results, library: FilamentLibrary | None) -> list[dict]:
+    """把这几份结果牵扯到的耗材定义摊成 JSON（1.6.61，m27752 第 4 条）。
+
+    「牵扯到」包括两层：配色表里那条颜色挂的 ``filament_ids``，和混色配方里
+    用到的两种丝。``library`` 为 ``None``（没接库）时给空表，工程照旧能开。
+    """
+    if library is None:
+        return []
+    seen: dict[str, dict] = {}
+    for result in results:
+        if result is None:
+            continue
+        for entry in result.palette:
+            for filament_id in getattr(entry, "filament_ids", ()) or ():
+                _remember_filament(seen, library, filament_id)
+            recipe = getattr(entry, "recipe", None)
+            for part in getattr(recipe, "parts", ()) or ():
+                _remember_filament(seen, library, getattr(part, "filament_id", ""))
+    return list(seen.values())
+
+
+def _remember_filament(seen: dict[str, dict], library: FilamentLibrary, filament_id: str) -> None:
+    key = str(filament_id or "")
+    if not key or key in seen:
+        return
+    filament = library.get(key)
+    if filament is None:
+        return
+    seen[key] = {
+        "id": filament.id,
+        "brand": filament.brand,
+        "material_type": filament.material_type,
+        "color_hex": filament.color_hex,
+        "name": filament.name,
+        "note": filament.note,
+    }
+
+
+class _ProjectLibrary:
+    """本机库 + 工程里带的耗材定义（1.6.61，m27752 第 4 条）。
+
+    ``entry_from_json`` 只需要一个 ``get(id)``，所以这里不必伪装成
+    :class:`FilamentLibrary`；本机库里有的优先用本机的（名字可能改过、颜色可能校准过），
+    没有的才回落到文件里记的那份。
+    """
+
+    def __init__(self, base: FilamentLibrary | None, stored) -> None:
+        self._base = base
+        self._stored: dict[str, Filament] = {}
+        for item in stored or ():
+            if not isinstance(item, dict):
+                continue
+            filament_id = str(item.get("id") or "")
+            if not filament_id:
+                continue
+            self._stored[filament_id] = Filament(
+                id=filament_id,
+                brand=str(item.get("brand") or ""),
+                material_type=str(item.get("material_type") or ""),
+                color_hex=str(item.get("color_hex") or "#000000"),
+                note=str(item.get("note") or ""),
+                name=str(item.get("name") or ""),
+            )
+
+    def get(self, filament_id: str) -> Filament | None:
+        if self._base is not None:
+            found = self._base.get(filament_id)
+            if found is not None:
+                return found
+        return self._stored.get(str(filament_id or ""))
+
+    def __bool__(self) -> bool:  # 有些老代码拿库当布尔用来判断「接没接库」
+        return bool(self._base) or bool(self._stored)
+
+
+def _library_with_project(library: FilamentLibrary | None, stored) -> object:
+    if not stored and library is not None:
+        return library
+    return _ProjectLibrary(library, stored)
+
+
 def save_project(
     path: str | Path,
     *,
@@ -420,6 +501,10 @@ def save_project(
         },
         "colours": colour_list(shown),
         "spools": spool_list(shown, library),
+        # 这一版用到的耗材定义（1.6.61，m27752 第 4 条）。原来只记 id，换台机器打开
+        # 就只剩「这卷不在库里」，方案里的配方全成了空壳。现在把品牌/材质/颜色/名字
+        # 一起带上，别人没有这卷也能照原样看和继续改。
+        "filaments": _used_filaments([shown], library),
     }
     settings = plate or PlateSettings()
     document["plate"] = {key: getattr(settings, key) for key in _PLATE_KEYS}
@@ -486,6 +571,9 @@ def load_project(
         raise ProjectError(f"工程里的原图读不出来：{error}") from error
 
     engine = str(document.get("engine") or DEFAULT_ENGINE)
+    # 工程自带的耗材定义（1.6.61，m27752 第 4 条）：本机库里没有的，用文件里的顶上，
+    # 这样配方、缩略色和「用哪几卷」都能照原样显示。
+    library = _library_with_project(library, document.get("filaments"))
     base_data = document.get("base") or {}
     palette = [
         entry_from_json(item, library, engine) for item in (base_data.get("palette") or ())

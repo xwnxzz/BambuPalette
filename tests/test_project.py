@@ -331,7 +331,10 @@ class ProjectRoundTripTests(unittest.TestCase):
         self.assertEqual(state.merged, merged)
         self.assertEqual(set(state.replaced), {0})
         self.assertEqual(state.replaced[0].color_hex, replacement.color_hex)
-        self.assertIsNone(state.replaced[0].filament)
+        # 1.6.61（m27752 第 4 条）：工程自带这一版用到的耗材定义，所以「本机没这卷」
+        # 也能认出它叫什么、哪个牌子，配方不会退化成一串光秃秃的色号。
+        self.assertIsNotNone(state.replaced[0].filament)
+        self.assertEqual(state.replaced[0].filament.name, replacement.filament.name)
         # …and recomposing by the page's rule gives back the live picture.
         rebuilt = _live_palette(
             state.base,

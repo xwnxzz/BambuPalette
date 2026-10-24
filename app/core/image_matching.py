@@ -298,29 +298,33 @@ class MatchSettings:
     #: regions, and never introduce a spool the budget cannot pay for.  0 means
     #: no limit.
     max_spools: int = 0
-    #: 实验性「没有颜色上限」（1.6.60，m27359 第 3 条）。3MF 的涂色码只编到 32 种
-    #: 耗材，所以默认把 ``max_colours`` 夹在 32；勾了这个开关就放开到 256，让量化
-    #: 按画面实际颜色收手 —— 代价是超过 32 种时导出 3MF 会拒绝（切片器装不下），
-    #: 界面上会给出提示，属于已知的实验边界。
+    #: 实验性「没有颜色上限」（1.6.60，m27359 第 3 条；1.6.61 按 m27752 第 1 条改成
+    #: 真的不设限）。3MF 的涂色码只编到 32 种耗材，所以默认把 ``max_colours`` 夹在 32；
+    #: 勾了这个开关就原样用用户填的数，不再夹 —— 代价是超过 32 种时导出 3MF 会拒绝。
     no_colour_limit: bool = False
+    #: 实验性「没有耗材上限」（1.6.61，m27752 第 6 条）。``max_spools`` 同样被夹在 32，
+    #: 勾上后原样生效（0 也照旧表示不限）。
+    no_spool_limit: bool = False
 
     def clamped(self) -> "MatchSettings":
         # Imported here rather than at module level: ``app.mesh.plate`` imports
         # this module, so a top-level import would close the loop.
         from ..mesh.threemf import MAX_PAINTED_FILAMENTS
 
+        colours = int(self.max_colours)
+        if not self.no_colour_limit:
+            colours = min(MAX_PAINTED_FILAMENTS, colours)
+        spools = int(self.max_spools)
+        if not self.no_spool_limit:
+            spools = min(MAX_PAINTED_FILAMENTS, spools)
         return replace(
             self,
-            max_colours=max(
-                2,
-                min(HARD_COLOUR_LIMIT if self.no_colour_limit else MAX_PAINTED_FILAMENTS,
-                    int(self.max_colours)),
-            ),
+            max_colours=max(2, colours),
             max_dimension=max(32, int(self.max_dimension)),
             alpha_threshold=max(0, min(255, int(self.alpha_threshold))),
             merge_delta_e=max(0.0, min(10.0, float(self.merge_delta_e))),
             smooth_radius=max(0, min(8, int(self.smooth_radius))),
-            max_spools=max(0, min(MAX_PAINTED_FILAMENTS, int(self.max_spools))),
+            max_spools=max(0, spools),
         )
 
 
@@ -906,7 +910,13 @@ def reduce_colours(
     )
     rows = np.array([_unpack(int(key)) for key in cluster_keys], dtype=np.uint8)
     counts = np.bincount(np.asarray(cluster_inverse).reshape(-1), minlength=len(cluster_keys))
-    budget = int(min(256, settings.max_colours))
+    # 1.6.61（m27752 第 1 条）：勾了「实验性：没有颜色上限」就按这张图真实的颜色数收手 ——
+    # 上限不再是 256，而是「图里到底有几种颜色」（聚类簇数不可能超过它），见 ``budget``。
+    budget = int(
+        min(len(cluster_keys), settings.max_colours)
+        if settings.no_colour_limit
+        else min(256, settings.max_colours)
+    )
     seeds = _median_cut_seeds(cluster_keys, counts, budget)
     labels = _kmeans_labels(_color.lab_from_rgb(rows), counts, _color.lab_from_rgb(seeds))
     if keep is None:
