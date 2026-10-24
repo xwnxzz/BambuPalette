@@ -67,6 +67,8 @@ DEFAULT_SETTINGS: dict = {
     "model_flip_rotate": True,
     #: 三维视图底色（1.6.54，m22211 第 6 条）：默认是 SolidWorks 视口那种浅蓝灰。
     "model_background": "#B4C6D2",
+    # 1.6.57（m26604 第 9 条）：导出 .blend 要让本机的 Blender 动手，路径可以手填。
+    "model_blender_path": "",
     "shortcut_export_glb": "Ctrl+S",
     # 1.6.54（m22211 第 7 条）：每个页自己的快捷键。允许跨页重复（同一时刻只有一页
     # 在屏幕上），但同一个页里不许撞车 —— 撞了 settings_dialog 会拒绝保存。

@@ -891,16 +891,35 @@ class MainWindow(QMainWindow):
 
     def _on_export(self) -> None:
         default = paths.default_start_dir() / "filament-library-export.json"
-        path, _ = QFileDialog.getSaveFileName(self, "导出耗材档案", str(default), "JSON 文件 (*.json)")
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出耗材档案",
+            str(default),
+            "耗材档案 (*.json);;Blender 材质脚本 (*.py)",
+        )
         if not path:
             return
+        target = Path(path)
+        if target.suffix.lower() == ".py":
+            # 1.6.57（m26604 第 7 条）：导出一份在 Blender 里跑一下就有这些材质的脚本。
+            from ..core.blender_bridge import material_script  # noqa: PLC0415
+
+            entries = list(self.library.visible)
+            target.write_text(material_script(entries), encoding="utf-8")
+            QMessageBox.information(
+                self,
+                "导出完成",
+                f"已写入\n{target}\n\n在 Blender 的「文本编辑器」里打开它、按「运行脚本」，"
+                f"就会出现这 {len(entries)} 个耗材材质（颜色已按线性空间换算，跟这里看到的一致）。",
+            )
+            return
         try:
-            self.library.save(Path(path))
+            self.library.save(target)
         except LibraryError as exc:
             QMessageBox.warning(self, "导出失败", str(exc))
             return
         note = ""
-        written = self._write_mix_sidecar(Path(path))
+        written = self._write_mix_sidecar(target)
         if written:
             note = (
                 f"\n并把整套三色混色缓存一起导出到\n{written.name}"

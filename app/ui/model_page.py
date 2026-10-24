@@ -19,6 +19,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QEventLoop, QSize, Qt
 from PySide6.QtGui import QColor, QKeySequence, QShortcut
+from PySide6.QtWidgets import QMenu  # noqa: F401  (导出下拉，1.6.57)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -56,6 +57,12 @@ from ..core.library import FilamentLibrary
 from ..core.mixes import MixCatalog
 from ..core.model_export import plate_from_model, write_glb
 from ..core.model_matching import ModelMatch, match_model_plans, summarise
+from ..core.blender_bridge import (
+    describe_missing_blender,
+    find_blender,
+    write_blend,
+    write_blend_script,
+)
 from ..core.settings import load_settings, save_settings
 from ..mesh.objfile import write_obj
 from ..mesh.threemf import slots_from_palette, write_3mf
@@ -78,6 +85,9 @@ CHART_WIDTH = 1024
 DEFAULT_COLOURS = 32
 #: 最多用几卷耗材（0 = 不限）。
 DEFAULT_SPOOL_CAP = 4
+#: 底排所有按钮统一用这个高度（1.6.58，m26604 第 1 条）。三维视图那边
+#: （`app/ui/model_view.py:595`）也是 24，两边才对齐成一条线。
+BUTTON_HEIGHT = 24
 
 #: 「耗材方案」空着时那一句，与图像转换页同一个写法（m26286 第 1 条）。
 MODEL_PLAN_HINT_TEXT = "匹配一个模型后，这里会列出几套耗材搭配，自己挑一套。"
@@ -152,17 +162,16 @@ class ModelPage(QWidget):
         splitter.setSizes([900, 380])
         layout.addWidget(splitter, 1)
 
+        # 1.6.57（m26604 第 3 / 8 条）：状态行放在底排之前、跟图像转换页同一个位置
+        # （那边是「匹配完成：…」那一行）；模型名也在这一行里，两页对齐。
+        layout.addLayout(self._build_status_row())
+
         layout.addLayout(self._build_bottom_row())
 
         # 1.6.54（m22211 第 3 条）：这一行不再常驻那句「左边的原模型是按模型自己的颜色画的…」，
-        # 只在真有事要说（正在配色 / 出错 / 刚写完文件）时才出现；空着就整行收起来，
-        # 省下的高度归上面的三维视图。
-        self._status = QLabel("")
-        self._status.setProperty("role", "hint")
-        self._status.setWordWrap(True)
-        selectable_text(self._status)
+        # 只在真有事要说（正在配色 / 出错 / 刚写完文件）时才出现。1.6.57 起它由
+        # `_build_status_row()` 建（跟图像转换页同一行、同一位置）。
         self._status.hide()
-        layout.addWidget(self._status)
 
         self._save_shortcut = QShortcut(QKeySequence.StandardKey.Save, self)
         self._save_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
@@ -238,9 +247,27 @@ class ModelPage(QWidget):
         self._filter_button.clicked.connect(self._on_filter)
 
         row.addStretch(1)
+        return row
+
+    def _build_status_row(self) -> QHBoxLayout:
+        """底部那一行文字：左边是状态 / 模型名，位置跟图像转换页一模一样。
+
+        1.6.57（m26604 第 3 / 8 条）：模型名（「独角兽：137,216 个三角形、13 块」）
+        原来挂在工具栏右端，跟图像转换页底部的状态行不对齐；现在两句话都在这条线上，
+        左端先是模型名，后面接状态（「这个模型里没有三角形…」这类）。
+        """
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(10)
         self._model_label = QLabel("还没有打开模型")
         self._model_label.setProperty("role", "hint")
+        selectable_text(self._model_label)
         row.addWidget(self._model_label)
+        self._status = QLabel("")
+        self._status.setProperty("role", "hint")
+        self._status.setWordWrap(True)
+        selectable_text(self._status)
+        row.addWidget(self._status, 1)
         return row
 
     def _panel(self, title: str) -> tuple[QWidget, QVBoxLayout]:
@@ -271,7 +298,9 @@ class ModelPage(QWidget):
         row.setSpacing(8)
         row.addWidget(self._source_view.takeBar())
         row.addSpacing(6)
-        row.addWidget(self._preview_view.takeBar())
+        source_bar = row.itemAt(row.count() - 2).widget()
+        preview_bar = self._preview_view.takeBar()
+        row.addWidget(preview_bar)
         row.addStretch(1)
 
         # 1.6.54（m22211 第 6 条）：三维视图的底色。点一下弹色盘，默认是 SolidWorks
@@ -281,21 +310,42 @@ class ModelPage(QWidget):
         self._background_button.clicked.connect(self._on_pick_background)
         row.addWidget(self._background_button)
 
-        self._export_glb_button = QPushButton("导出 GLB")
-        self._export_glb_button.setToolTip("存成带配色的 GLB（Ctrl+S），下次导入回来接着改")
-        self._export_glb_button.clicked.connect(self._on_export_glb)
-        row.addWidget(self._export_glb_button)
-
-        self._export_obj = QPushButton("生成 OBJ + MTL")
-        self._export_obj.setToolTip("导出成 OBJ，颜色分在 MTL 里")
-        self._export_obj.clicked.connect(lambda: self._on_export_plate("obj"))
-        row.addWidget(self._export_obj)
+        # 1.6.57（m26604 第 9 条）：「导出 GLB」与「生成 OBJ + MTL」合成一个「导出」，
+        # 下拉里再加一项 Blender（.blend）。
+        self._export_button = QPushButton("导出")
+        self._export_button.setProperty("accent", "true")
+        self._export_button.setToolTip("导出模型：GLB / OBJ + MTL / Blender（.blend）")
+        menu = QMenu(self._export_button)
+        self._export_glb_action = menu.addAction("导出 GLB（.glb，能再导入回来接着改）")
+        self._export_glb_action.triggered.connect(self._on_export_glb)
+        self._export_obj_action = menu.addAction("导出 OBJ + MTL")
+        self._export_obj_action.triggered.connect(lambda: self._on_export_plate("obj"))
+        self._export_blend_action = menu.addAction("导出 Blender（.blend）")
+        self._export_blend_action.triggered.connect(self._on_export_blend)
+        self._export_button.setMenu(menu)
+        row.addWidget(self._export_button)
 
         self._export_3mf = QPushButton("生成 3MF（Bambu Studio）")
         self._export_3mf.setProperty("accent", "true")
         self._export_3mf.setToolTip("导出成 Bambu Studio 工程，耗材按配色结果配好")
         self._export_3mf.clicked.connect(lambda: self._on_export_plate("3mf"))
         row.addWidget(self._export_3mf)
+
+        # 1.6.58（m26604 第 1 条）：左边那两排预设视角按钮跟右边这几个按钮是两家人建的
+        # （一排来自 ModelView，一排来自这里），样式表给的 min-height 不一样，并排看就差
+        # 一截、上沿参差。这里取右边那几颗的自然高度（样式表说了算），再把左排一起钉成
+        # 同一个高度，一眼看过去是一条线。
+        self._bottom_buttons = list(source_bar.findChildren(QPushButton)) + list(
+            preview_bar.findChildren(QPushButton)
+        ) + [self._background_button, self._export_button, self._export_3mf]
+        tall = max(
+            BUTTON_HEIGHT,
+            self._background_button.sizeHint().height(),
+            self._export_button.sizeHint().height(),
+            self._export_3mf.sizeHint().height(),
+        )
+        for button in self._bottom_buttons:
+            button.setFixedHeight(tall)
         return row
 
     def _build_side_panel(self) -> QWidget:
@@ -322,11 +372,11 @@ class ModelPage(QWidget):
         filter_row.addWidget(self._filter_hint, 1)
         plans_inside.addLayout(filter_row)
 
-        self._summary = QLabel("还没有配色。")
-        self._summary.setProperty("role", "hint")
-        self._summary.setWordWrap(True)
-        selectable_text(self._summary)
-        plans_inside.addWidget(self._summary)
+        # 1.6.57（m26604 第 6 条）：「13 种颜色，平均 ΔE00 4.24……用 4 卷：白色、黑色…」
+        # 那一句撤了 —— 数字每行方案上都有，卷名行尾的色块也写着，留着只是多一行字。
+        # 保留这个对象（不显示），是因为闸门和「重新匹配」之后的状态文字还读它。
+        self._summary = QLabel("")
+        self._summary.setVisible(False)
 
         # 方案列表跟图像转换页一样是「一行一个圆钮 + 数字 + 那一套用的卷」（m26286
         # 第 1 条）：普通列表只能读文字，看不出这套方案到底用哪几卷颜色。
@@ -338,7 +388,12 @@ class ModelPage(QWidget):
         self._plan_rows_area = QScrollArea()
         self._plan_rows_area.setWidgetResizable(True)
         self._plan_rows_area.setFrameShape(QFrame.Shape.NoFrame)
+        # 1.6.57（m26604 第 5 条）：图像转换页的方案行是直接铺在卡片白底上的，没有第二层
+        # 灰框。滚动区默认自带一层背景，这里让它透明、也不画边框，两层看起来才是一样。
+        self._plan_rows_area.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        self._plan_rows_area.viewport().setAutoFillBackground(False)
         rows_host = QWidget()
+        rows_host.setStyleSheet("background: transparent;")
         self._plan_rows_layout = QVBoxLayout(rows_host)
         self._plan_rows_layout.setContentsMargins(0, 0, 0, 0)
         self._plan_rows_layout.setSpacing(4)
@@ -387,9 +442,8 @@ class ModelPage(QWidget):
         for widget in (
             self._rematch_button,
             self._filter_button,
-            self._export_obj,
+            self._export_button,
             self._export_3mf,
-            self._export_glb_button,
             self._replace_button,
         ):
             widget.setEnabled(enabled)
@@ -965,6 +1019,52 @@ class ModelPage(QWidget):
             f"已生成 {written.name}：{stats['width_mm']} × {stats['depth_mm']} mm，"
             f"{stats['triangles']:,} 个三角面。"
         )
+
+    def _on_export_blend(self) -> None:
+        """导出 Blender 工程（1.6.57，m26604 第 9 条）。
+
+        `.blend` 是 Blender 自己的内存镜像，只有 Blender 能可靠地写。所以这里让本机的
+        Blender 跑一次后台脚本：把我们导出的 OBJ 导进去、存成 `.blend`。找不到 Blender
+        时不假装成功 —— 改成写一份等价的脚本，并说明怎么用。
+        """
+        if self._model is None or self._match is None:
+            return
+        suggested = f"{self._model.name}-配色.blend"
+        try:
+            start = str(paths.exports_dir() / suggested)
+        except OSError:  # pragma: no cover - 防守
+            start = suggested
+        name, _ = QFileDialog.getSaveFileName(
+            self, "导出 Blender", start, "Blender (*.blend);;Blender 脚本 (*.py)"
+        )
+        if not name:
+            return
+        target = Path(name)
+        # 先把手头这套配色写成 OBJ + MTL：Blender 那一步就是把它导进去。
+        staging = target.with_suffix(".obj")
+        try:
+            plate, _entries = self._plate_payload()
+            write_obj(plate, staging)
+        except Exception as error:  # noqa: BLE001 - 报给用户看
+            QMessageBox.warning(self, "导出失败", str(error))
+            self._say(f"写不进 {staging.name}：{error}")
+            return
+        blender = find_blender(load_settings().get("model_blender_path"))
+        if blender is None:
+            script = write_blend_script(staging, target, note="（本机没找到 Blender）")
+            QMessageBox.information(self, "没有找到 Blender", describe_missing_blender())
+            self._say(f"没找到 Blender；已写出脚本 {script.name}，在旁边那个 OBJ 上跑一下就是 .blend。")
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            written = write_blend(staging, target, blender=blender)
+        except Exception as error:  # noqa: BLE001 - 报给用户看
+            QApplication.restoreOverrideCursor()
+            QMessageBox.warning(self, "Blender 导出失败", str(error))
+            self._say(f"Blender 没能写出 {target.name}：{error}")
+            return
+        QApplication.restoreOverrideCursor()
+        self._say(f"已导出 {written.name}（用 {blender.name} 写的），OBJ 与 MTL 也留在旁边。")
 
     def _on_export_glb(self) -> None:
         """导出带配色的 GLB（Ctrl+S）。"""

@@ -607,6 +607,8 @@ class PictureView(QWidget):
         # 是以「铺满」为基准，不会把之前放大的倍数算丢。
         self._fit_scale = 1.0
         self._zoom = 1.0
+        # m26604 第 10 条：选中的是只有几像素的块时，描边加粗、蒙版压实的开关。
+        self._tiny_highlight = False
         self._pan = QPointF(0.0, 0.0)
         self._press_pos: QPointF | None = None
         self._last_pos: QPointF | None = None
@@ -784,6 +786,53 @@ class PictureView(QWidget):
     def zoom(self) -> float:
         return self._zoom
 
+    def setTinyHighlight(self, on: bool) -> None:
+        """要不要把选中的块画得更扎眼（m26604 第 10 条）。
+
+        0.0% 的块可能只有几像素，正常描边一个像素宽，缩到整张的画面里等于看不见；
+        这时把描边加粗、蒙版压得更实，用户才看得出「选中的是这里」。
+        """
+        on = bool(on)
+        if on == self._tiny_highlight:
+            return
+        self._tiny_highlight = on
+        self._highlight = None
+        self.update()
+
+    def focusOn(self, mask: np.ndarray) -> None:
+        """把 ``mask`` 的重心挪到预览画面正中间，必要时放大（m26604 第 10 条）。
+
+        只挪视角、不改匹配结果：用户点的是一个只有几像素的块，原来它可能贴在画面
+        边角，高亮框在视野外，看着像「点了没反应」。
+        """
+        if self._result is None or mask is None:
+            return
+        wanted = np.asarray(mask, dtype=bool)
+        if wanted.shape != self._result.indices.shape or not wanted.any():
+            return
+        rows, cols = np.nonzero(wanted)
+        centre_x = float(cols.mean())
+        centre_y = float(rows.mean())
+        # 一小块在整张画面里只有几个像素宽，放大到能看清为止。
+        span = max(int(cols.max() - cols.min()) + 1, int(rows.max() - rows.min()) + 1)
+        wanted_zoom = ZOOM_MIN
+        if span > 0:
+            # 让这一块至少占画面短边的 1/6，免得一个孤零零的像素还是一片模糊。
+            wanted_zoom = min(8.0, max(ZOOM_MIN, (min(self.width(), self.height()) / 6.0) / max(1.0, span * self._fit_scale)))
+        self._zoom = max(self._zoom, wanted_zoom)
+        self._target_rect()
+        draw_w, draw_h = self._draw_size()
+        if draw_w <= 0 or draw_h <= 0:
+            self.update()
+            return
+        # 图片坐标 → 画布坐标，再解出让这个点落在面板中心的平移量。
+        px = self._fit_scale * self._zoom * (centre_x + 0.5)
+        py = self._fit_scale * self._zoom * (centre_y + 0.5)
+        self._pan = self._clamped_pan(
+            QPointF(draw_w / 2.0 - px, draw_h / 2.0 - py), draw_w, draw_h
+        )
+        self.update()
+
     def reset_zoom(self, *, update: bool = True) -> None:
         """Back to 「整张铺满面板」, centred."""
         self._zoom = ZOOM_MIN
@@ -873,7 +922,7 @@ class PictureView(QWidget):
         printed = result.indices >= 0
         # A wash rather than a solid fill: the rest of the picture stays legible
         # as context, so a small highlighted region is not floating in a void.
-        canvas[printed & ~keep] = (246, 247, 249, 168)
+        canvas[printed & ~keep] = (246, 247, 249, 200 if self._tiny_highlight else 168)
         # Deleted pixels stay fully transparent even while a colour is
         # highlighted: nothing is printed there, and the preview has to say so.
         canvas[keep] = (0, 0, 0, 0)
@@ -893,6 +942,16 @@ class PictureView(QWidget):
         edge[:-1, :] |= keep[:-1, :] & ~keep[1:, :]
         edge[:, 1:] |= keep[:, 1:] & ~keep[:, :-1]
         edge[:, :-1] |= keep[:, :-1] & ~keep[:, 1:]
+        if self._tiny_highlight:
+            # m26604 第 10 条：一丁点大的块把描边往外扩两圈，否则缩在整张画面里
+            # 根本看不出高亮画在哪。
+            for _ in range(2):
+                thick = np.zeros_like(edge)
+                thick[1:, :] |= edge[:-1, :]
+                thick[:-1, :] |= edge[1:, :]
+                thick[:, 1:] |= edge[:, :-1]
+                thick[:, :-1] |= edge[:, 1:]
+                edge |= thick
         if not edge.any():
             return None
         canvas = np.zeros((*keep.shape, 4), dtype=np.uint8)
@@ -1937,21 +1996,9 @@ class PicturePage(QWidget):
         top.addWidget(QLabel("点图片时:"))
         top.addWidget(self._pick_combo)
         top.addStretch(1)
-        # 1.6.56（m25951 第 4 条）：切换「点图片时」的那句说明搬到右上角，跟模型配色页
-        # 「还没有打开模型」同一个位置——放左下角时它把底部那一行顶高，用户还得往下看。
-        # m26286 第 3 条：这句话不折行。折行时标签的最小宽度只有一两个汉字，前面的
-        # stretch 会把剩下的全吃掉，字被挤成一列；给足自然宽度、右对齐，窗口够宽就
-        # 完整显示（1920 宽下工具条约 1010 px，这句话约 520 px，放得下）。
-        self._mode_hint = QLabel("")
-        self._mode_hint.setProperty("role", "hint")
-        selectable_text(self._mode_hint)
-        self._mode_hint.setWordWrap(False)
-        self._mode_hint.setMinimumWidth(0)
-        self._mode_hint.setAlignment(
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-        )
-        top.addWidget(self._mode_hint)
-        self._update_mode_hint()
+        # 1.6.56（m25951 第 4 条）把「点图片时改成…」那句搬到右上角；1.6.57（m26604
+        # 第 2 条）用户要求把那句话删掉 —— 下拉框里写着现在是哪种模式，做法本身在
+        # 「帮助」里。这里不再建标签，`_update_mode_hint()` 留成空实现给旧调用点。
 
         # 底板厚度 = **整块**的厚度，含图上那一层颜色（1.6.42）。 一格多宽由喷嘴定
         # （CELL_MM = 0.4 mm），颜色层厚度由 Bambu Studio 自己管，这两个都不用再问用户。
@@ -3638,6 +3685,10 @@ class PicturePage(QWidget):
                 self._detail.clear()
                 return
             self._sync_block_highlight()
+        elif self._result is not None and 0 <= index < len(self._result.palette):
+            # 颜色模式这一侧也走同一套「太小的块把视角推过去」的逻辑（m26604 第 10 条）：
+            # 0.0% 的颜色只有几像素，高亮画在原处等于没画。
+            self._focus_tiny_block(self._result.indices == index)
         if self._result is None:
             return
         value = self._list.value_of(index)
@@ -4152,11 +4203,34 @@ class PicturePage(QWidget):
             if self._list.current() >= 0 and self._blocks is not None:
                 label = self._list.current()
                 if 0 <= label < blocks.count:
-                    self._view.setSelectedMask(blocks.mask(label))
+                    mask = blocks.mask(label)
+                    self._view.setSelectedMask(mask)
+                    self._focus_tiny_block(mask)
                     return
             self._view.setSelectedMask(None)
             return
         self._view.setSelectedMask(mask)
+        self._focus_tiny_block(mask)
+
+    def _focus_tiny_block(self, mask: np.ndarray) -> None:
+        """选中的是 0.0% 那种一丁点大的块时，把它挪到画面中间并加强高光（m26604 第 10 条）。
+
+        这种块在整张图里只有几像素，选完还留在原来的角落，用户根本看不见高亮在哪 ——
+        列表里明明高亮了，预览里却像什么都没发生。所以这里把视角推过去：按块的重心居中，
+        必要时放大到能看清的倍率；描边也交给视图加粗。
+        """
+        if mask is None:
+            return
+        size = int(mask.sum())
+        if size <= 0:
+            return
+        grid = mask.shape[0] * mask.shape[1]
+        if size > max(64, int(grid * 0.002)):
+            # 够大就不动视角：用户自己看着整张图在选，突然跳一下反而添乱。
+            self._view.setTinyHighlight(False)
+            return
+        self._view.setTinyHighlight(True)
+        self._view.focusOn(mask)
 
     def _on_list_selection_changed(self) -> None:
         """No row selected means 预览 draws nothing (m00830 item 2, m01191 item 1).
@@ -4298,25 +4372,12 @@ class PicturePage(QWidget):
             label.setText(title)
 
     def _update_mode_hint(self) -> None:
-        """右上角那句「点图片时改成…」（1.6.56，m25951 第 4 条）。
+        """不再有那句说明（1.6.57，m26604 第 2 条）。
 
-        原来它是往底部状态行里写的，切一次模式就把那一行顶起来、页面往下挤一格；
-        挪到工具栏右端以后，底部只留真正的进度/结果文字。
-
-        m26286 第 3 条：不折行。整句「点图片时改成「按颜色选择」：点一下选中一种颜色，
-        多选可以攒成一组颜色」在 1680 宽下要 520 px，工具条已经被按钮占满，放不下就被
-        裁掉半句。模式名本来就在左边那个下拉框里写着，所以这里只留后半句的做法说明，
-        一句话放得下，也不再重复。
+        1.6.56 把它搬到工具栏右端，1.6.57 用户要求直接删掉：下拉框里写着现在是哪种
+        模式，做法本身在「帮助」里，页面上不必再占一行字。方法留着是因为切模式那几处
+        调用点还在这里。
         """
-        hint = getattr(self, "_mode_hint", None)
-        if hint is None:
-            return
-        mode = self._mode
-        hint.setText(
-            "点一下选中一整块，多选可以攒成一组色块。"
-            if mode == PICK_EDGE
-            else "点一下选中一种颜色，多选可以攒成一组颜色。"
-        )
 
     def _on_multi_toggled(self, on: bool) -> None:
         """「多选」：click to add a colour, click again to drop it — no Ctrl.

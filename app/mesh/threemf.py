@@ -206,6 +206,16 @@ RELS = """<?xml version="1.0" encoding="UTF-8"?>
 #: origin.  It is column-major 4x4, which is what its reader expects.
 IDENTITY_MATRIX = "1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1"
 
+#: ``3D/_rels/3dmodel.model.rels`` —— 模型文档指向这两份配置的关系表。
+#: Bambu Studio 靠它把 ``Metadata/*.config`` 认成自己的工程文件；缺了它，整包只会被
+#: 当成一个「只有几何的 3MF」，双击在 Bambu Studio 里打不开（m26604 第 4 条）。
+MODEL_RELS = """<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Target="/Metadata/model_settings.config" Id="rel-1" Type="http://schemas.bambulab.com/package/2021/model_settings" />
+  <Relationship Target="/Metadata/project_settings.config" Id="rel-2" Type="http://schemas.bambulab.com/package/2021/project_settings" />
+</Relationships>
+"""
+
 
 def _fmt(value: float) -> str:
     """Shortest decimal that still round-trips the millimetre coordinates."""
@@ -352,6 +362,14 @@ def _model_settings(
         f'    <part id="1" subtype="normal_part">\n'
         f'      <metadata key="name" value="{_attr(object_name)}" />\n'
         f'      <metadata key="matrix" value="{IDENTITY_MATRIX}" />\n'
+        # Bambu Studio 读 part 时按这几个 key 把「这一块」认成一次正常的导入
+        # （1.6.57，m26604 第 4 条：缺少 source_* 时整个工程读不进来）。
+        f'      <metadata key="source_file" value="{_attr(object_name)}.3mf" />\n'
+        '      <metadata key="source_object_id" value="0" />\n'
+        '      <metadata key="source_volume_id" value="0" />\n'
+        '      <metadata key="source_offset_x" value="0" />\n'
+        '      <metadata key="source_offset_y" value="0" />\n'
+        '      <metadata key="source_offset_z" value="0" />\n'
         f'      <mesh_stat face_count="{triangles}" edges_fixed="0" '
         'degenerate_facets="0" facets_removed="0" facets_reversed="0" '
         'backwards_edges="0" />\n'
@@ -808,6 +826,9 @@ def write_3mf(
         with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as archive:
             archive.writestr("[Content_Types].xml", CONTENT_TYPES)
             archive.writestr("_rels/.rels", RELS)
+            # 1.6.57（m26604 第 4 条）：Bambu Studio 是从这份 rels 里找到工程设置与
+            # 模型设置的，缺了它整包会被判为「不是 Bambu 工程」，双击打不开。
+            archive.writestr("3D/_rels/3dmodel.model.rels", MODEL_RELS)
             archive.writestr(
                 "3D/3dmodel.model", _model_document(painted, translate, project.slots)
             )

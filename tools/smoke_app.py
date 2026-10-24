@@ -4529,9 +4529,12 @@ def main() -> int:
     check(model_match is not None and model_match.spool_count >= 1, "配色至少用了一卷耗材")
     # 1.6.53（m21616 第 13 条）：那句「N 种颜色，平均 ΔE00 …」搬进了「耗材方案」，
     # 状态行现在只说「左边是原模型、右边是预览」。
-    check("ΔE00" in model_page._summary.text(), f"耗材方案里带 ΔE00：{model_page._summary.text()[:90]!r}")
+    # 1.6.58（m26604 第 6 条）：那句话按用户要求整条撤掉，方案行自己带数字。
+    check(not model_page._summary.isVisible(), "「N 种颜色，平均 ΔE00 …」那句不再显示")
     check("三角形" in model_page._model_label.text(), "模型名字行带三角形数")
-    check(not hasattr(model_page, "_export_button"), "「导出配色表」按钮已经删了（m21496 第 9 条）")
+    # 1.6.58（m26604 第 9 条）：`_export_button` 这个名字现在给了「导出」下拉按钮
+    # （GLB / OBJ + MTL / Blender），所以旧名字要换个判据：配色表那一颗是彻底没了。
+    check(not hasattr(model_page, "_export_table"), "「导出配色表」按钮已经删了（m21496 第 9 条）")
     check(isinstance(model_page._source_view.hasOpenGL(), bool), "三维视图能回答有没有 OpenGL")
     check(isinstance(model_page._source_view.available(), str), "三维视图能给出不可用原因")
 
@@ -4593,8 +4596,23 @@ def main() -> int:
         check(plate.width_mm > 0 and plate.depth_mm > 0,
               f"板有尺寸：{plate.width_mm:.1f} × {plate.depth_mm:.1f} mm")
     check(model_page.glb_payload()[:4] == b"glTF", "导出的 GLB 有 glTF 头")
+    # 1.6.58（m26604 第 9 条）：导出改成一颗按钮 + 下拉，三项都在。
+    check(model_page._export_button.text() == "导出", "导出是一颗按钮")
+    check(
+        [action.text() for action in model_page._export_button.menu().actions()][:3]
+        == ["导出 GLB（.glb，能再导入回来接着改）", "导出 OBJ + MTL", "导出 Blender（.blend）"],
+        f"下拉三项：{[a.text() for a in model_page._export_button.menu().actions()]}",
+    )
     check(model_page._export_3mf.text().startswith("生成 3MF"), "有生成 3MF 的按钮")
-    check(model_page._export_obj.text().startswith("生成 OBJ"), "有生成 OBJ 的按钮")
+    check(
+        model_page._export_button.height() == model_page._export_3mf.height(),
+        f"底排按钮等高：{model_page._export_button.height()} / {model_page._export_3mf.height()}",
+    )
+    check(
+        all(button.height() == model_page._export_button.height() for button in model_page._bottom_buttons),
+        "底排每一颗（含两排视角按钮）都是同一个高度："
+        + str(sorted({button.height() for button in model_page._bottom_buttons})),
+    )
     check(model_page._save_shortcut.key().toString() in ("Ctrl+S", "Ctrl+S "),
           f"Ctrl+S 绑在导出 GLB 上，got {model_page._save_shortcut.key().toString()!r}")
 
