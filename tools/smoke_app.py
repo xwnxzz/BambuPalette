@@ -4191,12 +4191,15 @@ def main() -> int:
             # 行级的「更换颜色」只在颜色模式里记：它标的是颜色表的第几行。
             page._set_pick_mode(_picture_page.PICK_COLOUR, save=False)
             app.processEvents()
-            page._list.select([0])
+            # 1.6.56：0 像素的颜色不再列出来，第一行不一定是调色板第 0 位 —— 按第一行
+            # 真正顶着的那一位来选，判据才对得上「选中的那一行」。
+            first_value = int(page._list._list.item(0).data(Qt.ItemDataRole.UserRole))
+            page._list.select([first_value])
             wanted = next(
                 (
                     entry
                     for entry in page._candidate_palette()
-                    if entry.key != page._result.palette[0].key
+                    if entry.key != page._result.palette[first_value].key
                 ),
                 None,
             )

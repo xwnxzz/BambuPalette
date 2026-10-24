@@ -116,10 +116,13 @@ class ModelPage(QWidget):
         # 1.6.53（m21616 第 12 条）：那大段操作说明从页面上撤了，挪进「帮助」窗口
         # （主窗口的 _help_text 里）；页面顶上只留工具栏，布局整体上移一格。
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setChildrenCollapsible(False)
+        # 1.6.56（m25951 第 3 条）：三根分割条都跟图像转换页一样可以拖到「孩子消失」——
+        # 那边用的是默认的 childrenCollapsible=True，这里以前显式关掉了，右栏最小 340 px，
+        # 拖到头就停住。现在放开，视图/面板都能一路拖到零。
+        splitter.setChildrenCollapsible(True)
         splitter.setHandleWidth(8)
         views = QSplitter(Qt.Orientation.Horizontal)
-        views.setChildrenCollapsible(False)
+        views.setChildrenCollapsible(True)
         views.setHandleWidth(8)
         # 1.6.55（m25568 第 2 条）：两个三维视图各自套一层跟图像转换页同款的白底卡片，
         # 标题挂在卡片上、不再挂在视图那一排按钮里 —— 这样三页的观感才是一套。
@@ -288,9 +291,12 @@ class ModelPage(QWidget):
         # 分割条的两半，跟图像转换页一样能拖 —— 之前是 0 / 1 的伸缩比，上面那块想吃
         # 多少就吃多少，方案一多就把颜色列表压没了。
         panel = QSplitter(Qt.Orientation.Vertical)
-        panel.setChildrenCollapsible(False)
+        panel.setChildrenCollapsible(True)
         panel.setHandleWidth(8)
-        panel.setMinimumWidth(340)
+        # 1.6.56（m25951 第 3/5 条）：右栏不再钉死最小宽度（拖到消失），也不钉死最小
+        # 高度 —— 那 340 px 宽加上两块卡片的最小高度，把整页的最低高度顶到窗口之外，
+        # 底下一排按钮就被切掉了下半截。
+        panel.setMinimumWidth(0)
         panel.setMaximumWidth(560)
 
         # -- 耗材方案（跟图像转换页一样：筛选 + 一句话 + 方案列表）----------

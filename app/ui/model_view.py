@@ -184,7 +184,9 @@ class _FallbackView(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._text = "3D 视图需要 OpenGL；这台机器上没能创建。\n配色结果照常可用。"
-        self.setMinimumSize(280, 220)
+        # 1.6.56（m25951 第 3/5 条）：最小尺寸放到很小，让分割条能一路拖到消失、
+        # 也整页的最低高度收得住，底下一排按钮不会被窗口切掉。
+        self.setMinimumSize(120, 80)
 
     def setMessage(self, text: str) -> None:
         self._text = text
@@ -223,7 +225,7 @@ class _GLView(QOpenGLWidget):
         self._flip_orbit = True
         #: 视图底色（1.6.54，m22211 第 6 条）。默认照 SolidWorks 的浅蓝灰。
         self._background: tuple[int, int, int] = DEFAULT_BACKGROUND
-        self.setMinimumSize(280, 220)
+        self.setMinimumSize(160, 120)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMouseTracking(False)
         self._apply_format()

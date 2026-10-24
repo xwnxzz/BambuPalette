@@ -1396,6 +1396,11 @@ class ColourList(QWidget):
         for index, members in self._groups(result):
             entry = result.palette[index]
             count = int(sum(int(result.counts[position]) for position in members))
+            # 1.6.56（m25951 第 1 条）：一个像素都没有的颜色不列出来。它印不出来，删它
+            # 也没有像素可删（删除是把那些像素改成透明），于是那行永远删不掉、永远挂着
+            # 一个 0.0%。不列，问题就不存在。
+            if count <= 0:
+                continue
             image_hex = hex_of(result.region_colour(index))
             share = count / total * 100.0
             where = "" if len(members) == 1 else f" 等 {len(members)} 处"
@@ -1421,7 +1426,11 @@ class ColourList(QWidget):
         assert blocks is not None
         for rank, label in enumerate(self._order, start=1):
             value = blocks.value(label)
-            share = blocks.size(label) / total * 100.0
+            size = blocks.size(label)
+            # 1.6.56（m25951 第 1 条）：空块不列（理由同颜色那一栏：删不掉，只会挂着）。
+            if size <= 0:
+                continue
+            share = size / total * 100.0
             if 0 <= value < len(result.palette):
                 entry = result.palette[value]
                 image_hex = hex_of(result.region_colour(value))
@@ -1885,6 +1894,23 @@ class PicturePage(QWidget):
         top.addWidget(QLabel("点图片时:"))
         top.addWidget(self._pick_combo)
         top.addStretch(1)
+        # 1.6.56（m25951 第 4 条）：切换「点图片时」的那句说明搬到右上角，跟模型配色页
+        # 「还没有打开模型」同一个位置——放左下角时它把底部那一行顶高，用户还得往下看。
+        self._mode_hint = QLabel("")
+        self._mode_hint.setProperty("role", "hint")
+        selectable_text(self._mode_hint)
+        # 整句话有两行那么长，右上角放不下：给它一个宽度上限并允许折行，右对齐，
+        # 这样它占的是右上角那块空地，而不是把工具栏挤出一截（m25951 第 4 条）。
+        self._mode_hint.setWordWrap(True)
+        # 只设上限不够：折行的标签最小宽度只有一两个汉字，前面的 stretch 会把剩下的
+        # 全吃掉，字就被挤成一列。给它一个下限，它才真的占住右上角那块地方。
+        self._mode_hint.setMinimumWidth(340)
+        self._mode_hint.setMaximumWidth(500)
+        self._mode_hint.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        top.addWidget(self._mode_hint)
+        self._update_mode_hint()
 
         # 底板厚度 = **整块**的厚度，含图上那一层颜色（1.6.42）。 一格多宽由喷嘴定
         # （CELL_MM = 0.4 mm），颜色层厚度由 Bambu Studio 自己管，这两个都不用再问用户。
@@ -3678,7 +3704,13 @@ class PicturePage(QWidget):
         """
         index = self._list.current()
         if index < 0:
-            return -1
+            # 1.6.56（m25951 第 1 条连带）：`select()` 只改选中、不动「当前行」，切模式时
+            # `clear_selection()` 又把当前行清成 -1 —— 于是「只选中、没有当前行」时按
+            # 「更换颜色」会一声不响地什么都不做。没有当前行就拿选中的第一行。
+            picked = self._list.selected_indices()
+            if not picked:
+                return -1
+            return int(picked[0])
         value = self._list.value_of(index)
         if self._result is None or not 0 <= value < len(self._result.palette):
             return -1
@@ -4110,14 +4142,8 @@ class PicturePage(QWidget):
             # 列表整个换了内容，旧的选中集（颜色编号 vs 块编号）不能带过去。
             self._list.clear_selection()
             self._apply_edits()
-            self._status.setText(
-                "点图片时改成「{0}」：{1}".format(
-                    PICK_MODE_LABELS.get(mode, mode),
-                    "点一下选中一整块，多选可以攒成一组色块。"
-                    if mode == PICK_EDGE
-                    else "点一下选中一种颜色，多选可以攒成一组颜色。",
-                )
-            )
+            # 1.6.56（m25951 第 4 条）：说明写到右上角那行，不再占用底部状态行。
+            self._update_mode_hint()
 
     def _sync_source_title(self) -> None:
         """把原图的像素尺寸写进「原图」面板的标题（m14567）。
@@ -4175,6 +4201,25 @@ class PicturePage(QWidget):
         label = getattr(panel, "title_label", None)
         if label is not None and label.text() != title:
             label.setText(title)
+
+    def _update_mode_hint(self) -> None:
+        """右上角那句「点图片时改成…」（1.6.56，m25951 第 4 条）。
+
+        原来它是往底部状态行里写的，切一次模式就把那一行顶起来、页面往下挤一格；
+        挪到工具栏右端以后，底部只留真正的进度/结果文字。
+        """
+        hint = getattr(self, "_mode_hint", None)
+        if hint is None:
+            return
+        mode = self._mode
+        hint.setText(
+            "点图片时改成「{0}」：{1}".format(
+                PICK_MODE_LABELS.get(mode, mode),
+                "点一下选中一整块，多选可以攒成一组色块。"
+                if mode == PICK_EDGE
+                else "点一下选中一种颜色，多选可以攒成一组颜色。",
+            )
+        )
 
     def _on_multi_toggled(self, on: bool) -> None:
         """「多选」：click to add a colour, click again to drop it — no Ctrl.
