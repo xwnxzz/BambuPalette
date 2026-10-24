@@ -24,7 +24,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-__all__ = ["BlockMap", "label_blocks", "min_block_pixels"]
+__all__ = ["BlockMap", "label_blocks", "min_block_pixels", "without_blocks"]
 
 #: 去噪门槛占打印像素的比例：512×512（约 12 万实心像素）的图画出来是 24 像素，
 #: 比一个 5×5 的点还小；再小的东西在成品上就是噪点而不是形状。
@@ -67,6 +67,31 @@ class BlockMap:
     def value(self, label: int) -> int:
         """The palette index this block prints with."""
         return int(self.values[int(label)])
+
+
+def without_blocks(block_map: BlockMap, drop: "set[int] | frozenset[int] | list[int]") -> BlockMap:
+    """去掉几块之后的色块表（1.6.62，m28297 第 4 条）。
+
+    「删除」只会把整块像素变透明，剩下的块一个像素都不少，所以它们既不会合并、
+    也不会被切成两半 —— 重新从上往下扫一遍整张图是白扫。1680×2880 的图上那一次
+    要 4 秒，这里只要几毫秒。
+    """
+    gone = {int(label) for label in drop}
+    labels = block_map.labels
+    if not gone or labels.size == 0:
+        return block_map
+    stripped = np.where(np.isin(labels, np.asarray(sorted(gone), dtype=labels.dtype)), -1, labels)
+    keep = np.asarray(
+        [label for label in range(block_map.count) if label not in gone], dtype=np.int64
+    )
+    if keep.size == 0:
+        empty = np.full(labels.shape, -1, dtype=np.int32)
+        return BlockMap(labels=empty, sizes=np.zeros(0, dtype=np.int64), values=np.zeros(0, dtype=np.int32))
+    compact = np.full(block_map.count, -1, dtype=np.int64)
+    compact[keep] = np.arange(keep.size, dtype=np.int64)
+    remapped = np.where(stripped >= 0, compact[np.maximum(stripped, 0)], -1).astype(np.int32)
+    sizes = np.bincount(remapped[remapped >= 0].ravel(), minlength=keep.size).astype(np.int64)
+    return BlockMap(labels=remapped, sizes=sizes, values=block_map.values[keep].astype(np.int32))
 
 
 def label_blocks(
@@ -172,7 +197,15 @@ def _keep_every_colour(
 
 
 def _runs(grid: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Row runs + union-find: the connected pieces of ``grid`` in raster order."""
+    """Row runs + union-find: the connected pieces of ``grid`` in raster order.
+
+    1.6.62（m28297 第 4 条）：删一块要卡 4 秒，最贵的就是这个函数。原来每行对每个
+    调色板颜色各做一次 ``np.unique`` + ``np.flatnonzero``（32 色 × 2880 行 = 9 万次
+    numpy 调用，光这个就 1.3 s），而且「当前 run 扫上一行所有 run」是 O(R²)。
+
+    现在：每行只做 4 次 numpy 调用（一次 argsort 分组），配对用 ``searchsorted`` 只找
+    真正重叠的那些，配对数组一次摊平后交给并查集。
+    """
     height, width = int(grid.shape[0]), int(grid.shape[1])
     labels = np.full((height, width), -1, dtype=np.int32)
     if height == 0 or width == 0:
@@ -196,41 +229,98 @@ def _runs(grid: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         if first != second:
             parent[max(first, second)] = min(first, second)
 
-    rows: list[list[tuple[int, int, int]]] = []
-    previous: list[tuple[int, int, int, int]] = []
+    row_ids: list[np.ndarray] = []
+    row_starts: list[np.ndarray] = []
+    row_stops: list[np.ndarray] = []
+    previous: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    total_runs = 0
     for y in range(height):
         row = grid[y]
         edges = np.flatnonzero(row[1:] != row[:-1]) + 1
         if edges.size:
-            starts = np.concatenate(([0], edges))
-            stops = np.concatenate((edges, [width]))
+            starts = np.concatenate((np.zeros(1, dtype=np.int64), edges))
+            stops = np.concatenate((edges, np.full(1, width, dtype=np.int64)))
         else:
-            starts = np.array([0], dtype=np.int64)
-            stops = np.array([width], dtype=np.int64)
-        current: list[tuple[int, int, int, int]] = []
-        for start, stop in zip(starts.tolist(), stops.tolist()):
-            value = int(row[start])
-            if value < 0:
+            starts = np.zeros(1, dtype=np.int64)
+            stops = np.full(1, width, dtype=np.int64)
+        values = row[starts]
+        ids = np.full(starts.size, -1, dtype=np.int64)
+        keep = values >= 0
+        if keep.any():
+            kept_values = values[keep]
+            count = int(kept_values.size)
+            ids[keep] = np.arange(total_runs, total_runs + count, dtype=np.int64)
+            parent.extend(range(total_runs, total_runs + count))
+            total_runs += count
+            # 一行只排一次序，按值切成连续几段（以前是每个颜色各扫一遍整行）。
+            order = np.argsort(kept_values, kind="stable")
+            sorted_values = kept_values[order]
+            unique_values, firsts_at = np.unique(sorted_values, return_index=True)
+            bounds = np.append(firsts_at, sorted_values.size)
+            kept_index = np.flatnonzero(keep)
+            for position, value in enumerate(unique_values.tolist()):
+                selected = kept_index[order[firsts_at[position]: int(bounds[position + 1])]]
+                bucket = previous.get(int(value))
+                if bucket is None:
+                    continue
+                prev_starts, prev_stops, prev_ids = bucket
+                # Overlap is "share at least one column", which is exactly
+                # 4-connectivity: prev_start < stop and start < prev_stop.
+                firsts = np.searchsorted(prev_stops, starts[selected], side="right")
+                lasts = np.searchsorted(prev_starts, stops[selected], side="left")
+                counts = lasts - firsts
+                total = int(counts.sum())
+                if total == 0:
+                    continue
+                current_runs = np.repeat(ids[selected], counts).tolist()
+                offsets = np.repeat(
+                    firsts
+                    - np.concatenate((np.zeros(1, dtype=np.int64), np.cumsum(counts)[:-1])),
+                    counts,
+                )
+                for mine, theirs in zip(current_runs, prev_ids[offsets + np.arange(total, dtype=np.int64)].tolist()):
+                    union(int(mine), int(theirs))
+        current: dict[int, list] = {}
+        for start, stop, run, value in zip(
+            starts.tolist(), stops.tolist(), ids.tolist(), values.tolist()
+        ):
+            if run < 0:
                 continue
-            run = len(parent)
-            parent.append(run)
-            current.append((start, stop, run, value))
-            # Touching runs of the row above belong together.  Overlap is "share
-            # at least one column", which is exactly 4-connectivity.
-            for pstart, pstop, prun, pvalue in previous:
-                if pvalue == value and pstart < stop and start < pstop:
-                    union(run, prun)
-        rows.append([(start, stop, run) for start, stop, run, _ in current])
-        previous = current
+            slot = current.setdefault(int(value), [[], [], []])
+            slot[0].append(start)
+            slot[1].append(stop)
+            slot[2].append(run)
+        previous = {
+            value: (
+                np.asarray(parts[0], dtype=np.int64),
+                np.asarray(parts[1], dtype=np.int64),
+                np.asarray(parts[2], dtype=np.int64),
+            )
+            for value, parts in current.items()
+        }
+        row_ids.append(ids)
+        row_starts.append(starts)
+        row_stops.append(stops)
 
-    roots = [find(run) for run in range(len(parent))]
+    roots = [find(run) for run in range(total_runs)]
     numbering = {root: position for position, root in enumerate(sorted(set(roots)))}
     sizes = np.zeros(len(numbering), dtype=np.int64)
-    for y, runs in enumerate(rows):
-        for start, stop, run in runs:
-            label = numbering[roots[run]]
-            labels[y, start:stop] = label
-            sizes[label] += stop - start
+    for y, (ids, starts, stops) in enumerate(zip(row_ids, row_starts, row_stops)):
+        if ids.size == 0:
+            continue
+        mapped = np.fromiter(
+            (numbering[roots[run]] if run >= 0 else -1 for run in ids.tolist()),
+            dtype=np.int32,
+            count=ids.size,
+        )
+        labels[y] = np.repeat(mapped, (stops - starts).astype(np.int64))
+        positive = mapped >= 0
+        if positive.any():
+            sizes += np.bincount(
+                mapped[positive],
+                weights=(stops - starts)[positive],
+                minlength=sizes.size,
+            ).astype(np.int64)
     return labels, sizes
 
 
@@ -303,9 +393,14 @@ def _absorb_small(
             if mine != theirs:
                 destination[mine] = theirs
         dest = np.asarray([land(label) for label in range(len(sizes))], dtype=np.int64)
-        merged = np.where(labels >= 0, dest[labels], -1)
-        work = np.where(merged >= 0, values[merged], -1).astype(np.int32)
+        # 折叠会改颜色：小片并进大块之后，原来隔着它、现在颜色相同又挨在一起的两块
+        # 必须并成一块（「AABAAB」并完只剩一块）。所以这一步仍然要重新分块 ——
+        # 「删除」那条路才是可以省掉重新分块的（1.6.62，m28297 第 4 条，见
+        # ``without_blocks``）。``dest`` 是「旧编号 → 留下来的那一块」，按像素查表。
+        landing_values = values[dest]
+        work = np.where(labels >= 0, landing_values[labels], -1).astype(np.int32)
         labels, sizes = _runs(work)
+        sizes = sizes.astype(np.int64)
     return work, labels, sizes
 
 

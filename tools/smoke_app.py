@@ -3118,9 +3118,12 @@ def main() -> int:
                 "the bar appears once the match outlasts the delay",
             )
             page._report_match("在耗材与混色库里寻找最接近的颜色", 0.42)
+            # 1.6.62（m28297 第 3 条）：进度条按「实测耗时」重新排过（量化与找色各拿到
+            # 一大段），所以这里比的是映射之后的值，不是引擎原始分数。
+            wanted = int(_picture_page._match_progress_fraction(0.42) * _picture_page.PROGRESS_STEPS)
             check(
-                page._progress.value() == int(0.42 * _picture_page.PROGRESS_STEPS),
-                f"a report moves the bar, got {page._progress.value()}",
+                page._progress.value() == wanted,
+                f"a report moves the bar, got {page._progress.value()} want {wanted}",
             )
             check(
                 page._status.text() == "正在匹配：在耗材与混色库里寻找最接近的颜色…",

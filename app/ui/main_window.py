@@ -96,6 +96,31 @@ DEFAULT_TARGET_HEX = "#000000"
 BUILD_DELAY_MS = 150
 
 
+def _write_failure_log(what: str, error: BaseException) -> "Path | None":
+    """把一次失败连同调用栈写进数据目录，返回那个文件（1.6.62，m28297 第 2 条）。
+
+    消息框里的文字会随着点击消失，用户想反馈的时候已经没了；何况「设置没能保存」
+    这种一句话根本看不出是权限、磁盘还是别的什么。
+    """
+    try:
+        import traceback as _traceback
+        from datetime import datetime as _datetime
+
+        from ..core import paths as _paths
+
+        folder = _paths.data_dir()
+        folder.mkdir(parents=True, exist_ok=True)
+        stamp = _datetime.now().strftime("%Y%m%d-%H%M%S")
+        target = folder / f"{what}失败-{stamp}.log"
+        target.write_text(
+            "".join(_traceback.format_exception(type(error), error, error.__traceback__)),
+            encoding="utf-8",
+        )
+        return target
+    except Exception:  # pragma: no cover - 连日志都写不下就只能算了
+        return None
+
+
 class MainWindow(QMainWindow):
     def __init__(
         self,
@@ -1646,8 +1671,14 @@ class MainWindow(QMainWindow):
         values = dialog.values()
         try:
             settings.save_settings(values)
-        except OSError as error:
-            QMessageBox.warning(self, "设置没能保存", f"写不进偏好文件：{error}")
+        except Exception as error:  # 1.6.62（m28297 第 2 条）：任何写不进去都报清楚
+            log = _write_failure_log("设置", error)
+            detail = f"\n\n详细调用栈已写到\n{log}" if log is not None else ""
+            QMessageBox.warning(
+                self,
+                "设置没能保存",
+                f"{error}{detail}\n\n设置文件的位置：{settings.settings_path()}",
+            )
             return
         self._picture_page.apply_settings(values)
         self._model_page.apply_settings(values)

@@ -3004,10 +3004,13 @@ def run_selftest(*, report_path: Path | None = None) -> int:
             size_dialog.chosen() == (60, 30),
             f"弹窗默认填声明尺寸，直接回车就是 1.6.48 的行为：{size_dialog.chosen()}",
         )
+        # 1.6.62（m28297 第 1 条）：上界从 4096 放开到 100000 —— 1680×2880 这种尺寸正好
+        # 卡在旧上限外面，填 6000 会被悄悄改成 4096。真实约束（机器行程）改在弹窗里提示。
+        high = _pp.VECTOR_MAX_PX
         check(
-            (size_dialog._width.minimum(), size_dialog._width.maximum()) == (16, 4096)
-            and (size_dialog._height.minimum(), size_dialog._height.maximum()) == (16, 4096),
-            f"宽长两个框都能写 16～4096："
+            (size_dialog._width.minimum(), size_dialog._width.maximum()) == (16, high)
+            and (size_dialog._height.minimum(), size_dialog._height.maximum()) == (16, high),
+            f"宽长两个框都能写 16～{high}："
             f"{size_dialog._width.minimum()}～{size_dialog._width.maximum()} / "
             f"{size_dialog._height.minimum()}～{size_dialog._height.maximum()}",
         )

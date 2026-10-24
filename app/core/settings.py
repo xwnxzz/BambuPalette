@@ -17,6 +17,7 @@ while a file that carries a version is obeyed exactly.
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 from . import paths
@@ -180,7 +181,17 @@ def save_settings(values: dict) -> Path:
     target.parent.mkdir(parents=True, exist_ok=True)
     # 先写临时文件再改名（1.6.50）：偏好是一份小 JSON，但被截断也等于「设置全丢」，
     # 而这条路径在窗口构造与每次切页时都会走到。
-    atomic_write_text(
-        target, json.dumps(merged, ensure_ascii=False, indent=2) + "\n"
-    )
-    return target
+    # 1.6.62（m28297 第 2 条）：Windows 上杀软/索引器会短时间攥住刚写出来的文件，
+    # 一次失败不代表存不下。重试三次、每次隔 120 ms，把这种抖动挡掉；三次都败才
+    # 往上报，并在消息里带上路径 —— 以前的报错只有一句「写不进偏好文件」，用户
+    # 完全不知道是哪个盘、哪个文件夹。
+    payload = json.dumps(merged, ensure_ascii=False, indent=2) + "\n"
+    last: OSError | None = None
+    for attempt in range(3):
+        try:
+            atomic_write_text(target, payload)
+            return target
+        except OSError as error:  # pragma: no cover - 需要真的锁住文件才走得到
+            last = error
+            time.sleep(0.12 * (attempt + 1))
+    raise OSError(f"写不进 {target}（{last}）") from last

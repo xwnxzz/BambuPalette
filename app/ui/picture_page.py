@@ -74,7 +74,13 @@ from PySide6.QtWidgets import (
 from .. import __version__
 from ..core import paths
 from ..core.atomicio import atomic_path
-from ..core.blocks import BlockMap, label_blocks, min_block_pixels, revalue_blocks
+from ..core.blocks import (
+    BlockMap,
+    label_blocks,
+    min_block_pixels,
+    revalue_blocks,
+    without_blocks,
+)
 from ..core.image_matching import (
     BudgetOption,
     MatchResult,
@@ -111,6 +117,7 @@ from ..core.project import (
 )
 from ..mesh.objfile import write_obj
 from ..mesh.plate import CELL_MM, COLOUR_BAND_MM, PlateModel, PlateSettings, build_plate
+from ..mesh.threemf import DEFAULT_PLATE_MM as PLATE_MM
 from ..mesh.threemf import MAX_PAINTED_FILAMENTS, slots_from_palette, write_3mf
 from . import theme
 from .colour_picker import (
@@ -139,10 +146,13 @@ PNG_FILTER = "PNG 图片 (*.png);;所有文件 (*)"
 #: 像素可认。1.6.44 起渲染不再设上限 —— 拿来一个图标渲染成多大，由它自己的尺寸和栅格决定（m17910 第 2 条）。
 SVG_SUFFIXES = frozenset({".svg"})
 
-#: 导入 SVG 时那个弹窗里能写的像素数（1.6.49）。小到 16 已经和图标差不多大，大到 4096
-#: 一格 0.4 mm 就是 1638 mm 的板；中间任何一档都合法，默认值是它在文件里声明的那一档。
+#: 导入 SVG 时那个弹窗里能写的像素数（1.6.49）。下界 16 已经和图标差不多大。
+#: 1.6.62（m28297 第 1 条）：上界撤了 —— 用户要 8000 px 就给它 8000，不再悄悄夹到
+#: 4096。夹着的坏处是明显的：填 6000 被改成 4096，导进来的图和想要的不一样，而且
+#: 界面上没有任何提示。
 VECTOR_MIN_PX = 16
-VECTOR_MAX_PX = 4096
+#: Qt 的 QSpinBox 上限。写这么大等于「不设上限」，但控件本身还得有个数才合法。
+VECTOR_MAX_PX = 100_000
 
 #: Wheel zoom runs between 「整张铺满面板」 (1.0) and this many times the fit.
 ZOOM_MIN = 1.0
@@ -159,6 +169,39 @@ DEFAULT_MAX_COLOURS = MAX_PAINTED_FILAMENTS
 #: 一个「比任何图都多」的哨兵：真正收手的是图自己的颜色数 —— 聚类簇数不可能超过
 #: 「这张图里有几种不同的颜色」，所以这里写多大都不会凭空造出颜色。
 UNLIMITED_COLOURS = 4096
+#: 引擎报上来的分数是「第几步」，不是「过了多少时间」：``0.05/0.15/0.30`` 这三步
+#: 在几千像素的图上眨眼就过，可是在 1680×2880 的图上，从 0.15 走到 0.30 之间的那次
+#: 量化要一秒多 —— 进度条就定在那儿不动，用户看到的是「卡住了」（1.6.62，m28297 第 3 条）。
+#: 这里按实测耗时重新排一遍：量化那一段（0.15→0.30）拿到 6%→45%，找色（0.35→0.60）
+#: 拿 45%→72%，剩下的才分给收尾。表是 (引擎分数, 进度条分数)，中间线性插值。
+_MATCH_PROGRESS_MAP = (
+    (0.00, 0.00),
+    (0.15, 0.06),
+    (0.30, 0.45),
+    (0.35, 0.48),
+    (0.60, 0.72),
+    (0.75, 0.88),
+    (0.85, 0.94),
+    (0.90, 0.96),
+    (0.96, 0.99),
+    (1.00, 1.00),
+)
+
+
+def _match_progress_fraction(engine_fraction: float) -> float:
+    """引擎分数 → 进度条分数（见 ``_MATCH_PROGRESS_MAP``）。"""
+    value = max(0.0, min(1.0, float(engine_fraction)))
+    for (in_from, out_from), (in_to, out_to) in zip(
+        _MATCH_PROGRESS_MAP, _MATCH_PROGRESS_MAP[1:]
+    ):
+        if value <= in_to:
+            span = in_to - in_from
+            if span <= 0:
+                return out_to
+            return out_from + (out_to - out_from) * (value - in_from) / span
+    return 1.0
+
+
 #: 一次打印最常用的卷数（AMS 四槽）。0 才是「不限」，默认值必须是真数字。
 DEFAULT_SPOOL_CAP = 4
 
@@ -740,15 +783,23 @@ class PictureView(QWidget):
             self._matched = self._build_matched(self._result)
         self.update()
 
+    #: 两个视图（「原图」与「预览」）以前各有一份缓存，同一张图要各自 render 一遍；
+    #: 1680×2880 的工程上一遍 0.45 s，删一块等于白付一次（1.6.62，m28297 第 4 条）。
+    #: 键是「画出来的东西」（指纹 + 圆滑开关），与对象 id 无关，所以两个视图能共用。
+    _SHARED_PREVIEW: dict = {}
+
     def _build_matched(self, result: MatchResult) -> QImage:
         # 缓存按「画出来的东西」认，不按对象 id 认（m26286 第 4 条）：``_apply_edits``
         # 每次都重建一个 MatchResult，什么都没改也换了对象，于是每次切模式都要重画一遍
         # 预览（实测 2 × 110 ms，全在 plate.smooth_indices 里），这就是用户说的停顿。
-        key = (_result_fingerprint(result), self._smooth)
-        cached = self._matched_cache.get(key)
+        key = (_result_fingerprint(result), self._smooth, int(result.width), int(result.height))
+        cached = self._SHARED_PREVIEW.get(key)
         if cached is not None:
             return cached
         image = _to_qimage(render_preview(result, smooth=self._smooth))
+        if len(self._SHARED_PREVIEW) > 6:
+            self._SHARED_PREVIEW.clear()
+        self._SHARED_PREVIEW[key] = image
         self._matched_cache[key] = image
         return image
 
@@ -1832,10 +1883,19 @@ class SvgSizeDialog(QDialog):
 
     def _sync_note(self) -> None:
         width, height = self.chosen()
-        self._note.setText(
+        note = (
             f"匹配 {width * height:,} 个像素：板 {width * CELL_MM:.1f} × {height * CELL_MM:.1f} mm"
             f"（一格 {CELL_MM} mm），渲出来的就是 {width} × {height} 像素的位图。"
         )
+        # 1.6.62（m28297 第 1 条）：像素数不再封顶，板就可能大过机器行程。这里照实说
+        # 一句，别让用户导进来才发现导出时超框。
+        longest = max(width, height) * CELL_MM
+        if longest > PLATE_MM:
+            note += (
+                f"\n注意：最长一边 {longest:.0f} mm，超过 {PLATE_MM:.0f} mm 的机器行程 ——"
+                "导出前得把图缩到这个范围里。"
+            )
+        self._note.setText(note)
 
 
 def _ask_vector_size(
@@ -2337,6 +2397,12 @@ class PicturePage(QWidget):
         self._progress.setVisible(False)
         self._busy_timer = QTimer(self)
         self._busy_timer.setSingleShot(True)
+        # 两档之间还有很长的活（量化、找色）：这条计时器让进度条朝下一档慢慢爬，
+        # 停在 45% 不动比慢慢爬更像「卡住」（1.6.62，m28297 第 3 条）。
+        self._progress_timer = QTimer(self)
+        self._progress_timer.setInterval(90)
+        self._progress_timer.timeout.connect(self._creep_progress)
+        self._progress_goal = 0
         self._busy_timer.setInterval(BUSY_DELAY_MS)
         self._busy_timer.timeout.connect(self._show_progress)
 
@@ -3036,12 +3102,15 @@ class PicturePage(QWidget):
     def _begin_match(self) -> None:
         """Arm the progress bar; it appears only if the match is slow enough."""
         self._progress.setValue(0)
+        self._progress_goal = 0
         self._busy_timer.start()
         self._set_controls_enabled(False)
 
     def _end_match(self) -> None:
         """Put the bar away.  The controls come back with the new result."""
         self._busy_timer.stop()
+        self._progress_timer.stop()
+        self._progress_goal = 0
         self._progress.setVisible(False)
         self._progress.setValue(0)
         self._sync_status_bar()
@@ -3057,6 +3126,19 @@ class PicturePage(QWidget):
             return
         bar.setVisible(bool(self._status.text().strip()) or self._progress.isVisible())
 
+    def _creep_progress(self) -> None:
+        """朝 ``_progress_goal`` 慢慢挪，永不越过它（1.6.62，m28297 第 3 条）。
+
+        引擎的分数是「第几步」，两档之间的量化、找色各自要好几秒。原地不动看起来就是
+        死机；按固定节奏往下一档挪，既不动摇「还没做完」这个事实，也让用户看见它在走。
+        """
+        goal = int(self._progress_goal)
+        value = int(self._progress.value())
+        if value >= goal or not self._progress.isVisible():
+            return
+        step = max(1, (goal - value) // 12)
+        self._progress.setValue(min(goal, value + step))
+
     def _report_match(self, message: str, fraction: float) -> None:
         """One step of :func:`match_image`, drawn while the match is running.
 
@@ -3065,7 +3147,13 @@ class PicturePage(QWidget):
         start a second match inside the first one, which is the only way this
         can go wrong.
         """
-        self._progress.setValue(int(max(0.0, min(1.0, fraction)) * PROGRESS_STEPS))
+        shown = _match_progress_fraction(fraction)
+        self._progress_goal = int(max(0.0, min(1.0, shown)) * PROGRESS_STEPS)
+        self._progress.setValue(self._progress_goal)
+        if self._progress_goal < PROGRESS_STEPS:
+            self._progress_timer.start()
+        else:
+            self._progress_timer.stop()
         self._status.setText(f"正在匹配：{message}…")
         QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
 
@@ -3443,8 +3531,12 @@ class PicturePage(QWidget):
         line = QHBoxLayout(box)
         line.setContentsMargins(0, 0, 0, 0)
         line.setSpacing(3)
+        # 1.6.62（m28297 第 2 条）：``use.filament`` 可能是 None —— 工程是从别人那里
+        # 拿来的，里面的耗材本机库里没有，spool_usage 只能认出 id。以前这里直接读
+        # ``use.filament.id``，于是「打开工程」当场 AttributeError。
         shares = {
-            use.filament.id: use for use in spool_usage(option.result, self._library)
+            (use.filament.id if use.filament is not None else use.filament_id): use
+            for use in spool_usage(option.result, self._library)
         }
         for filament_id in option.spools:
             filament = self._library.get(filament_id) if self._library is not None else None
@@ -4082,6 +4174,7 @@ class PicturePage(QWidget):
         keep: int | None = None,
         *,
         reselect: Sequence[np.ndarray] | np.ndarray | None = None,
+        drop_blocks: Sequence[int] | None = None,
     ) -> None:
         """Recompose the live result and show it everywhere.
 
@@ -4120,7 +4213,13 @@ class PicturePage(QWidget):
             self._update_actions()
             self._announce_edits()
             return
-        blocks = self._build_blocks(result)
+        # 「删除」是把整块像素变透明：留下的块一个像素都不会少，也不会被切成两半，
+        # 所以照旧表去掉那几块就等价 —— 不必把整张图重新分一遍块（1.6.62，m28297
+        # 第 4 条）。1680×2880 的工程上，那一次重新分块要 4 秒。
+        if drop_blocks is not None and self._blocks is not None:
+            blocks = without_blocks(self._blocks, drop_blocks)
+        else:
+            blocks = self._build_blocks(result)
         self._blocks = blocks
         self._view.setResult(result, self._source_qimage)
         self._original_view.setResult(result, self._source_qimage)
@@ -4595,7 +4694,7 @@ class PicturePage(QWidget):
         self._paint_original(mask, None)
         self._block_edits.append(BlockPaint(mask=mask, entry=None, labels=tuple(sorted(labels))))
         # 逐块交回去，删除之后选中的就是「删掉的那几块留下的那几块」(m02316 item 4).
-        self._apply_edits(reselect=masks)
+        self._apply_edits(reselect=masks, drop_blocks=labels)
         self._mark_plans_stale()
         self._status.setText(
             f"已删除 {len(masks)} 块：这些地方留空、变成透明，不打印也没有底板；"

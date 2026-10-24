@@ -19,6 +19,7 @@ U 盘被拔、断电、包里的某一步抛异常——留下的都是一个被
 from __future__ import annotations
 
 import os
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
@@ -80,15 +81,24 @@ def atomic_path(target: str | Path, *, attempts: int = ATTEMPTS) -> Iterator[Pat
         _discard(temporary)
         raise
     _flush_to_disk(temporary)
-    try:
-        os.replace(temporary, destination)
-    except OSError as error:
-        # 顶替这一步失败（最常见的成因是目标被别的程序锁着）：临时文件里是**这次**
-        # 写好的内容，不能删 —— 报错里说清楚它在哪，比留一个没人认得的文件名有用。
-        raise OSError(
-            f"写不进 {destination}（{error.strerror or error}）；"
-            f"这次的内容留在 {temporary}"
-        ) from error
+    # 1.6.62（m28297 第 2 条）：Windows 上杀软、索引器、OneDrive 同步会短暂攥住目标
+    # 文件，``os.replace`` 于是报 WinError 5/32 —— 隔一百多毫秒再试一次通常就过去了。
+    # 所有「保存」都走这条路径（工程、设置、3MF、OBJ），重试放在这里一次就够。
+    last: OSError | None = None
+    for pause in (0.0, 0.15, 0.35):
+        if pause:
+            time.sleep(pause)
+        try:
+            os.replace(temporary, destination)
+            return
+        except OSError as error:
+            last = error
+    # 三次都没顶上去（目标被别的程序锁着）：临时文件里是**这次**写好的内容，不能删
+    # —— 报错里说清楚它在哪，比留一个没人认得的文件名有用。
+    raise OSError(
+        f"写不进 {destination}（{getattr(last, 'strerror', None) or last}）；"
+        f"这次的内容留在 {temporary}"
+    ) from last
 
 
 def atomic_write_text(
