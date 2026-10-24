@@ -864,12 +864,7 @@ class MainWindow(QMainWindow):
         except LibraryError as exc:
             QMessageBox.warning(self, "导入失败", str(exc))
             return
-        added = 0
-        for filament in incoming:
-            if self.library.get(filament.id) is not None:
-                filament = filament.copy()
-            self.library.add(filament)
-            added += 1
+        added, skipped = self._merge_library(incoming)
         # 档案旁边那份三色混色缓存要在重建耗材库之前就登记好：重建会顺手开始算
         # 三色（见 _ensure_triples），而这份档案很可能自带现成的表——先算再丢掉，
         # 用户就要白等几分钟，鼠标还会一直转圈。
@@ -887,7 +882,34 @@ class MainWindow(QMainWindow):
                 self._ensure_triples()
         else:
             self._pending_sidecar = None
-        QMessageBox.information(self, "导入完成", f"已导入 {added} 条耗材。{note}")
+        skipped_note = f"跳过 {skipped} 条已存在的。" if skipped else ""
+        QMessageBox.information(
+            self, "导入完成", f"已导入 {added} 条耗材。{skipped_note}{note}"
+        )
+
+    def _merge_library(self, incoming) -> tuple[int, int]:
+        """把一份档案并进当前耗材库，返回 (新增条数, 跳过条数)。
+
+        1.6.59（m26980 第 2 条）：同一条耗材导第二次不该再长出一条来。以前只要 id
+        撞了就给一份副本（副本带新 id），于是「再导入一次自己的档案」会让耗材表凭空
+        多出几条一模一样的 —— 用户看到的「耗材 3、4、5 从哪来的」就是这么来的。
+        现在先按「颜色 + 种类 + 品牌」认人：已经有了就跳过；真的只是 id 撞了（内容
+        不同）才换 id 加进去。
+        """
+        added = 0
+        skipped = 0
+        for filament in incoming:
+            same = self.library.find_duplicate(
+                filament.color_hex, filament.material_type, filament.brand
+            )
+            if same is not None:
+                skipped += 1
+                continue
+            if self.library.get(filament.id) is not None:
+                filament = filament.copy()
+            self.library.add(filament)
+            added += 1
+        return added, skipped
 
     def _on_export(self) -> None:
         default = paths.default_start_dir() / "filament-library-export.json"
@@ -895,11 +917,25 @@ class MainWindow(QMainWindow):
             self,
             "导出耗材档案",
             str(default),
-            "耗材档案 (*.json);;Blender 材质脚本 (*.py)",
+            "耗材档案 (*.json);;Blender 材质样板 (*.obj);;Blender 材质脚本 (*.py)",
         )
         if not path:
             return
         target = Path(path)
+        if target.suffix.lower() == ".obj":
+            # 1.6.59（m26980 第 1 条）：拖进 Blender 就能用的一种 — OBJ + MTL，
+            # 每卷耗材一块小方片、各自一个材质。比「开文本编辑器跑脚本」省事。
+            from ..core.library_export import write_swatch  # noqa: PLC0415
+
+            written, mtl = write_swatch(target, list(self.library.visible))
+            QMessageBox.information(
+                self,
+                "导出完成",
+                f"已写入\n{written}\n（材质表 {mtl.name}）\n\n"
+                "把这个 .obj 直接拖进 Blender 窗口（它旁边的 .mtl 会被一起读进来），"
+                "每卷耗材就是一块小方片，材质名是「序号 名称 颜色」，拿来给模型上色即可。",
+            )
+            return
         if target.suffix.lower() == ".py":
             # 1.6.57（m26604 第 7 条）：导出一份在 Blender 里跑一下就有这些材质的脚本。
             from ..core.blender_bridge import material_script  # noqa: PLC0415

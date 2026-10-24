@@ -17,6 +17,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
+import time
 import traceback
 import zlib
 
@@ -1166,6 +1167,14 @@ class ColourList(QWidget):
         self._list.currentRowChanged.connect(self._on_row_changed)
         self._list.itemSelectionChanged.connect(self._on_selection_changed)
         self._list.itemDoubleClicked.connect(self._on_row_double_clicked)
+        # 1.6.59（m26980 第 3 条）：颜色详情从双击改成三击，所以要自己数连击。
+        self._click_row = -1
+        self._click_time = 0.0
+        self._click_count = 0
+        self._triple_gap = max(
+            0.6, QApplication.doubleClickInterval() / 1000.0 * 1.2
+        )
+        self._list.itemPressed.connect(self._on_row_pressed)
         # 「再点一下同一个颜色就取消选中」: Qt moves the current row during the
         # press and only then emits itemPressed, so by the time the click signal
         # arrives the row has already changed and 「the same colour again」 is no
@@ -1599,7 +1608,32 @@ class ColourList(QWidget):
         self.selectionChanged.emit()
 
     def _on_row_double_clicked(self, item: QListWidgetItem) -> None:
-        self.colourActivated.emit(int(item.data(Qt.ItemDataRole.UserRole)))
+        """双击什么都不做（1.6.59，m26980 第 3 条）：颜色详情改成三击。
+
+        双击在「多选」和「连点换选中」两条路上太容易误触 —— 用户本来只是想连点
+        两下换一行，详情窗口就弹出来盖住半边。三击是故意「重」一点的动作，见
+        :meth:`_on_row_pressed`。
+        """
+
+    def _on_row_pressed(self, item: QListWidgetItem) -> None:
+        """连击计数：同一行在双击间隔内被按到第三次，就打开颜色详情。
+
+        Qt 自己只到「双击」为止，三击要自己数。计数的时机是 ``itemPressed``
+        （按下就记），而不是 ``doubleClicked``（按下两下才算），所以三下之间
+        只要每一下都够快就会触发，中间被拖走一点也没关系。
+        """
+        index = int(item.data(Qt.ItemDataRole.UserRole))
+        now = time.monotonic()
+        if index == self._click_row and now - self._click_time <= self._triple_gap:
+            self._click_count += 1
+        else:
+            self._click_count = 1
+        self._click_row = index
+        self._click_time = now
+        if self._click_count >= 3:
+            self._click_count = 0
+            self._click_row = -1
+            self.colourActivated.emit(index)
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802 - Qt spelling
         """Remember the row and the shown colour from before the press landed.
@@ -4690,10 +4724,20 @@ class PicturePage(QWidget):
         colour = self._picture_colour(survivor)
         if colour is not None:
             self._paint_original(mask, colour)
+        if target < 0:
+            # 1.6.59（m27164）：合并的目标本身是「色块级编辑带进来的颜色」，它在基准
+            # 调色板里没有位子，`_live_map` 给的是 -1。以前这条路上 `_merged[源] = -1`
+            # 就只是把源颜色的像素写成透明 —— 用户看着像「源颜色被删掉了」，那块地方
+            # 从预览里消失，正是这次报的 bug。
+            # `_compose` 的顺序是「先按 merged/deleted 挪成 -1，最后才刷色块级编辑」，
+            # 所以这里补一条把并过来的像素刷成目标颜色的编辑，透明那一步会被刷回来。
+            self._block_edits.append(
+                BlockPaint(mask=mask, entry=entries[choice], labels=())
+            )
         for original in originals:
-            if original != target:
+            if original >= 0 and original != target:
                 self._merged[original] = target
-        self._apply_edits(keep=target)
+        self._apply_edits(keep=target if target >= 0 else None)
         self._mark_plans_stale()
         self._status.setText(
             f"已把 {len(originals)} 种颜色合并成 {entries[choice].color_hex}，"

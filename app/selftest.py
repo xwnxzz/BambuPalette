@@ -1508,15 +1508,25 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         # active and the list focused), so hand Qt's own double-click signal to the
         # view instead — that is the link the handler hangs off, and 合并 has relied
         # on the same signal since 1.6.x.
-        rows.itemDoubleClicked.emit(target)
+        # 1.6.59（m26980 第 3 条）：详情改成三击才开，所以这里按三次
+        # itemPressed —— 前两下什么都不该发生，第三下才发 colourActivated。
+        page._list._on_row_pressed(target)
+        app.processEvents()
+        page._list._on_row_pressed(target)
+        app.processEvents()
+        check(
+            fired == [],
+            f"连点两下不开颜色详情，got {fired}",
+        )
+        page._list._on_row_pressed(target)
         app.processEvents()
         check(
             fired == [0],
-            f"双击第 1 行让列表说出被双击的是哪种颜色，got {fired}",
+            f"连点三下让列表说出选中的是哪种颜色，got {fired}",
         )
         check(
             page._detail_dialog is not None and page._detail_dialog.isVisible(),
-            "双击颜色列表里的一行，弹出这个颜色的详情",
+            "连点三下颜色列表里的一行，弹出这个颜色的详情",
         )
         if page._detail_dialog is not None:
             check(
