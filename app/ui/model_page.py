@@ -22,16 +22,20 @@ from PySide6.QtGui import QColor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QColorDialog,
     QDialog,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QListWidget,
     QListWidgetItem,
     QMessageBox,
     QPushButton,
+    QRadioButton,
+    QScrollArea,
     QSplitter,
     QSpinBox,
     QVBoxLayout,
@@ -41,7 +45,13 @@ from PySide6.QtWidgets import (
 from ..core import paths
 from ..core.glb import GlbModel, load_model, model_colours
 from ..core.threemf_import import THREEMF_SUFFIXES, load_3mf_model
-from ..core.image_matching import MatchSettings, PaletteEntry, TriplePalette, build_palette
+from ..core.image_matching import (
+    MatchSettings,
+    PaletteEntry,
+    TriplePalette,
+    build_palette,
+    spool_usage,
+)
 from ..core.library import FilamentLibrary
 from ..core.mixes import MixCatalog
 from ..core.model_export import plate_from_model, write_glb
@@ -66,9 +76,11 @@ CHART_WIDTH = 1024
 
 #: 模型最多配成多少种颜色 —— 与图像转换页同一个默认值（m21172 item 7）。
 DEFAULT_COLOURS = 32
-
 #: 最多用几卷耗材（0 = 不限）。
 DEFAULT_SPOOL_CAP = 4
+
+#: 「耗材方案」空着时那一句，与图像转换页同一个写法（m26286 第 1 条）。
+MODEL_PLAN_HINT_TEXT = "匹配一个模型后，这里会列出几套耗材搭配，自己挑一套。"
 
 PAGE_HELP = (
     "打开一个 GLB / glTF：程序读出它每一块的颜色，把这些颜色在「全部颜色」里配成能打印的"
@@ -316,11 +328,26 @@ class ModelPage(QWidget):
         selectable_text(self._summary)
         plans_inside.addWidget(self._summary)
 
-        self._plan_list = QListWidget()
-        self._plan_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self._plan_list.setWordWrap(True)
-        self._plan_list.currentRowChanged.connect(self._on_plan_changed)
-        plans_inside.addWidget(self._plan_list)
+        # 方案列表跟图像转换页一样是「一行一个圆钮 + 数字 + 那一套用的卷」（m26286
+        # 第 1 条）：普通列表只能读文字，看不出这套方案到底用哪几卷颜色。
+        self._plan_hint = QLabel(MODEL_PLAN_HINT_TEXT)
+        self._plan_hint.setProperty("role", "hint")
+        self._plan_hint.setWordWrap(True)
+        plans_inside.addWidget(self._plan_hint)
+
+        self._plan_rows_area = QScrollArea()
+        self._plan_rows_area.setWidgetResizable(True)
+        self._plan_rows_area.setFrameShape(QFrame.Shape.NoFrame)
+        rows_host = QWidget()
+        self._plan_rows_layout = QVBoxLayout(rows_host)
+        self._plan_rows_layout.setContentsMargins(0, 0, 0, 0)
+        self._plan_rows_layout.setSpacing(4)
+        self._plan_rows_layout.addStretch(1)
+        self._plan_rows_area.setWidget(rows_host)
+        plans_inside.addWidget(self._plan_rows_area, 1)
+        self._plan_group = QButtonGroup(self)
+        self._plan_group.setExclusive(True)
+        self._plan_group.idClicked.connect(self._on_plan_picked)
         panel.addWidget(plans_box)
 
         # -- 模型上色块的颜色 -------------------------------------------------
@@ -569,21 +596,65 @@ class ModelPage(QWidget):
         return True
 
     def _refresh_plan_list(self) -> None:
-        self._plan_list.blockSignals(True)
-        self._plan_list.clear()
+        """Rebuild the 方案 rows: one radio + numbers + the rolls' colours each."""
+        while self._plan_rows_layout.count():
+            item = self._plan_rows_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        for button in self._plan_group.buttons():
+            self._plan_group.removeButton(button)
+        if not self._plans:
+            self._plan_hint.setText(MODEL_PLAN_HINT_TEXT)
+            self._plan_hint.setVisible(True)
+            self._plan_rows_layout.addStretch(1)
+            return
+        self._plan_hint.clear()
+        self._plan_hint.setVisible(False)
         for index, plan in enumerate(self._plans):
-            title = plan.title or f"方案 {index + 1}"
-            # 只写数字（1.6.53）：`option.note` 是那一类方案的做法说明，八行会一模一样地
+            row = QWidget()
+            line = QHBoxLayout(row)
+            line.setContentsMargins(0, 0, 0, 0)
+            line.setSpacing(6)
+            button = QRadioButton(plan.title or f"方案 {index + 1}")
+            button.setChecked(index == self._plan_index)
+            self._plan_group.addButton(button, index)
+            # 只写数字（1.6.53）：`plan.note` 是那一类方案的做法说明，八行会一模一样地
             # 重复八遍，看一眼什么也分不出来。要读做法就去「帮助」。
-            row = QListWidgetItem(
-                f"{title}　平均 ΔE00 {plan.mean_delta_e:.2f}、最差 {plan.worst_delta_e:.2f}，"
+            numbers = QLabel(
+                f"平均 ΔE00 {plan.mean_delta_e:.2f} · 最差 {plan.worst_delta_e:.2f} · "
                 f"用 {plan.spool_count} 卷"
             )
-            row.setData(Qt.ItemDataRole.UserRole, index)
-            self._plan_list.addItem(row)
-        self._plan_list.blockSignals(False)
-        if self._plans:
-            self._plan_list.setCurrentRow(self._plan_index)
+            numbers.setProperty("role", "hint")
+            line.addWidget(button)
+            line.addWidget(numbers)
+            line.addWidget(self._plan_swatches(plan))
+            line.addStretch(1)
+            self._plan_rows_layout.addWidget(row)
+        self._plan_rows_layout.addStretch(1)
+
+    def _plan_swatches(self, plan: ModelMatch) -> QWidget:
+        """这一套方案用到的卷，按它们自己的颜色画出来（跟图像转换页同一套画法）。"""
+        box = QWidget()
+        line = QHBoxLayout(box)
+        line.setContentsMargins(0, 0, 0, 0)
+        line.setSpacing(3)
+        shares = {
+            use.filament.id: use for use in spool_usage(plan.result, self._library)
+        } if self._library is not None else {}
+        for filament_id in sorted(plan.spools):
+            use = shares.get(filament_id)
+            swatch = QLabel()
+            swatch.setFixedSize(12, 12)
+            colour = use.filament.color_hex if use is not None else "#CCCCCC"
+            swatch.setStyleSheet(f"background:{colour}; border:1px solid #00000022;")
+            name = use.filament.name if use is not None else filament_id
+            swatch.setToolTip(f"{name}（{colour}）")
+            line.addWidget(swatch)
+        return box
+
+    def _on_plan_picked(self, index: int) -> None:
+        self._on_plan_changed(index)
 
     def _on_plan_changed(self, row: int) -> None:
         if not (0 <= row < len(self._plans)):
@@ -1051,9 +1122,9 @@ class ModelPage(QWidget):
             for index, plan in enumerate(self._plans):
                 if plan.key == wanted:
                     self._plan_index = index
-                    self._plan_list.blockSignals(True)
-                    self._plan_list.setCurrentRow(index)
-                    self._plan_list.blockSignals(False)
+                    buttons = self._plan_group.buttons()
+                    if 0 <= index < len(buttons):
+                        buttons[index].setChecked(True)
                     self._match = plan
                     self._refresh_preview()
                     self._fill_list()

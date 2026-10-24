@@ -4540,11 +4540,22 @@ def main() -> int:
 
     check(_tips.tooltips_disabled(), "悬停提示框全程序关掉了（ToolTip 事件被吃掉）")
     check(model_page._source_view.flipOrbit() is True, "模型配色页默认左右翻转")
-    check(model_page._plan_list.count() == len(model_page._plans),
-          f"耗材方案列表行数等于方案数，got {model_page._plan_list.count()}")
-    if model_page._plans:
-        row = model_page._plan_list.item(0).text()
-        check("ΔE00" in row and "卷" in row, f"方案行写的是数字：{row!r}")
+    # 1.6.57（m26286 第 1 条）：方案改成图像转换页那种「圆钮 + 数字 + 卷的颜色」的行。
+    from PySide6.QtWidgets import QLabel as _PlanLabel  # noqa: PLC0415
+    from PySide6.QtWidgets import QRadioButton as _PlanRadio  # noqa: PLC0415
+
+    _rows = [
+        model_page._plan_rows_layout.itemAt(index).widget()
+        for index in range(model_page._plan_rows_layout.count())
+    ]
+    _rows = [row for row in _rows if row is not None]
+    check(len(_rows) == len(model_page._plans),
+          f"耗材方案行数等于方案数，got {len(_rows)} / {len(model_page._plans)}")
+    if _rows:
+        _texts = [label.text() for label in _rows[0].findChildren(_PlanLabel)]
+        check(any("ΔE00" in text and "卷" in text for text in _texts),
+              f"方案行写的是数字：{_texts!r}")
+        check(bool(_rows[0].findChildren(_PlanRadio)), "方案行是圆钮（跟图像转换页一致）")
 
     # --- 1.6.52：只匹配耗材 / 筛选 / 换色撤销 / 三个出口 -----------------------
     check(model_page._colour_count.value() == 32,

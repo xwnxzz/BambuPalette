@@ -79,7 +79,9 @@ def main() -> int:
     # 并且大声说出来；报告里真有一条 fail、或者根本没写 SELFTEST OK，照旧判失败。
     teardown_codes = {0xC0000409, 0xC0000005}
     crashed_after_report = (
-        code < 0 and (code & 0xFFFFFFFF) in teardown_codes and "SELFTEST OK" in text
+        code != 0
+        and (code & 0xFFFFFFFF) in teardown_codes
+        and "SELFTEST OK" in text
     )
     if crashed_after_report:
         print(

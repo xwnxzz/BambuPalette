@@ -18,6 +18,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 import traceback
+import zlib
 
 import numpy as np
 from PIL import Image
@@ -490,6 +491,23 @@ class BlockPaint:
     labels: tuple[int, ...] = ()
 
 
+def _result_fingerprint(result: "MatchResult") -> tuple:
+    """这份匹配「画出来会是什么样」的身份（m26286 第 4 条）。
+
+    预览只取决于是哪张图、每种颜色各是什么、有没有圆滑，所以指纹只看这几样：
+    宽高 + 每个像素落在哪一色（indices）+ 每一色的平均色（means）。``MatchResult``
+    的对象身份不能用 —— 每次 ``_apply_edits`` 都会新建一个，哪怕内容一模一样。
+    """
+    indices = np.ascontiguousarray(result.indices)
+    means = np.ascontiguousarray(result.means) if result.means is not None else None
+    return (
+        result.width,
+        result.height,
+        zlib.crc32(indices.tobytes()),
+        None if means is None else zlib.crc32(means.tobytes()),
+    )
+
+
 def _to_qimage(image: Image.Image) -> QImage:
     """PIL image → QImage, copying so the buffer outlives the PIL object."""
     rgba = image.convert("RGBA")
@@ -577,8 +595,7 @@ class PictureView(QWidget):
         self._smooth = True
         # 两种画法各留一份，来回勾「圆滑色块」就不必重算：细格那一版要一秒多
         # （512 像素、8 色约 1.2–1.5 s），勾一次卡一次是不能接受的。
-        self._matched_cache: dict[bool, QImage] = {}
-        self._matched_for: int | None = None
+        self._matched_cache: dict[tuple, QImage] = {}
         self._highlight: QPixmap | None = None
         self._selected = -1
         self._show_matched = True
@@ -715,14 +732,15 @@ class PictureView(QWidget):
         self.update()
 
     def _build_matched(self, result: MatchResult) -> QImage:
-        if self._matched_for != id(result):
-            self._matched_cache = {}
-            self._matched_for = id(result)
-        cached = self._matched_cache.get(self._smooth)
+        # 缓存按「画出来的东西」认，不按对象 id 认（m26286 第 4 条）：``_apply_edits``
+        # 每次都重建一个 MatchResult，什么都没改也换了对象，于是每次切模式都要重画一遍
+        # 预览（实测 2 × 110 ms，全在 plate.smooth_indices 里），这就是用户说的停顿。
+        key = (_result_fingerprint(result), self._smooth)
+        cached = self._matched_cache.get(key)
         if cached is not None:
             return cached
         image = _to_qimage(render_preview(result, smooth=self._smooth))
-        self._matched_cache[self._smooth] = image
+        self._matched_cache[key] = image
         return image
 
     # -- geometry ---------------------------------------------------------
@@ -1016,6 +1034,26 @@ class PictureView(QWidget):
                 return smaller
             return _nearest_label(labels, x, y, fallback=-1)
         return _nearest_edge(result, x, y, fallback=exact)
+
+
+class _StatusLabel(QLabel):
+    """状态行的一句话。
+
+    1.6.57（m26286 第 2 条）：这一行原来始终占着一行高度，没话说的时候就是一块
+    空白。``owner`` 指回页面，字一改就把整行（含进度条）按需显隐。
+    """
+
+    owner: "PicturePage | None" = None
+
+    def setText(self, text: str) -> None:  # noqa: N802 - Qt 的命名
+        super().setText(text)
+        if self.owner is not None:
+            self.owner._sync_status_bar()
+
+    def clear(self) -> None:  # noqa: D401 - Qt 的命名
+        super().clear()
+        if self.owner is not None:
+            self.owner._sync_status_bar()
 
 
 class ColourList(QWidget):
@@ -1774,6 +1812,11 @@ class PicturePage(QWidget):
         self._block_edits: list[BlockPaint] = []
         #: 当前匹配上认出来的色块；只在块模式下建（顺序、掩码都由它出）。
         self._blocks: BlockMap | None = None
+        #: 上一次算出来的色块表，连同它对应的那份结果。切回「按色块边缘选择」时同一份
+        #: 结果（同一个对象）没必要再分一次块——分块要跑一遍全分辨率的连通域，正是用户
+        #: 说的那一下停顿（m26286 第 4 条）。结果一换（重新匹配、改色块、撤销）对象就
+        #: 不是同一个了，缓存自然失效。
+        self._blocks_cache: tuple[tuple, BlockMap] | None = None
         #: 「这一份划分说了算」的标签图（m15721 第 1 条）。「按当前色块重新匹配」重新
         #: 分色时把旧划分留在这里，_:meth:`_build_blocks` 见到尺寸对得上就用它，块数和
         #: 编号都不变；导入新图、从头匹配、打开工程都会清掉它。
@@ -1896,16 +1939,14 @@ class PicturePage(QWidget):
         top.addStretch(1)
         # 1.6.56（m25951 第 4 条）：切换「点图片时」的那句说明搬到右上角，跟模型配色页
         # 「还没有打开模型」同一个位置——放左下角时它把底部那一行顶高，用户还得往下看。
+        # m26286 第 3 条：这句话不折行。折行时标签的最小宽度只有一两个汉字，前面的
+        # stretch 会把剩下的全吃掉，字被挤成一列；给足自然宽度、右对齐，窗口够宽就
+        # 完整显示（1920 宽下工具条约 1010 px，这句话约 520 px，放得下）。
         self._mode_hint = QLabel("")
         self._mode_hint.setProperty("role", "hint")
         selectable_text(self._mode_hint)
-        # 整句话有两行那么长，右上角放不下：给它一个宽度上限并允许折行，右对齐，
-        # 这样它占的是右上角那块空地，而不是把工具栏挤出一截（m25951 第 4 条）。
-        self._mode_hint.setWordWrap(True)
-        # 只设上限不够：折行的标签最小宽度只有一两个汉字，前面的 stretch 会把剩下的
-        # 全吃掉，字就被挤成一列。给它一个下限，它才真的占住右上角那块地方。
-        self._mode_hint.setMinimumWidth(340)
-        self._mode_hint.setMaximumWidth(500)
+        self._mode_hint.setWordWrap(False)
+        self._mode_hint.setMinimumWidth(0)
         self._mode_hint.setAlignment(
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         )
@@ -2198,9 +2239,10 @@ class PicturePage(QWidget):
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([760, 320])
 
-        self._status = QLabel("")
+        self._status = _StatusLabel("")
         self._status.setProperty("role", "hint")
         self._status.setWordWrap(True)
+        self._status.owner = self
 
         # The progress bar sits at the end of the status line it belongs to
         # (m00940 第 2 条: 「在文本『正在匹配：…』的地方添加匹配进度条」).  It is
@@ -2222,18 +2264,22 @@ class PicturePage(QWidget):
         # 从这里读一份给帮助窗口和自动检查用。
         self._help = PAGE_HELP
 
-        status_row = QHBoxLayout()
+        self._status_bar = QWidget()
+        status_row = QHBoxLayout(self._status_bar)
         status_row.setContentsMargins(0, 0, 0, 0)
         status_row.setSpacing(10)
         status_row.addWidget(self._status, 1)
         status_row.addWidget(self._progress)
+        # 没有话要说的时候整行收起来（m26286 第 2 条）：原来它始终占着一行，
+        # 上下留白加起来就是用户说的「空着的那块」。
+        self._status_bar.setVisible(False)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
         layout.addLayout(top)
         layout.addWidget(splitter, 1)
-        layout.addLayout(status_row)
+        layout.addWidget(self._status_bar)
         layout.addLayout(bottom)
         # 1.6.53（m21616 第 8 条）：开机就按「设置」里的默认值摆好。
         self.apply_settings(load_settings())
@@ -2889,9 +2935,18 @@ class PicturePage(QWidget):
         self._busy_timer.stop()
         self._progress.setVisible(False)
         self._progress.setValue(0)
+        self._sync_status_bar()
 
     def _show_progress(self) -> None:
         self._progress.setVisible(True)
+        self._sync_status_bar()
+
+    def _sync_status_bar(self) -> None:
+        """状态行只在有话要说、或者进度条正显示的时候占地方（m26286 第 2 条）。"""
+        bar = getattr(self, "_status_bar", None)
+        if bar is None:
+            return
+        bar.setVisible(bool(self._status.text().strip()) or self._progress.isVisible())
 
     def _report_match(self, message: str, fraction: float) -> None:
         """One step of :func:`match_image`, drawn while the match is running.
@@ -4004,17 +4059,38 @@ class PicturePage(QWidget):
         """
         if result is None or self._mode != PICK_EDGE:
             return None
+        cache = getattr(self, "_blocks_cache", None)
+        fingerprint = self._blocks_fingerprint(result)
+        if cache is not None and cache[0] == fingerprint:
+            # 同一份划分：块表没变，直接用上一次那份（m26286 第 4 条）。
+            return cache[1]
         template = self._block_template
         if template is not None and np.shape(template) == np.shape(result.indices):
             # ``previous`` 传现在这一批块：某块在新分色里一格都不剩（全是「不打印」）时
             # 就留它本来那一种颜色，而不是从别人那里顺手取一个。
-            return revalue_blocks(template, result.indices, previous=self._blocks)
-        return label_blocks(
-            result.indices,
-            min_pixels=min_block_pixels(result.printed_pixels),
-            keep_colours=True,
-        )
+            blocks = revalue_blocks(template, result.indices, previous=self._blocks)
+        else:
+            blocks = label_blocks(
+                result.indices,
+                min_pixels=min_block_pixels(result.printed_pixels),
+                keep_colours=True,
+            )
+        self._blocks_cache = (fingerprint, blocks)
+        return blocks
 
+    def _blocks_fingerprint(self, result: MatchResult) -> tuple:
+        """块表的身份：同一份划分就认这一份缓存。
+
+        不能拿 ``result is`` 当身份：``_apply_edits`` 每次都重建一个 ``MatchResult``，
+        什么都没改也换了对象，于是每次切模式都重分一遍块（实测一次 350 ms，正是用户
+        说的停顿）。拿像素本身做指纹，看得见的划分没变就复用（m26286 第 4 条）。
+        """
+        return (
+            result.width,
+            result.height,
+            len(self._block_edits),
+            zlib.crc32(np.ascontiguousarray(result.indices).tobytes()),
+        )
     def _blocks_after(
         self, masks: Sequence[np.ndarray] | np.ndarray | None
     ) -> list[int]:
@@ -4141,7 +4217,26 @@ class PicturePage(QWidget):
         if switched and getattr(self, "_list", None) is not None:
             # 列表整个换了内容，旧的选中集（颜色编号 vs 块编号）不能带过去。
             self._list.clear_selection()
-            self._apply_edits()
+            # 切到「按色块边缘选择」时第一次要跑一遍全分辨率的连通域，这是那一下停顿的
+            # 来源（m26286 第 4 条）。已有缓存就不用等，也不必闪一下提示；真要重算就
+            # 先说一声、把光标换成漏斗，别让界面看着像卡死。
+            cache = getattr(self, "_blocks_cache", None)
+            slow = (
+                self._mode == PICK_EDGE
+                and self._result is not None
+                and (cache is None or cache[0] is not self._result)
+            )
+            if slow:
+                self._status.setText("正在重新分色块…")
+                QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+                QApplication.processEvents(
+                    QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents
+                )
+            try:
+                self._apply_edits()
+            finally:
+                if slow:
+                    QApplication.restoreOverrideCursor()
             # 1.6.56（m25951 第 4 条）：说明写到右上角那行，不再占用底部状态行。
             self._update_mode_hint()
 
@@ -4207,18 +4302,20 @@ class PicturePage(QWidget):
 
         原来它是往底部状态行里写的，切一次模式就把那一行顶起来、页面往下挤一格；
         挪到工具栏右端以后，底部只留真正的进度/结果文字。
+
+        m26286 第 3 条：不折行。整句「点图片时改成「按颜色选择」：点一下选中一种颜色，
+        多选可以攒成一组颜色」在 1680 宽下要 520 px，工具条已经被按钮占满，放不下就被
+        裁掉半句。模式名本来就在左边那个下拉框里写着，所以这里只留后半句的做法说明，
+        一句话放得下，也不再重复。
         """
         hint = getattr(self, "_mode_hint", None)
         if hint is None:
             return
         mode = self._mode
         hint.setText(
-            "点图片时改成「{0}」：{1}".format(
-                PICK_MODE_LABELS.get(mode, mode),
-                "点一下选中一整块，多选可以攒成一组色块。"
-                if mode == PICK_EDGE
-                else "点一下选中一种颜色，多选可以攒成一组颜色。",
-            )
+            "点一下选中一整块，多选可以攒成一组色块。"
+            if mode == PICK_EDGE
+            else "点一下选中一种颜色，多选可以攒成一组颜色。"
         )
 
     def _on_multi_toggled(self, on: bool) -> None:
