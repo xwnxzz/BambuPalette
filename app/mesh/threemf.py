@@ -111,6 +111,13 @@ THREEMF_APP_VERSION = f"{__version__}.0"
 #: is centred.  A larger plate simply leaves more room around it.
 DEFAULT_PLATE_MM = 256.0
 
+#: 导出 3MF 时写进 ``project_settings.config`` 的机器与喷嘴（m27359 第 2 条）。
+#: 模板原本是 A1 + 0.4，用户默认用 P1S + 0.2，打开时就不用再改一遍。
+DEFAULT_PRINTER_MODEL = "Bambu Lab P1S"
+DEFAULT_NOZZLE_MM = "0.2"
+DEFAULT_PRINT_PROFILE = f"0.20mm Standard @BBL P1S"
+DEFAULT_FILAMENT_PROFILE_SUFFIX = "@BBL P1S"
+
 #: Bambu Studio's per-triangle multi-material code, transcribed verbatim from
 #: ``CONST_FILAMENTS`` in ``src/libslic3r/Model.cpp`` (tag ``v02.08.02.61``,
 #: lines 57-60).  Index == the 1-based filament slot.
@@ -757,6 +764,20 @@ def _project_settings(
     settings = json.loads(_PROJECT_TEMPLATE_PATH.read_text(encoding="utf-8"))
     palette = [_as_slot(slot).color_hex.upper() for slot in slots]
     count = len(palette)
+    # 机器与喷嘴按默认写死（m27359 第 2 条）：模板是 A1 + 0.4，改成 P1S + 0.2，
+    # 连同三处跟着机器名走的 id 一起改，否则 Bambu Studio 会报「预设对不上」。
+    settings["printer_model"] = DEFAULT_PRINTER_MODEL
+    settings["printer_settings_id"] = f"{DEFAULT_PRINTER_MODEL} {DEFAULT_NOZZLE_MM} nozzle"
+    settings["printer_variant"] = DEFAULT_NOZZLE_MM
+    settings["nozzle_diameter"] = [DEFAULT_NOZZLE_MM] * max(1, count)
+    settings["print_settings_id"] = DEFAULT_PRINT_PROFILE
+    for key in ("filament_settings_id", "filament_preset_name"):
+        value = settings.get(key)
+        if isinstance(value, list) and value:
+            settings[key] = [
+                f"{str(item).split('@')[0].strip()} {DEFAULT_FILAMENT_PROFILE_SUFFIX}"
+                for item in value
+            ]
     settings["filament_colour"] = palette
     settings.update(_mixed_keys(palette, mixed or {}))
     for key in list(settings):

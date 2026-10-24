@@ -69,6 +69,10 @@ DEFAULT_SETTINGS: dict = {
     "model_background": "#B4C6D2",
     # 1.6.57（m26604 第 9 条）：导出 .blend 要让本机的 Blender 动手，路径可以手填。
     "model_blender_path": "",
+    # 1.6.60（m27359 第 3 条）：「实验性：没有颜色上限」。勾上以后两页匹配都不再按
+    # 「颜色数量」停手（默认 32），改用节目里能容纳的最大值 —— 板子颜色太多、
+    # 32 种明显不够用时才值得开，颜色一多，每个色块对应的像素就少。
+    "experimental_no_colour_limit": False,
     "shortcut_export_glb": "Ctrl+S",
     # 1.6.54（m22211 第 7 条）：每个页自己的快捷键。允许跨页重复（同一时刻只有一页
     # 在屏幕上），但同一个页里不许撞车 —— 撞了 settings_dialog 会拒绝保存。

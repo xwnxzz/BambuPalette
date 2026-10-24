@@ -153,6 +153,10 @@ class SettingsDialog(QDialog):
         self._model_flip = QCheckBox("旋转左右翻转（默认勾上）")
         self._model_flip.setChecked(bool(self._current.get("model_flip_rotate", True)))
 
+        # 1.6.60（m27359 第 3 条）：实验性开关。勾上以后两页都不再按「颜色数量」停手。
+        self._no_limit = QCheckBox("实验性：没有颜色上限")
+        self._no_limit.setChecked(bool(self._current.get("experimental_no_colour_limit", False)))
+
         # 三维视图底色：一个能点的色块 + 十六进制，两边同步（1.6.54，m22211 第 6 条）。
         self._background = str(self._current.get("model_background") or "#B4C6D2")
         self._background_button = QPushButton()
@@ -179,6 +183,12 @@ class SettingsDialog(QDialog):
                 ("颜色数量", self._model_colours, "打开模型时「颜色数量」的起始值。"),
                 ("耗材上限", self._model_spools, "0 表示不限。"),
                 ("", self._model_only, "只用你自己这些耗材的本色。"),
+                (
+                    "",
+                    self._no_limit,
+                    "实验性：勾上后两个页都不看「颜色数量」，能分出多少种颜色就分多少种。"
+                    "颜色一多，每种颜色分到的像素就少，打印出来更碎，先小图试。",
+                ),
                 (
                     "",
                     self._model_flip,
@@ -327,6 +337,7 @@ class SettingsDialog(QDialog):
         self._model_spools.setValue(int(DEFAULT_SETTINGS["model_spools"]))
         self._model_only.setChecked(bool(DEFAULT_SETTINGS["model_only_spools"]))
         self._model_flip.setChecked(bool(DEFAULT_SETTINGS["model_flip_rotate"]))
+        self._no_limit.setChecked(bool(DEFAULT_SETTINGS["experimental_no_colour_limit"]))
         self._background = str(DEFAULT_SETTINGS.get("model_background") or "#B4C6D2")
         self._background_edit.setText(self._background)
         self._paint_background_button()
@@ -347,6 +358,7 @@ class SettingsDialog(QDialog):
             "model_spools": int(self._model_spools.value()),
             "model_only_spools": bool(self._model_only.isChecked()),
             "model_flip_rotate": bool(self._model_flip.isChecked()),
+            "experimental_no_colour_limit": bool(self._no_limit.isChecked()),
             "model_background": self._background,
         }
         for _page, entries in self._page_shortcuts.items():

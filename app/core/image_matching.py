@@ -46,6 +46,9 @@ ProgressFn = Callable[[str, float], None]
 #: same pool is 0.010 ΔE00, for 1.35× the search time (m03703 第 1 条).
 _SHORTLIST = 4096
 
+#: 「实验性：没有颜色上限」时的硬上限（1.6.60，m27359 第 3 条）。量化预算本来就是
+#: ``min(256, max_colours)``，这里与它对齐，再大也没有意义。
+HARD_COLOUR_LIMIT = 256
 #: ``rows × colours`` below which the search skips the shortlist altogether and
 #: measures every row with CIEDE2000, so its answer *is* the global optimum.  The
 #: two-filament pool is ~60k rows and lands here; the four-million-row
@@ -295,6 +298,11 @@ class MatchSettings:
     #: regions, and never introduce a spool the budget cannot pay for.  0 means
     #: no limit.
     max_spools: int = 0
+    #: 实验性「没有颜色上限」（1.6.60，m27359 第 3 条）。3MF 的涂色码只编到 32 种
+    #: 耗材，所以默认把 ``max_colours`` 夹在 32；勾了这个开关就放开到 256，让量化
+    #: 按画面实际颜色收手 —— 代价是超过 32 种时导出 3MF 会拒绝（切片器装不下），
+    #: 界面上会给出提示，属于已知的实验边界。
+    no_colour_limit: bool = False
 
     def clamped(self) -> "MatchSettings":
         # Imported here rather than at module level: ``app.mesh.plate`` imports
@@ -303,7 +311,11 @@ class MatchSettings:
 
         return replace(
             self,
-            max_colours=max(2, min(MAX_PAINTED_FILAMENTS, int(self.max_colours))),
+            max_colours=max(
+                2,
+                min(HARD_COLOUR_LIMIT if self.no_colour_limit else MAX_PAINTED_FILAMENTS,
+                    int(self.max_colours)),
+            ),
             max_dimension=max(32, int(self.max_dimension)),
             alpha_threshold=max(0, min(255, int(self.alpha_threshold))),
             merge_delta_e=max(0.0, min(10.0, float(self.merge_delta_e))),

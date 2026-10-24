@@ -53,6 +53,7 @@ from ..core.image_matching import (
     build_palette,
     spool_usage,
 )
+from ..core.image_matching import HARD_COLOUR_LIMIT as NO_COLOUR_LIMIT
 from ..core.library import FilamentLibrary
 from ..core.mixes import MixCatalog
 from ..core.model_export import plate_from_model, write_glb
@@ -241,6 +242,9 @@ class ModelPage(QWidget):
         )
         self._only_spools.toggled.connect(self._on_only_spools)
         row.addWidget(self._only_spools)
+
+        #: 设置里的实验性开关（1.6.60，m27359 第 3 条）：不是控件，是旗标。
+        self._no_colour_limit = False
 
         self._filter_button = QPushButton("筛选耗材")
         self._filter_button.setToolTip("指定必须有哪几卷、不许用哪几卷")
@@ -499,11 +503,18 @@ class ModelPage(QWidget):
 
     def _settings(self) -> MatchSettings:
         return MatchSettings(
-            max_colours=int(self._colour_count.value()),
+            max_colours=self._colour_limit(),
             max_dimension=CHART_WIDTH,
             dither=False,
             max_spools=int(self._spool_cap.value()),
+            no_colour_limit=bool(self._no_colour_limit),
         ).clamped()
+
+    def _colour_limit(self) -> int:
+        """这一版匹配最多分几种颜色（1.6.60，m27359 第 3 条）。"""
+        if self._no_colour_limit:
+            return NO_COLOUR_LIMIT
+        return int(self._colour_count.value())
 
     # -- 筛选 -------------------------------------------------------------
     def _spool_name(self, filament_id: str) -> str:
@@ -745,6 +756,11 @@ class ModelPage(QWidget):
         flip = bool(values.get("model_flip_rotate", True))
         self._source_view.setFlipOrbit(flip)
         self._preview_view.setFlipOrbit(flip)
+        # 1.6.60（m27359 第 3 条）：实验性「没有颜色上限」——勾上就把「颜色数量」灰掉。
+        self._no_colour_limit = bool(
+            values.get("experimental_no_colour_limit", self._no_colour_limit)
+        )
+        self._colour_count.setEnabled(not self._no_colour_limit)
         sequence = str(values.get("shortcut_export_glb") or "Ctrl+S")
         # QShortcut 没有 setKeySequence，换键要重新 setKey（Qt 6 的写法）。
         self._save_shortcut.setKey(QKeySequence(sequence))

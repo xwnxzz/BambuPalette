@@ -87,6 +87,7 @@ from ..core.image_matching import (
     rematch_options,
     spool_usage,
 )
+from ..core.image_matching import HARD_COLOUR_LIMIT as NO_COLOUR_LIMIT
 from ..core.library import FilamentLibrary
 from ..core.mixes import DEFAULT_ENGINE, MixCatalog
 from ..core.settings import (
@@ -2014,6 +2015,10 @@ class PicturePage(QWidget):
         )
         self._only_spools.toggled.connect(self._on_only_spools)
 
+        #: 设置里的实验性开关（1.6.60，m27359 第 3 条）。它不是一个控件，是
+        #: 「这一版按不按颜色数量停手」的旗标，由 apply_settings 灌进来。
+        self._no_colour_limit = False
+
         top = QHBoxLayout()
         top.setSpacing(8)
         top.addWidget(self._import_button)
@@ -2396,6 +2401,12 @@ class PicturePage(QWidget):
             self._only_spools.setChecked(only)
             self._only_spools.blockSignals(False)
             self._on_only_spools(only)
+        # 1.6.60（m27359 第 3 条）：实验性「没有颜色上限」——勾上就把「颜色数量」灰掉，
+        # 它这一版不参与计算（值还留着，取消勾选就恢复）。
+        self._no_colour_limit = bool(
+            values.get("experimental_no_colour_limit", self._no_colour_limit)
+        )
+        self._colour_count.setEnabled(not self._no_colour_limit)
         # 1.6.54（m22211 第 7 条）：这一页自己的四个快捷键。
         for editor, key, fallback in (
             (self._import_shortcut, "shortcut_picture_import", "Ctrl+O"),
@@ -2938,11 +2949,22 @@ class PicturePage(QWidget):
 
     def _settings(self) -> MatchSettings:
         return MatchSettings(
-            max_colours=int(self._colour_count.value()),
+            max_colours=self._colour_limit(),
             max_dimension=int(self._span),
             dither=bool(self._dither.isChecked()),
             max_spools=int(self._spool_cap.value()),
+            no_colour_limit=bool(self._no_colour_limit),
         ).clamped()
+
+    def _colour_limit(self) -> int:
+        """这一版匹配最多分几种颜色（1.6.60，m27359 第 3 条）。
+
+        勾了「实验性：没有颜色上限」就交一个足够大的数，让量化按实际颜色数收手；
+        「颜色数量」那个框留着显示原来的值，只是灰掉不参与。
+        """
+        if self._no_colour_limit:
+            return NO_COLOUR_LIMIT
+        return int(self._colour_count.value())
 
     def _candidate_palette(self) -> list[PaletteEntry]:
         """The full 全部颜色 list, built once per library.
@@ -4846,6 +4868,20 @@ class PicturePage(QWidget):
         ]
         original = self._live_map[index]
         self._push()
+        if original < 0:
+            # 1.6.60（m27359 第 1 条）：这一行是「色块级编辑带进来的颜色」，基准调色板里
+            # 没有它的位子（`_live_map` 给 -1）。老代码把 `_replaced[-1] = 新颜色` 写进一本
+            # 死账 —— 界面上什么都不换，用户看着就是「点了没反应」／「凭空多出一条 0%」。
+            # 现在改成落一条色块级着色：这一行的像素直接刷成新颜色。
+            mask = np.asarray(self._result.indices) == index
+            self._block_edits.append(BlockPaint(mask=mask, entry=chosen, labels=()))
+            self._apply_edits()
+            self._mark_plans_stale()
+            self._status.setText(
+                f"已把整行 {chosen.color_hex} 换掉，"
+                f"{int(mask.sum())} 个像素改用它打印。Ctrl+Z 可以撤销。"
+            )
+            return
         for slot in originals or [original]:
             self._replaced[slot] = chosen
         self._apply_edits(keep=original)

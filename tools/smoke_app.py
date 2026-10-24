@@ -4193,6 +4193,9 @@ def main() -> int:
             app.processEvents()
             # 1.6.56：0 像素的颜色不再列出来，第一行不一定是调色板第 0 位 —— 按第一行
             # 真正顶着的那一位来选，判据才对得上「选中的那一行」。
+            # 1.6.60（m27359 第 1 条）：origin < 0 的行是色块级编辑带进来的颜色，换它走
+            # 「按像素掩码重画」那条路、不记 `_replaced`。两路都算「换成了」，所以这里只
+            # 要求「有落地」；下面看的是 `_on_rematch_blocks()` 之后还剩下什么。
             first_value = int(page._list._list.item(0).data(Qt.ItemDataRole.UserRole))
             page._list.select([first_value])
             wanted = next(
@@ -4211,7 +4214,11 @@ def main() -> int:
                 app.processEvents()
             finally:
                 _picture_page.ColourPickerDialog = real_picker
-            check(bool(page._replaced), "行级的「更换颜色」记下了（下面要看它被清掉）")
+            check(
+                bool(page._replaced) or len(page._block_edits) > len(before_edits),
+                "「更换颜色」落地了（行级那本账，或色块级那条掩码）",
+            )
+            after_replace = [edit.mask.copy() for edit in page._block_edits]
             page._on_rematch_blocks()
             app.processEvents()
             page._set_pick_mode(_picture_page.PICK_EDGE, save=False)
@@ -4228,10 +4235,10 @@ def main() -> int:
                 f"行级的「更换颜色」清掉了，got {len(page._replaced)} 条",
             )
             check(
-                len(page._block_edits) == len(before_edits)
+                len(page._block_edits) == len(after_replace)
                 and all(
                     _np.array_equal(edit.mask, mask)
-                    for edit, mask in zip(page._block_edits, before_edits)
+                    for edit, mask in zip(page._block_edits, after_replace)
                 ),
                 "块级改动（按像素掩码）原样留着",
             )
