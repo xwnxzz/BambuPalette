@@ -17,6 +17,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
+import tempfile
 import time
 import traceback
 import zlib
@@ -97,6 +98,8 @@ from ..core.image_matching import (
 from ..core.image_matching import HARD_COLOUR_LIMIT as NO_COLOUR_LIMIT  # noqa: F401
 from ..core.library import FilamentLibrary
 from ..core.mixes import DEFAULT_ENGINE, MixCatalog
+from ..core.vectorize import VectorizeUnavailable, image_to_svg
+from .svg_export import SvgExportDialog
 from ..core.settings import (
     DEFAULT_PICK_MODE,
     PICK_COLOUR,
@@ -2042,6 +2045,12 @@ class PicturePage(QWidget):
         self._export_original_button = QPushButton("导出原图")
         self._export_original_button.clicked.connect(self._on_export_original)
 
+        # 「导出 SVG」（1.6.64，m29374）：把这张图描成矢量。用户要求按钮排在「点图片时：
+        # 按颜色选择」后面，所以它加在下拉框之后、弹簧之前 —— 那一排左边全是文件动作，
+        # 最右这件也是文件动作，读起来是一条线。
+        self._export_svg_button = QPushButton("导出 SVG")
+        self._export_svg_button.clicked.connect(self._on_export_svg)
+
         self._colour_count = QSpinBox()
         self._colour_count.setRange(2, MAX_PAINTED_FILAMENTS)
         self._colour_count.setValue(DEFAULT_MAX_COLOURS)
@@ -2088,6 +2097,7 @@ class PicturePage(QWidget):
         top.addWidget(self._rematch_blocks_button)
         top.addWidget(QLabel("点图片时:"))
         top.addWidget(self._pick_combo)
+        top.addWidget(self._export_svg_button)
         top.addStretch(1)
         # 1.6.56（m25951 第 4 条）把「点图片时改成…」那句搬到右上角；1.6.57（m26604
         # 第 2 条）用户要求把那句话删掉 —— 下拉框里写着现在是哪种模式，做法本身在
@@ -2758,6 +2768,67 @@ class PicturePage(QWidget):
         self._status.setText(
             f"已导出原图 {target.name}（{target.parent}）：这张图里已经带着删除和合并的结果，"
             "删掉的地方是透明的。"
+        )
+
+    # -- 导出 SVG：把位图描成矢量 ------------------------------------------
+    def _on_export_svg(self) -> None:
+        """把这张图描成 SVG（1.6.64，m29374）。
+
+        描的是 ``self._image`` —— 跟「导出原图」同一张，也就是**已经带着删除/合并结果**
+        的那张。用户删掉的色块在矢量里就该是空的，不能绕回去描那张没改过的原图。
+        """
+        if self._image is None:
+            self._status.setText("先导入一张图片，再导出 SVG。")
+            return
+
+        dialog = SvgExportDialog(self, name=self._image_name)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        options = dialog.values()
+
+        suggested = f"{self._image_name}-矢量.svg"
+        start = str(
+            (self._project_path.with_name(suggested))
+            if self._project_path
+            else (paths.exports_dir() / suggested)
+        )
+        name, _ = QFileDialog.getSaveFileName(self, "导出 SVG", start, "SVG 矢量图 (*.svg);;所有文件 (*)")
+        if not name:
+            return
+        target = Path(name)
+        if target.suffix.lower() != ".svg":
+            target = target.with_suffix(".svg")
+
+        # 描摹库吃的是文件路径，所以先把手上这张 PIL 图落到临时文件；用完就删。
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        self._status.setText("正在把这张图描成矢量…")
+        QApplication.processEvents()
+        try:
+            with tempfile.TemporaryDirectory(prefix="fcs-svg-") as folder:
+                staged = Path(folder) / "source.png"
+                self._image.save(staged, format="PNG")
+                result = image_to_svg(
+                    staged,
+                    target,
+                    colours=int(options["colours"]),
+                    speckle=int(options["speckle"]),
+                    smooth=float(options["smooth"]),
+                )
+        except VectorizeUnavailable as error:
+            QApplication.restoreOverrideCursor()
+            self._status.setText("导出 SVG 不可用：这台机器没装 vtracer。")
+            QMessageBox.information(self, "导出 SVG 不可用", str(error))
+            return
+        except Exception as error:  # pragma: no cover - the dialog is interactive
+            QApplication.restoreOverrideCursor()
+            self._status.setText("导出 SVG 失败。")
+            QMessageBox.warning(self, "导出 SVG 失败", str(error))
+            return
+        QApplication.restoreOverrideCursor()
+
+        self._status.setText(
+            f"已导出矢量 {target.name}（{target.parent}）：{result.paths} 条路径、"
+            f"{result.colours} 种颜色、{result.bytes // 1024} KB。放大不糊，能进 Blender 继续改。"
         )
 
     # -- 工程：存下来，下次接着改 -----------------------------------------

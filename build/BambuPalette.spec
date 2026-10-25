@@ -20,6 +20,7 @@ from PyInstaller.utils.win32.versioninfo import (
 )
 
 from pathlib import Path
+import importlib.util
 import re
 
 ROOT = Path(SPECPATH).resolve().parent
@@ -144,7 +145,7 @@ a = Analysis(
         # lives in _internal/app/mesh/, so it has to be collected the same way.
         (str(ROOT / "app" / "mesh" / "orca_project_template.json"), "app/mesh"),
     ],
-    hiddenimports=["numpy"],
+    hiddenimports=["numpy", "vtracer"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -152,6 +153,16 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+
+# 1.6.64（m29374）：「导出 SVG」依赖 vtracer（Rust 扩展 + visioncortex）。
+# 它不在标准 hook 里，二进制要自己收，否则冻结版点按钮只会报「描摹不可用」。
+_vtracer = importlib.util.find_spec("vtracer")
+if _vtracer is not None and _vtracer.origin:
+    _vtracer_root = Path(_vtracer.origin).parent
+    a.binaries += [
+        (str(path.relative_to(_vtracer_root.parent)), str(path), "BINARY")
+        for path in _vtracer_root.rglob("*.pyd")
+    ]
 
 pyz = PYZ(a.pure)
 

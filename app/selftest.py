@@ -3711,6 +3711,41 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     check({tuple(item.colour) for item in back.primitives} == {(0xB3, 0x4F, 0x50), (0x2F, 0xA8, 0x4F)},
           "GLB 往返后每块材质是配到的颜色")
 
+    # 1.6.64（m29374）：「导出 SVG」依赖的 vtracer 真的能跑（冻结版最常在这里翻车）。
+    from PIL import Image as _PIL_Image, ImageDraw as _PIL_ImageDraw  # noqa: PLC0415
+    from tempfile import TemporaryDirectory as _TemporaryDirectory  # noqa: PLC0415
+
+    from .core.vectorize import (  # noqa: PLC0415
+        DEFAULT_COLOURS,
+        available as _vector_available,
+        image_to_svg,
+        quantize,
+    )
+
+    check(_vector_available(), "图片转矢量可用（vtracer 已装）")
+    with _TemporaryDirectory() as trace_dir:
+        trace_root = Path(trace_dir)
+        icon = trace_root / "trace-icon.png"
+        canvas = _PIL_Image.new("RGB", (120, 120), (0, 190, 110))
+        pen = _PIL_ImageDraw.Draw(canvas)
+        pen.ellipse((20, 24, 100, 104), fill=(248, 248, 248))
+        pen.ellipse((52, 58, 62, 68), fill=(12, 12, 12))
+        canvas.save(icon)
+
+        reduced = quantize(icon, 6)
+        colours_in = {rgb for _count, rgb in _PIL_Image.open(reduced).convert("RGB").getcolors(1 << 24)}
+        check(len(colours_in) <= 6, f"量化后颜色不超过 6 种（实际 {len(colours_in)}）")
+        check(
+            min(0.299 * r + 0.587 * g + 0.114 * b for r, g, b in colours_in) < 90,
+            "量化后暗色还在（眼睛没被吃掉）",
+        )
+
+        traced = image_to_svg(icon, trace_root / "trace-icon.svg", colours=6)
+        check(traced.paths > 0, f"描出来有路径（{traced.paths} 条）")
+        check(traced.bytes > 200, "写出的 SVG 不是空文件")
+        check((trace_root / "trace-icon.svg").is_file(), "SVG 真的写到磁盘上了")
+        check(DEFAULT_COLOURS >= 8, f"默认颜色数量是 {DEFAULT_COLOURS}")
+
     # Render the real window once, so a broken Qt platform plugin or a missing
     # font shows up here rather than in front of the user.
     shot = None

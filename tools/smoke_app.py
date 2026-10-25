@@ -4744,6 +4744,47 @@ def main() -> int:
 
     model_page.close()
 
+    # -- 1.6.64（m29374）：图像转换页的「导出 SVG」 ---------------------------
+    # 按钮要排在「点图片时」那个下拉框后面（用户点名要的位置），并且真的能描出矢量。
+    if True:
+        picture = window._picture_page
+        check(picture._export_svg_button.text() == "导出 SVG", "图像转换页有「导出 SVG」按钮")
+        combo_x = picture._pick_combo.mapTo(picture, picture._pick_combo.rect().topLeft()).x()
+        button_x = picture._export_svg_button.mapTo(
+            picture, picture._export_svg_button.rect().topLeft()
+        ).x()
+        check(button_x > combo_x, f"「导出 SVG」在下拉框右边（{combo_x} → {button_x}）")
+        check(picture._export_svg_button.isEnabled(), "有图时「导出 SVG」可以点")
+
+        from app.core.vectorize import DEFAULT_COLOURS, image_to_svg
+        from app.ui.svg_export import SvgExportDialog
+
+        dialog = SvgExportDialog(None, name="probe")
+        values = dialog.values()
+        check(
+            values["colours"] == DEFAULT_COLOURS,
+            f"参数框默认 {DEFAULT_COLOURS} 色（现在是 {values['colours']}）",
+        )
+        check(
+            {"colours", "speckle", "smooth"} == set(values),
+            "参数框给的就是颜色数量 / 去碎块 / 曲线简化三项",
+        )
+        dialog.deleteLater()
+
+        with _TemporaryDirectory() as folder:
+            icon = _Path(folder) / "trace-icon.png"
+            _image_lib = __import__("PIL.Image", fromlist=["Image"])
+            canvas = _image_lib.new("RGB", (96, 96), (0, 190, 110))
+            pen = __import__("PIL.ImageDraw", fromlist=["ImageDraw"]).Draw(canvas)
+            pen.ellipse((16, 20, 80, 84), fill=(248, 248, 248))
+            pen.ellipse((40, 44, 48, 52), fill=(15, 15, 15))
+            canvas.save(icon)
+            traced = image_to_svg(icon, _Path(folder) / "trace-icon.svg", colours=6)
+            check(traced.paths > 0, f"描出来有路径（{traced.paths} 条）")
+            check(traced.colours <= 6, f"颜色不超过 6 种（实际 {traced.colours}）")
+            check((_Path(folder) / "trace-icon.svg").stat().st_size > 200, "写出的 SVG 不是空文件")
+            check(not list(_Path(folder).glob("*q6.png")), "量化用的临时 PNG 收干净了")
+
     window.close()
 
     print(f"checks: {CHECKS}")
