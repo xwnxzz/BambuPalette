@@ -314,18 +314,13 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(2, 0)
         splitter.setSizes([288, 612, 440])
 
-        blurb = QLabel(
-            "输入你自己的耗材颜色，程序自动算出所有两两混色的 81 个配比；"
-            "点击任意一个混色，就知道它由哪两种耗材丝、按什么比例混成，方便直接在 Bambu Studio 里配置。"
-        )
-        blurb.setProperty("role", "hint")
-        blurb.setWordWrap(True)
-
+        # 1.6.63（m28848 第 1 条）：页首那句「输入你自己的耗材颜色，程序自动算出所有两两
+        # 混色的 81 个配比……」撤掉 —— 它讲的正是界面本身已经摆明的三件事（左边是你的
+        # 耗材、右边是全部颜色、点一个就看配方），留着只是把工具栏往下挤一行。
         mix_page = QWidget()
         mix_layout = QVBoxLayout(mix_page)
         mix_layout.setContentsMargins(0, 0, 0, 0)
         mix_layout.setSpacing(10)
-        mix_layout.addWidget(blurb)
         mix_layout.addLayout(controls)
         mix_layout.addLayout(target_row)
         mix_layout.addWidget(splitter, 1)
@@ -1666,7 +1661,7 @@ class MainWindow(QMainWindow):
         页面只接值，不下命令（`apply_settings` 里写清了）。
         """
         dialog = SettingsDialog(settings.load_settings(), self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        if dialog.exec() != dialog.DialogCode.Accepted:
             return
         values = dialog.values()
         try:

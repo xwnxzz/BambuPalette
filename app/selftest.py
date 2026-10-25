@@ -3613,6 +3613,47 @@ def run_selftest(*, report_path: Path | None = None) -> int:
     check(settings_dialog.values()["model_colours"] == 32, "「恢复默认」把颜色数量改回 32")
     settings_dialog.deleteLater()
 
+    # 1.6.63（m28848 第 2 条）：「设置」里点保存这件事本身要能跑通 —— 之前 `_on_settings`
+    # 引用了一个没导入的 `QDialog`，点保存就抛 NameError，所有的设置（包括两个实验开关）
+    # 都存不住、也不生效，而界面上什么都不说。这条用一个假对话框把整条保存路径走一遍。
+    from .ui import main_window as _main_window_api
+
+    class _StubDialog:
+        DialogCode = type("Code", (), {"Accepted": 1})
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def exec(self) -> int:
+            return 1
+
+        def values(self) -> dict:
+            out = dict(_settings_api.DEFAULT_SETTINGS)
+            out["model_spools"] = 3
+            out["picture_no_colour_limit"] = True
+            return out
+
+    real_dialog = _main_window_api.SettingsDialog
+    saved_before = dict(_settings_api.load_settings())  # 自检不许改用户的真实偏好
+    _main_window_api.SettingsDialog = _StubDialog
+    try:
+        window._on_settings()
+    finally:
+        _main_window_api.SettingsDialog = real_dialog
+    stored = _settings_api.load_settings()
+    check(
+        stored["model_spools"] == 3 and stored["picture_no_colour_limit"] is True,
+        f"「设置」的保存路径走得通：model_spools={stored['model_spools']} "
+        f"picture_no_colour_limit={stored['picture_no_colour_limit']}",
+    )
+    check(
+        window._picture_page._colour_count.isEnabled() is False,
+        "勾上「没有颜色上限」后图像转换页的颜色数量框灰掉（说明真的生效了）",
+    )
+    # 原样放回去，下面几段检查还要接着用这份偏好
+    _settings_api.save_settings(saved_before)
+    window._picture_page.apply_settings(saved_before)
+
     # 把默认参数下发到页面上：不该因此触发一次重算（1.6.53 里 apply_settings 用
     # blockSignals 掐掉 valueChanged），所以颜色数量会变、方案数不会变。
     before = len(model_page._plans)
