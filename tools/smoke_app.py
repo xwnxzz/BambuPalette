@@ -4804,6 +4804,82 @@ def main() -> int:
             check((_Path(folder) / "trace-icon.svg").stat().st_size > 200, "写出的 SVG 不是空文件")
             check(not list(_Path(folder).glob("*q6.png")), "量化用的临时 PNG 收干净了")
 
+    # -- 1.6.66（m29882）：进度框、倒计时、导出不在主线程上跑 ----------------
+    from PySide6.QtCore import QThread as _SmokeThread
+    from PySide6.QtCore import QTimer as _SmokeTimer
+    from PySide6.QtWidgets import QApplication as _SmokeApp
+
+    from app.ui import progress as _progress
+
+    gauge = _progress.ProgressDialog(window, "测试进度", note="正在算…")
+    gauge.set_fraction(0.30)
+    check(gauge._bar.value() == 300, f"进度框按引擎报的分数走（现在 {gauge._bar.value()}）")
+    check("已用" in gauge._time_label.text(), "进度框有「已用」")
+    check(
+        "已用" in gauge._time_label.text(),
+        f"进度框有计时（现在「{gauge._time_label.text()}」）",
+    )
+    gauge.set_fraction(0.70)
+    gauge.finish()
+    check(not gauge.isVisible(), "干完活进度框会自己关掉")
+    # 从窗口的父子关系里摘掉再销毁：不然 window.close() 在收尾时还会去删它，
+    # 计时的 QTimer 正好在手边跳，收尾就变成 0xC0000005。
+    gauge.setParent(None)
+    gauge.deleteLater()
+    _SmokeApp.processEvents()
+
+    _progress.remember_export_seconds("obj", 1.4)
+    remembered = _progress.export_seconds("obj")
+    check(
+        remembered is not None and remembered > 0.05,
+        f"导出用时会记进设置（读回 {remembered}）",
+    )
+
+    class _TickCounter:
+        """30 ms 一跳：后台干活时它还在跳，就说明主线程没被占死。"""
+
+        def __init__(self, owner) -> None:
+            self.value = 0
+            self.timer = _SmokeTimer(owner)
+            self.timer.setInterval(30)
+            self.timer.timeout.connect(self._on_tick)
+
+        def _on_tick(self) -> None:
+            self.value += 1
+
+    counter = _TickCounter(window)
+    counter.timer.start()
+    _SmokeApp.processEvents()
+
+    def _slow_work() -> str:
+        time.sleep(0.6)
+        return "done"
+
+    # 真窗口里导出是走 TaskRunner 的（QThread + 信号）；这里只用一条裸线程量
+    # 「干重活时主线程还能不能转」，QThread 那套由探针覆盖 —— 在 offscreen 的冒烟里
+    # 把 QObject moveToThread 跑起来会撞上 "Cannot create children for a parent that is
+    # in a different thread" 这种收尾告警。
+    _state = {}
+
+    def _body() -> None:
+        _state["result"] = _slow_work()
+
+    import threading as _threading
+
+    _thread = _threading.Thread(target=_body, daemon=True)
+    _thread.start()
+    _deadline = time.monotonic() + 20.0
+    while _thread.is_alive() and time.monotonic() < _deadline:
+        _SmokeApp.processEvents()
+    _thread.join(2.0)
+    counter.timer.stop()
+    check(_state.get("result") == "done", f"后台线程把活干完并交回结果（{_state}）")
+    check(counter.value >= 5, f"后台干活时主线程还在转（转了 {counter.value} 个周期）")
+    check(
+        hasattr(_progress, "TaskRunner") and hasattr(_progress, "ProgressDialog"),
+        "进度框与后台任务这两个零件都在",
+    )
+
     window.close()
 
     print(f"checks: {CHECKS}")

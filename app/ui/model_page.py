@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -67,6 +68,7 @@ from ..core.blender_bridge import (
 from ..core.settings import load_settings, save_settings
 from ..mesh.objfile import write_obj
 from ..mesh.threemf import slots_from_palette, write_3mf
+from .progress import export_seconds, remember_export_seconds, run_task
 from .colour_picker import ColourPickerDialog, entry_recipe_text
 from .model_view import DEFAULT_BACKGROUND, ModelView
 from .plan_filter import SpoolFilterDialog
@@ -1009,16 +1011,14 @@ class ModelPage(QWidget):
         return plate, entries
 
     def _on_export_plate(self, kind: str) -> None:
+        """生成 3MF / OBJ（1.6.66 起在后台线程里跑，m29882 第 3 条）。
+
+        摊成打印板（`plate_from_model`）对十几万三角面的模型要好几秒，写文件又要一两秒；
+        整段压在主线程里就是「未响应」。现在只把「选在哪存」放在主线程，剩下的交给
+        :class:`TaskRunner`。
+        """
         if self._model is None or self._match is None:
             return
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            plate, entries = self._plate_payload()
-        except Exception as error:
-            QApplication.restoreOverrideCursor()
-            QMessageBox.warning(self, "无法生成模型", str(error))
-            return
-        QApplication.restoreOverrideCursor()
         suffix = ".3mf" if kind == "3mf" else ".obj"
         label = "3MF 模型" if kind == "3mf" else "OBJ 模型"
         suggested = f"{self._model.name}_{datetime.now():%Y%m%d-%H%M%S}{suffix}"
@@ -1030,25 +1030,38 @@ class ModelPage(QWidget):
         if not name:
             return
         target = Path(name)
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        self._say(f"正在写入 {target.name}…")
-        QApplication.processEvents()
-        try:
+        model_name = self._model.name
+        library = self._library
+
+        def work(report):
+            report(0.10, "正在摊成打印板…")
+            plate, entries = self._plate_payload()
+            report(0.70, f"正在写入 {target.name}…")
             if kind == "3mf":
                 written = write_3mf(
                     plate,
                     target,
-                    object_name=self._model.name,
-                    filaments=slots_from_palette(entries, self._library),
+                    object_name=model_name,
+                    filaments=slots_from_palette(entries, library),
                 )
             else:
                 written = write_obj(plate, target)
-        except Exception as error:
-            QApplication.restoreOverrideCursor()
-            QMessageBox.warning(self, "保存失败", str(error))
-            self._say(f"写不进 {target.name}：{error}")
+            return plate, written
+
+        self._export_started = time.monotonic()
+        outcome, failure = run_task(
+            self,
+            f"导出{label}",
+            work,
+            note="正在摊成打印板…",
+            expected_seconds=self._export_seconds(kind),
+        )
+        if failure is not None:
+            QMessageBox.warning(self, "保存失败", failure)
+            self._say(f"导出失败：{failure}")
             return
-        QApplication.restoreOverrideCursor()
+        plate, written = outcome
+        self._note_export_seconds(kind)
         stats = plate.stats()
         self._say(
             f"已生成 {written.name}：{stats['width_mm']} × {stats['depth_mm']} mm，"
@@ -1077,28 +1090,39 @@ class ModelPage(QWidget):
         target = Path(name)
         # 先把手头这套配色写成 OBJ + MTL：Blender 那一步就是把它导进去。
         staging = target.with_suffix(".obj")
-        try:
-            plate, _entries = self._plate_payload()
-            write_obj(plate, staging)
-        except Exception as error:  # noqa: BLE001 - 报给用户看
-            QMessageBox.warning(self, "导出失败", str(error))
-            self._say(f"写不进 {staging.name}：{error}")
-            return
         blender = find_blender(load_settings().get("model_blender_path"))
+
+        def work(report):
+            report(0.15, "正在摊成打印板…")
+            plate, _entries = self._plate_payload()
+            report(0.45, f"正在写 {staging.name}…")
+            write_obj(plate, staging)
+            if blender is None:
+                report(0.80, "正在写 Blender 脚本…")
+                return write_blend_script(staging, target, note="（本机没找到 Blender）")
+            report(0.80, "正在让 Blender 写 .blend…")
+            return write_blend(staging, target, blender=blender)
+
+        self._export_started = time.monotonic()
+        outcome, failure = run_task(
+            self,
+            "导出 Blender",
+            work,
+            note="正在准备模型…",
+            expected_seconds=export_seconds("blend"),
+        )
+        if failure is not None:
+            QMessageBox.warning(self, "导出失败", failure)
+            self._say(f"写不进 {target.name}：{failure}")
+            return
+        written = outcome
+        remember_export_seconds("blend", time.monotonic() - self._export_started)
         if blender is None:
-            script = write_blend_script(staging, target, note="（本机没找到 Blender）")
             QMessageBox.information(self, "没有找到 Blender", describe_missing_blender())
-            self._say(f"没找到 Blender；已写出脚本 {script.name}，在旁边那个 OBJ 上跑一下就是 .blend。")
+            self._say(
+                f"没找到 Blender；已写出脚本 {written.name}，在旁边那个 OBJ 上跑一下就是 .blend。"
+            )
             return
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            written = write_blend(staging, target, blender=blender)
-        except Exception as error:  # noqa: BLE001 - 报给用户看
-            QApplication.restoreOverrideCursor()
-            QMessageBox.warning(self, "Blender 导出失败", str(error))
-            self._say(f"Blender 没能写出 {target.name}：{error}")
-            return
-        QApplication.restoreOverrideCursor()
         self._say(f"已导出 {written.name}（用 {blender.name} 写的），OBJ 与 MTL 也留在旁边。")
 
     def _on_export_glb(self) -> None:
@@ -1114,15 +1138,27 @@ class ModelPage(QWidget):
         if not name:
             return
         colours = self._preview_colours()
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            written = write_glb(self._model, colours, name, extras=self._saved_extras())
-        except Exception as error:
-            QApplication.restoreOverrideCursor()
-            QMessageBox.warning(self, "保存失败", str(error))
-            self._say(f"写不进 {name}：{error}")
+        extras = self._saved_extras()
+        model = self._model
+
+        def work(report):
+            report(0.20, "正在写 GLB…")
+            return write_glb(model, colours, name, extras=extras)
+
+        self._export_started = time.monotonic()
+        outcome, failure = run_task(
+            self,
+            "导出 GLB",
+            work,
+            note="正在写 GLB…",
+            expected_seconds=export_seconds("glb"),
+        )
+        if failure is not None:
+            QMessageBox.warning(self, "保存失败", failure)
+            self._say(f"写不进 {name}：{failure}")
             return
-        QApplication.restoreOverrideCursor()
+        written = outcome
+        remember_export_seconds("glb", time.monotonic() - self._export_started)
         self._say(
             f"已导出 {written.name}：{len(colours)} 块材质换成了配色结果，"
             "方案和换过的颜色也一并记在文件里，再导入回来就接着改。"

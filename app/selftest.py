@@ -3761,6 +3761,32 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         )
         check(COLOUR_RANGE[1] >= 256, f"颜色数量上限放宽到 {COLOUR_RANGE[1]}")
 
+    # --- 1.6.66（m29882）：导出在后台线程上跑，主线程还能转 ------------------
+    from .ui import progress as _progress_api
+
+    _seen = {}
+
+    def _threaded_work(report) -> str:
+        import threading as _threading
+
+        _seen["worker_thread"] = _threading.get_ident()
+        report(0.25, "自检：一号阶段")
+        report(0.75, "自检：二号阶段")
+        return "ok"
+
+    _seen["main_thread"] = __import__("threading").get_ident()
+    _outcome, _failure = _progress_api.run_task(window, "自检导出", _threaded_work)
+    check(_failure is None, f"后台任务跑完没有报错（{_failure}）")
+    check(_outcome == "ok", f"后台任务把结果交回来了（{_outcome}）")
+    check(
+        _seen.get("worker_thread") not in (None, _seen["main_thread"]),
+        "导出真的不在主线程上跑（干活的是另一条线程）",
+    )
+    check(
+        _progress_api.export_seconds("3mf") is None or _progress_api.export_seconds("3mf") > 0,
+        "导出用时的记忆表里只有正数",
+    )
+
     # Render the real window once, so a broken Qt platform plugin or a missing
     # font shows up here rather than in front of the user.
     shot = None

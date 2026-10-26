@@ -99,6 +99,7 @@ from ..core.image_matching import HARD_COLOUR_LIMIT as NO_COLOUR_LIMIT  # noqa: 
 from ..core.library import FilamentLibrary
 from ..core.mixes import DEFAULT_ENGINE, MixCatalog
 from ..core.vectorize import VectorizeUnavailable, image_to_svg
+from .progress import ProgressDialog, export_seconds, remember_export_seconds, run_task
 from .svg_export import SvgExportDialog
 from ..core.settings import (
     DEFAULT_PICK_MODE,
@@ -2609,7 +2610,23 @@ class PicturePage(QWidget):
                 chosen = _ask_vector_size(self, path, declared)
                 if chosen is None:
                     return  # 用户取消：这张图不导入，原来那张原图一个像素都不动
-                image = _load_vector(path, 1, size=chosen)
+                # 渲 8400×14400 那种尺寸要好几秒，而这一个调用没法分段
+                # （QSvgRenderer 一次画完）。所以先摆一个「在干什么」的框再渲，
+                # 否则那几秒里界面什么都不动 —— 1.6.66（m29882 第 1 条）。
+                dialog = ProgressDialog(
+                    self,
+                    "正在读入矢量图",
+                    note=f"正在渲成 {chosen[0]} × {chosen[1]} 像素…",
+                )
+                dialog.set_busy()
+                dialog.show()
+                QApplication.processEvents()
+                try:
+                    image = _load_vector(path, 1, size=chosen)
+                finally:
+                    dialog.finish()
+                    dialog.deleteLater()
+                    QApplication.processEvents()
             else:
                 image = Image.open(source)
             self._image_name = path.stem or "混色底板"
@@ -3146,11 +3163,26 @@ class PicturePage(QWidget):
         return self._triple_palette
 
     def _begin_match(self) -> None:
-        """Arm the progress bar; it appears only if the match is slow enough."""
+        """开一个带倒计时的进度框（1.6.66，m29882 第 1、2、4 条）。
+
+        以前只有状态行里那根细条：引擎只在相位入口报一次（量化 0.30、找色 0.35），
+        大图上这两段各要好几秒，条子就停在原地不动，看起来像卡死。现在换成独立的
+        进度框 —— 有「在做什么」、有条子、有「已用 / 预计还要」。
+        """
         self._progress.setValue(0)
         self._progress_goal = 0
         self._busy_timer.start()
         self._set_controls_enabled(False)
+        # 复用同一个框，不每次匹配都造一个新的：冒烟里一次运行会匹配上百次，逐个
+        # 新建 + deleteLater 会把还没销毁的对话框堆起来（Windows 上收尾时直接 0xC0000005）。
+        dialog = getattr(self, "_match_dialog", None)
+        if dialog is None:
+            dialog = ProgressDialog(self, "正在配色", note="准备中…")
+            self._match_dialog = dialog
+        else:
+            dialog.restart("准备中…")
+        dialog.show()
+        QApplication.processEvents()
 
     def _end_match(self) -> None:
         """Put the bar away.  The controls come back with the new result."""
@@ -3159,6 +3191,9 @@ class PicturePage(QWidget):
         self._progress_goal = 0
         self._progress.setVisible(False)
         self._progress.setValue(0)
+        dialog = getattr(self, "_match_dialog", None)
+        if dialog is not None:
+            dialog.finish()
         self._sync_status_bar()
 
     def _show_progress(self) -> None:
@@ -3188,10 +3223,11 @@ class PicturePage(QWidget):
     def _report_match(self, message: str, fraction: float) -> None:
         """One step of :func:`match_image`, drawn while the match is running.
 
-        ``processEvents`` is what makes the bar move at all — the match is a
-        plain synchronous call — and it excludes user input so a click cannot
-        start a second match inside the first one, which is the only way this
-        can go wrong.
+        ``processEvents`` is what makes the dialog move at all — the match is a
+        plain synchronous call on this thread — and it excludes user input so a
+        click cannot start a second match inside the first one, which is the only
+        way this can go wrong.  (1.6.66: 同一个回调也喂给进度框，条子按引擎报的
+        真实分数走，倒计时由进度框自己估。)
         """
         shown = _match_progress_fraction(fraction)
         self._progress_goal = int(max(0.0, min(1.0, shown)) * PROGRESS_STEPS)
@@ -3201,6 +3237,14 @@ class PicturePage(QWidget):
         else:
             self._progress_timer.stop()
         self._status.setText(f"正在匹配：{message}…")
+        dialog = getattr(self, "_match_dialog", None)
+        if dialog is not None:
+            # 框里走**引擎的原始分数**，不套 `_match_progress_fraction` 那张"看起来
+            # 顺滑"的映射表：映射是为了让细条不突兀，代价是条子和真实进度对不上；
+            # 换了带倒计时的框之后，老老实实报 0.30 / 0.35 反而更能说明"还要等多久"
+            # （1.6.66，m29882 第 2 条）。
+            dialog.set_note(f"正在匹配：{message}…")
+            dialog.set_fraction(fraction)
         QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
 
     def _on_rematch(self, *, pushed: bool = False) -> None:
@@ -5106,69 +5150,72 @@ class PicturePage(QWidget):
         QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
 
     def _on_export(self, kind: str) -> None:
-        # Building the plate for a 512×512 picture takes ~2 s, and with 「圆滑色块」
-        # on (the default) the refinement adds a pass per colour on the fine grid.
-        # Without a wait cursor, the progress bar and a line of text the window
-        # simply stops answering, which is the whole 「未响应」 complaint; the
-        # cursor is popped again on every exit path.
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        self._status.setText("正在生成模型…")
-        self._progress.setValue(0)
-        self._progress.setVisible(True)
-        QApplication.processEvents()
-        try:
-            plate = self.buildPlate()
-        except Exception as error:
-            QApplication.restoreOverrideCursor()
-            self._progress.setVisible(False)
-            QMessageBox.warning(self, "无法生成模型", str(error))
-            return
-        QApplication.restoreOverrideCursor()
-        self._progress.setVisible(False)
-        suffix = ".3mf" if kind == "3mf" else ".obj"
+        """生成并保存 3MF / OBJ（1.6.66 起挪到后台线程，m29882 第 3 条）。
+
+        以前整段都在主线程里跑：512×512 的图光 `buildPlate()` 就两秒多，开了「圆滑色块」
+        更久，写文件又要一两秒；这期间窗口收不到消息，Windows 会给标题栏挂上「(未响应)」，
+        用户以为程序死了就去点关闭。现在重活交给 :class:`TaskRunner` 的 QThread，主线程只
+        负责把进度画到进度框上，窗口照常响应（但导出本身不可取消 —— 写文件取消到一半会
+        留下半截模型，比慢一点更糟）。
+        """
         label = "3MF 模型" if kind == "3mf" else "OBJ 模型"
+        suffix = ".3mf" if kind == "3mf" else ".obj"
         suggested = f"{self._image_name}_{datetime.now():%Y%m%d-%H%M%S}{suffix}"
         start = str(paths.exports_dir() / suggested)
         name, _ = QFileDialog.getSaveFileName(self, f"保存{label}", start, f"{label} (*{suffix})")
         if not name:
             return
         target = Path(name)
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        self._status.setText(f"正在写入 {target.name}…")
-        QApplication.processEvents()
-        written = None
-        try:
-            written = self._write_model(plate, kind, target)
-        except OSError as error:
-            # The dialog opens where the user asked for it, which is 下载.  If
-            # the shell or a policy refuses that folder, losing the model is not
-            # an option: write it next to our own data and name the file that
-            # really exists.  (1.6.5 probed Downloads up front instead, so the
-            # dialog silently opened in a hidden folder.)
-            for alternative in self._alternative_targets(target):
-                try:
-                    written = self._write_model(plate, kind, alternative)
-                except OSError:
-                    continue
-                QApplication.restoreOverrideCursor()
-                QMessageBox.information(
-                    self,
-                    "已存到别的位置",
-                    f"{target.parent} 写不进去：{error.strerror or error}\n\n"
-                    f"模型已经存到：\n{written}",
-                )
-                break
-            if written is None:
-                QApplication.restoreOverrideCursor()
-                QMessageBox.warning(self, "保存失败", str(error))
-                return
-        except Exception as error:
-            QApplication.restoreOverrideCursor()
-            QMessageBox.warning(self, "保存失败", str(error))
+
+        def work(report):
+            report(0.10, "正在生成模型…")
+            plate = self.buildPlate()
+            report(0.65, f"正在写入 {target.name}…")
+            try:
+                written = self._write_model(plate, kind, target)
+                return plate, written, ""
+            except OSError as error:
+                # 用户选的目录被拒（下载夹的策略、OneDrive 占位）：文件不能丢，写到
+                # 我们自己的数据目录，并把真实路径带回去让主线程提示。
+                for alternative in self._alternative_targets(target):
+                    try:
+                        written = self._write_model(plate, kind, alternative)
+                    except OSError:
+                        continue
+                    return plate, written, f"{target.parent} 写不进去：{error.strerror or error}"
+                raise
+
+        title = f"导出{label}"
+        expected = self._export_seconds(kind)
+        self._export_started = time.monotonic()
+        outcome, failure = run_task(
+            self,
+            title,
+            work,
+            note="正在生成模型…",
+            expected_seconds=expected,
+        )
+        if failure is not None:
+            QMessageBox.warning(self, "保存失败", failure)
             return
-        QApplication.restoreOverrideCursor()
+        plate, written, moved = outcome
+        if moved:
+            QMessageBox.information(
+                self,
+                "已存到别的位置",
+                f"{moved}\n\n模型已经存到：\n{written}",
+            )
+        self._note_export_seconds(kind)
         self._status.setText(self._describe(plate, written))
         self._announce(plate, written)
+
+    def _export_seconds(self, kind: str) -> float | None:
+        return export_seconds(kind)
+
+    def _note_export_seconds(self, kind: str) -> None:
+        started = getattr(self, "_export_started", None)
+        if started is not None:
+            remember_export_seconds(kind, time.monotonic() - started)
 
     def _write_model(self, plate: PlateModel, kind: str, target: Path) -> Path:
         """Write *plate* to *target* in the requested format and return the path."""

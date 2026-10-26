@@ -82,6 +82,9 @@ DEFAULT_SETTINGS: dict = {
     "model_no_colour_limit": False,
     "model_no_spool_limit": False,
     "shortcut_export_glb": "Ctrl+S",
+    # 1.6.66（m29882 第 4 条）：每种导出的实测用时（秒），进度框的倒计时拿它当起点。
+    # 键是 "3mf" / "obj" / "glb" / "blend" / "svg"，值是最近几次的指数滑动平均。
+    "export_seconds": {},
     # 1.6.54（m22211 第 7 条）：每个页自己的快捷键。允许跨页重复（同一时刻只有一页
     # 在屏幕上），但同一个页里不许撞车 —— 撞了 settings_dialog 会拒绝保存。
     "shortcut_picture_import": "Ctrl+O",
@@ -161,6 +164,15 @@ def load_settings() -> dict:
                 values[key] = float(stored)
             except (TypeError, ValueError):
                 continue
+        elif isinstance(fallback, dict):
+            # 1.6.66（m29882 第 4 条）：`export_seconds` 是一张「导出种类 → 秒」的表，
+            # 给进度框的倒计时当起点。只收数字，别的当没写过。
+            if isinstance(stored, dict):
+                values[key] = {
+                    str(name): float(seconds)
+                    for name, seconds in stored.items()
+                    if isinstance(seconds, (int, float)) and float(seconds) > 0
+                }
         else:
             values[key] = str(stored)
     # 1.6.61（m27752 第 1、2 条）：旧版只有一个「实验性：没有颜色上限」的开关，它对两页
