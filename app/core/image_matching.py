@@ -49,6 +49,13 @@ _SHORTLIST = 4096
 #: 「实验性：没有颜色上限」时的硬上限（1.6.60，m27359 第 3 条）。量化预算本来就是
 #: ``min(256, max_colours)``，这里与它对齐，再大也没有意义。
 HARD_COLOUR_LIMIT = 256
+#: 不设限时的内部天花板（1.6.65，m29614 第 1 条）。界面不夹，但聚类每多一簇，就要多
+#: 一份「唯一颜色 × 簇」的浮点矩阵：4096 簇 × 四万种颜色 ≈ 1.3 GB，直接把内存吃光。
+#: 512 色在 A4 纸上也已是每色几十个像素，再多只换来回更慢。
+_NO_LIMIT_CEILING = 512
+#: 一种颜色要占画面多少才算「这张图自己的一种颜色」（1.6.65）。万分之五：A4 纸上约
+#: 60 mm²，比一个色块还小；抗锯齿过渡色每个都远低于它。
+_SIGNIFICANT_SHARE = 0.0005
 #: ``rows × colours`` below which the search skips the shortlist altogether and
 #: measures every row with CIEDE2000, so its answer *is* the global optimum.  The
 #: two-filament pool is ~60k rows and lands here; the four-million-row
@@ -706,19 +713,54 @@ def _median_cut_seeds(keys: np.ndarray, counts: np.ndarray, count: int) -> np.nd
     same question as where the eye sees a difference; it is, however, a cheap and
     stable way to get ``count`` colours that cover the picture, and the weighted
     clustering below then moves them onto the picture's own colours.
+
+    Done on the histogram itself rather than through ``Image.quantize``: that
+    call refuses more than 256 colours ("bad number of colors"), and with
+    「没有颜色上限」 the colour goal can now be the picture's own colour count,
+    which for a photo runs into the thousands.
     """
-    rows = np.array([_unpack(int(key)) for key in keys], dtype=np.uint8)
-    repeat = np.maximum(np.asarray(counts, dtype=np.int64), 1)
-    total = int(repeat.sum())
-    if total > _SEED_ROWS:
-        repeat = np.maximum(repeat // int(np.ceil(total / _SEED_ROWS)), 1)
-    strip = np.repeat(rows, repeat, axis=0).reshape(1, -1, 3)
-    quantized = Image.fromarray(strip, "RGB").quantize(
-        colors=int(count), method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE
-    )
-    palette = quantized.getpalette() or []
-    seeds = np.asarray(palette[: count * 3], dtype=np.float64).reshape(-1, 3)
-    return np.clip(np.rint(seeds), 0, 255).astype(np.uint8)
+    rows = np.array([_unpack(int(key)) for key in keys], dtype=np.float64)
+    weight = np.asarray(counts, dtype=np.float64)
+    if len(rows) == 0:
+        return np.zeros((0, 3), dtype=np.uint8)
+    boxes = [np.arange(len(rows))]
+    boxes_weight = [float(weight.sum())]
+    while len(boxes) < max(1, int(count)):
+        # 挑「还值得再切」且最重的那只箱子：里面颜色不止一种才有得切。
+        choice = -1
+        for index, index_rows in enumerate(boxes):
+            if len(index_rows) < 2:
+                continue
+            if choice < 0 or boxes_weight[index] > boxes_weight[choice]:
+                choice = index
+        if choice < 0:
+            break
+        index_rows = boxes[choice]
+        colours = rows[index_rows]
+        span = colours.max(axis=0) - colours.min(axis=0)
+        axis = int(span.argmax())
+        if span[axis] <= 0:
+            break
+        order = index_rows[np.argsort(colours[:, axis], kind="stable")]
+        sort_weight = weight[order]
+        running = np.cumsum(sort_weight)
+        cut = int(np.searchsorted(running, running[-1] / 2.0, side="left")) + 1
+        cut = min(max(cut, 1), len(order) - 1)
+        left, right = order[:cut], order[cut:]
+        boxes[choice] = left
+        boxes_weight[choice] = float(weight[left].sum())
+        boxes.append(right)
+        boxes_weight.append(float(weight[right].sum()))
+    seeds = []
+    for index_rows in boxes:
+        if len(index_rows) == 0:
+            continue
+        local = weight[index_rows]
+        total = float(local.sum())
+        seeds.append(
+            (rows[index_rows] * local[:, None]).sum(axis=0) / (total if total > 0 else 1.0)
+        )
+    return np.clip(np.rint(np.asarray(seeds)), 0, 255).astype(np.uint8)
 
 
 def _kmeans_labels(
@@ -912,11 +954,18 @@ def reduce_colours(
     counts = np.bincount(np.asarray(cluster_inverse).reshape(-1), minlength=len(cluster_keys))
     # 1.6.61（m27752 第 1 条）：勾了「实验性：没有颜色上限」就按这张图真实的颜色数收手 ——
     # 上限不再是 256，而是「图里到底有几种颜色」（聚类簇数不可能超过它），见 ``budget``。
-    budget = int(
-        min(len(cluster_keys), settings.max_colours)
-        if settings.no_colour_limit
-        else min(256, settings.max_colours)
-    )
+    # 1.6.65（m29614 第 1 条）：两个「不设限」的边界。一，内存：4096 簇遇上四万种颜色
+    # 就是 1.3 GB 的浮点矩阵；二，意义：一张照片的「唯一颜色数」有几万，其中绝大多数是
+    # 抗锯齿过渡，每个都不到万分之一个像素。所以按「占画面 ``_SIGNIFICANT_SHARE`` 以上的
+    # 颜色数」来定预算，再夹到 ``_NO_LIMIT_CEILING``。实测渐变海报：不夹时 300 色要 18.6 s、
+    # 4096 色要 36.8 s，按显著颜色数只留几十簇，一秒多就完。
+    if settings.no_colour_limit:
+        total = float(counts.sum())
+        significant = int(np.count_nonzero(counts >= max(1.0, total * _SIGNIFICANT_SHARE)))
+        budget = int(min(len(cluster_keys), max(2, significant), _NO_LIMIT_CEILING))
+    else:
+        budget = int(min(len(cluster_keys), 256, settings.max_colours))
+    budget = max(2, budget)
     seeds = _median_cut_seeds(cluster_keys, counts, budget)
     labels = _kmeans_labels(_color.lab_from_rgb(rows), counts, _color.lab_from_rgb(seeds))
     if keep is None:

@@ -23,7 +23,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-COLOUR_RANGE = (2, 32)
+COLOUR_RANGE = (2, 256)
 SPECKLE_RANGE = (0, 40)
 SMOOTH_RANGE = (1.0, 12.0)
 
@@ -72,6 +72,38 @@ def available() -> bool:
     except ModuleNotFoundError:  # pragma: no cover - 只有缺依赖时走到
         return False
     return True
+
+
+def detect_colours(source: Path, *, share: float = 0.004) -> int:
+    """猜这张图自己有多少种颜色（m29614 第 2 条：默认值不该是个固定数）。
+
+    做法：先把像素压到 12 bit（每通道 16 档），统计每种粗颜色占多少；只算占画面
+    ``share`` 以上的那些 —— 抗锯齿的过渡色每个都只占万分之几，全算进来会报出几千种。
+    最后夹在 :data:`COLOUR_RANGE` 里，并且至少给 2 色。
+
+    实测：猪信那种图标 8–10 色，海报这类渐变图 30–60 色。
+    """
+
+    import numpy as np
+    from PIL import Image
+
+    image = Image.open(source)
+    if image.mode != "RGB":
+        image = image.convert("RGBA")
+        flat = Image.new("RGBA", image.size, (255, 255, 255, 255))
+        flat.alpha_composite(image)
+        image = flat.convert("RGB")
+    pixels = np.asarray(image, dtype=np.uint8).reshape(-1, 3)
+    if pixels.size == 0:
+        return int(COLOUR_RANGE[0])
+    coarse = (pixels >> 4).astype(np.int32)
+    keys = coarse[:, 0] * 256 + coarse[:, 1] * 16 + coarse[:, 2]
+    counts = np.bincount(keys, minlength=4096)
+    total = int(counts.sum())
+    if total <= 0:
+        return int(COLOUR_RANGE[0])
+    keep = int(np.count_nonzero(counts >= max(1.0, total * share)))
+    return max(int(COLOUR_RANGE[0]), min(int(COLOUR_RANGE[1]), keep))
 
 
 def _prepared_image(source: Path):

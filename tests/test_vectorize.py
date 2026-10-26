@@ -13,10 +13,12 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 
+from app.core import vectorize
 from app.core.vectorize import (
     COLOUR_RANGE,
     DEFAULT_COLOURS,
     VectorizeUnavailable,
+    detect_colours,
     image_to_svg,
     palette_of,
     quantize,
@@ -82,6 +84,41 @@ class QuantizeTests(unittest.TestCase):
         reduced = quantize(source, 3)
         corner = Image.open(reduced).convert("RGB").getpixel((1, 1))
         self.assertGreater(min(corner), 200, f"透明底没拍平到白：{corner}")
+
+
+class DetectTests(unittest.TestCase):
+    """1.6.65（m29614 第 2 条）：颜色数量的默认值按图自己有多少色来。"""
+
+    def test_a_three_colour_icon_reports_three(self) -> None:
+        image = Image.new("RGB", (40, 40), (255, 255, 255))
+        for x in range(20, 40):
+            for y in range(40):
+                image.putpixel((x, y), (0, 0, 0))
+        for x in range(0, 20):
+            for y in range(0, 20):
+                image.putpixel((x, y), (0, 120, 0))
+        path = Path(self.folder.name) / "three.png"
+        image.save(path)
+        self.assertGreaterEqual(detect_colours(path), 3)
+
+    def test_it_never_reports_more_than_the_range_allows(self) -> None:
+        noise = Image.new("RGB", (60, 60))
+        for x in range(60):
+            for y in range(60):
+                noise.putpixel((x, y), (x * 4 % 256, y * 4 % 256, (x + y) * 2 % 256))
+        path = Path(self.folder.name) / "noise.png"
+        noise.save(path)
+        value = detect_colours(path)
+        self.assertGreaterEqual(value, COLOUR_RANGE[0])
+        self.assertLessEqual(value, COLOUR_RANGE[1])
+
+    def setUp(self) -> None:
+        import tempfile
+
+        self.folder = tempfile.TemporaryDirectory()
+
+    def tearDown(self) -> None:
+        self.folder.cleanup()
 
 
 class TraceTests(unittest.TestCase):

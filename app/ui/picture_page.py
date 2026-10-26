@@ -2772,10 +2772,13 @@ class PicturePage(QWidget):
 
     # -- 导出 SVG：把位图描成矢量 ------------------------------------------
     def _on_export_svg(self) -> None:
-        """把这张图描成 SVG（1.6.64，m29374）。
+        """把这张图描成矢量（1.6.64 加，1.6.65 改成先预览再决定，m29614）。
 
-        描的是 ``self._image`` —— 跟「导出原图」同一张，也就是**已经带着删除/合并结果**
+        描的是 `self._image` —— 跟「导出原图」同一张，也就是**已经带着删除/合并结果**
         的那张。用户删掉的色块在矢量里就该是空的，不能绕回去描那张没改过的原图。
+
+        窗口里先描一遍给用户对比：「保存 SVG」写到磁盘，「直接导入这张 SVG」把描好的
+        那份当成一张新图交回本页（会再问一次渲成多少像素），两个出口都在窗口里。
         """
         if self._image is None:
             self._status.setText("先导入一张图片，再导出 SVG。")
@@ -2784,51 +2787,23 @@ class PicturePage(QWidget):
         dialog = SvgExportDialog(self, name=self._image_name)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        options = dialog.values()
 
-        suggested = f"{self._image_name}-矢量.svg"
-        start = str(
-            (self._project_path.with_name(suggested))
-            if self._project_path
-            else (paths.exports_dir() / suggested)
-        )
-        name, _ = QFileDialog.getSaveFileName(self, "导出 SVG", start, "SVG 矢量图 (*.svg);;所有文件 (*)")
-        if not name:
+        if dialog.import_requested():
+            source = dialog.svg_path()
+            if source is None:
+                return
+            if self._dirty and not self._confirm_discard("导入这张矢量图"):
+                return
+            # 走普通的导入路径：SVG 会先问渲成多少像素，然后照常配色。
+            self.loadImage(source)
+            self._status.setText("已导入描好的矢量图，正在重新配色…")
             return
-        target = Path(name)
-        if target.suffix.lower() != ".svg":
-            target = target.with_suffix(".svg")
 
-        # 描摹库吃的是文件路径，所以先把手上这张 PIL 图落到临时文件；用完就删。
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        self._status.setText("正在把这张图描成矢量…")
-        QApplication.processEvents()
-        try:
-            with tempfile.TemporaryDirectory(prefix="fcs-svg-") as folder:
-                staged = Path(folder) / "source.png"
-                self._image.save(staged, format="PNG")
-                result = image_to_svg(
-                    staged,
-                    target,
-                    colours=int(options["colours"]),
-                    speckle=int(options["speckle"]),
-                    smooth=float(options["smooth"]),
-                )
-        except VectorizeUnavailable as error:
-            QApplication.restoreOverrideCursor()
-            self._status.setText("导出 SVG 不可用：这台机器没装 vtracer。")
-            QMessageBox.information(self, "导出 SVG 不可用", str(error))
+        target = dialog.saved_to()
+        if target is None:
             return
-        except Exception as error:  # pragma: no cover - the dialog is interactive
-            QApplication.restoreOverrideCursor()
-            self._status.setText("导出 SVG 失败。")
-            QMessageBox.warning(self, "导出 SVG 失败", str(error))
-            return
-        QApplication.restoreOverrideCursor()
-
         self._status.setText(
-            f"已导出矢量 {target.name}（{target.parent}）：{result.paths} 条路径、"
-            f"{result.colours} 种颜色、{result.bytes // 1024} KB。放大不糊，能进 Blender 继续改。"
+            f"已导出矢量 {target.name}（{target.parent}）。放大不糊，能进 Blender 继续改。"
         )
 
     # -- 工程：存下来，下次接着改 -----------------------------------------

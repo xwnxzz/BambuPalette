@@ -309,6 +309,26 @@ class MatchTests(unittest.TestCase):
         self.assertTrue(all(not entry.is_mix for entry in result.palette))
         self.assertEqual({entry.color_hex for entry in result.palette}, {v for _, v in SPOOLS})
 
+    def test_no_colour_limit_does_not_ask_pil_for_thousands(self):
+        """1.6.65（m29614 第 1 条）：勾了「没有颜色上限」不能再炸。
+
+        以前这条路上把「不设限」当成 4096 递给 PIL 的分色函数，它只认到 256，
+        直接抛 `ValueError: bad number of colors`。现在预算按「这张图真实的颜色数」
+        算，并且有内部天花板 —— 这里只验「不炸 + 收得住」。
+        """
+        from app.core.image_matching import _NO_LIMIT_CEILING
+
+        gradient = Image.new("RGB", (64, 64))
+        for x in range(64):
+            for y in range(64):
+                gradient.putpixel((x, y), (x * 4, y * 4, (x + y) * 2))
+        result = match_image(
+            gradient,
+            self.palette,
+            MatchSettings(max_colours=1200, no_colour_limit=True),
+        )
+        self.assertTrue(0 < len(result.counts) <= _NO_LIMIT_CEILING)
+
     def test_counts_are_sorted_largest_first(self):
         result = match_image(_quadrant_image(40), self.palette, MatchSettings(max_colours=8))
         self.assertEqual(list(result.counts), sorted(result.counts, reverse=True))

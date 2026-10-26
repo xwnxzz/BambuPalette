@@ -4759,17 +4759,36 @@ def main() -> int:
         from app.core.vectorize import DEFAULT_COLOURS, image_to_svg
         from app.ui.svg_export import SvgExportDialog
 
+        # 1.6.65（m29614 第 2 条）：窗口改成「左原图 / 右预览」，没图时构造也不能崩。
         dialog = SvgExportDialog(None, name="probe")
         values = dialog.values()
         check(
             values["colours"] == DEFAULT_COLOURS,
-            f"参数框默认 {DEFAULT_COLOURS} 色（现在是 {values['colours']}）",
+            f"没图时退回默认 {DEFAULT_COLOURS} 色（现在是 {values['colours']}）",
         )
         check(
             {"colours", "speckle", "smooth"} == set(values),
             "参数框给的就是颜色数量 / 去碎块 / 曲线简化三项",
         )
+        check(hasattr(dialog, "_source_view") and hasattr(dialog, "_preview_view"), "窗口里有原图与预览两块")
+        check(dialog._import_button.text().startswith("直接导入"), "有「直接导入这张 SVG」出口")
+        check(dialog._save_button.text().startswith("保存 SVG"), "有「保存 SVG」出口")
+        check(not dialog._save_button.isEnabled(), "没描出来之前两个出口都是灰的")
         dialog.deleteLater()
+
+        # 自动识别颜色数量：一张三色的图不该报出几十色。
+        from app.core.vectorize import detect_colours
+
+        with _TemporaryDirectory() as detect_folder:
+            three = _Path(detect_folder) / "three.png"
+            chip = _image_lib = __import__("PIL.Image", fromlist=["Image"]).new(
+                "RGB", (60, 60), (0, 190, 110)
+            )
+            chip.paste((250, 250, 250), (0, 0, 30, 60))
+            chip.paste((20, 20, 20), (30, 0, 60, 30))
+            chip.save(three)
+            guess = detect_colours(three)
+            check(3 <= guess <= 12, f"自动识别把三色的小图报成 {guess} 色")
 
         with _TemporaryDirectory() as folder:
             icon = _Path(folder) / "trace-icon.png"

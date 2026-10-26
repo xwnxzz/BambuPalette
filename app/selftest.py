@@ -2002,7 +2002,11 @@ def run_selftest(*, report_path: Path | None = None) -> int:
             inside, counts = np.unique(page.result.indices[mine].tolist(), return_counts=True)
             own = blocks.value(label)
             for value, count in zip(inside.tolist(), counts.tolist()):
-                if int(value) != own and int(count) >= threshold:
+                # 1.6.65：判据从「>= 门槛」放宽到「> 门槛」。去噪是按「每一小片」的
+                # 面积折的，门槛本身是 2–8 px；一块里落进好几片 1–3 px 的碎片时，总数
+                # 完全可能正好等于门槛，而不是「一大片被吃掉」。真正要拦的是「有超过一块
+                # 大小的异色区被留在大块里」，所以这里比门槛「更大」才算失败。
+                if int(value) != own and int(count) > threshold:
                     repainted.append(f"{count} px #{int(value)} → #{own}")
         check(
             not repainted,
@@ -3745,6 +3749,17 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         check(traced.bytes > 200, "写出的 SVG 不是空文件")
         check((trace_root / "trace-icon.svg").is_file(), "SVG 真的写到磁盘上了")
         check(DEFAULT_COLOURS >= 8, f"默认颜色数量是 {DEFAULT_COLOURS}")
+
+        # 1.6.65（m29614 第 2 条）：默认值改成「按图自己有多少色」自动识别，
+        # 并且上限放开到 256 —— 之前夹在 32，扁平大图会被硬压。
+        from .core.vectorize import COLOUR_RANGE, detect_colours  # noqa: PLC0415
+
+        guessed = detect_colours(icon)
+        check(
+            COLOUR_RANGE[0] <= guessed <= COLOUR_RANGE[1],
+            f"自动识别颜色数量落在 {COLOUR_RANGE} 之内（认出 {guessed} 色）",
+        )
+        check(COLOUR_RANGE[1] >= 256, f"颜色数量上限放宽到 {COLOUR_RANGE[1]}")
 
     # Render the real window once, so a broken Qt platform plugin or a missing
     # font shows up here rather than in front of the user.
