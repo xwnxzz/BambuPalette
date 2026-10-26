@@ -1315,7 +1315,14 @@ def run_selftest(*, report_path: Path | None = None) -> int:
         f"分隔条能把「耗材方案」压到 {right.sizes()[0]} px（只剩标题 + 一小条），不再被内容顶住",
     )
     check(right.isCollapsible(0), "而且它还能被整块收起来")
-    check(not right.isCollapsible(1), "下面的颜色列表不会被收掉")
+    # 1.6.67（m30363 第 2 条）：下面那块也允许被拖到 0 —— 用户要把方案列表铺满整栏。
+    check(right.isCollapsible(1), "下面那块也能被拖到 0（拖回来就复原）")
+    right.setSizes([900, 0])
+    app.processEvents()
+    check(
+        right.sizes()[1] == 0,
+        f"把分割条拖到底，颜色列表整块让位（现在 {right.sizes()}）",
+    )
     check(
         page._plan_scroll.minimumSizeHint().height() <= 80,
         f"面板的最小高度很小（{page._plan_scroll.minimumSizeHint().height()} px），所以拖得动",

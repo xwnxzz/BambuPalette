@@ -2361,10 +2361,12 @@ class PicturePage(QWidget):
         right.addWidget(self._list_panel)
         right.setStretchFactor(0, 2)
         right.setStretchFactor(1, 3)
-        # 耗材方案 may be collapsed away entirely so the colour list gets the whole
-        # column; the colour list never collapses, so it cannot be lost.
+        # 1.6.67（m30363 第 2 条）：两块都能被拖到 0 —— 用户要的是「耗材方案能完全拖下去，
+        # 把「打印图片需要的颜色」挤出画面」。以前只让上面那块折叠，下面那块的最小高度
+        # 一直占着，拖到底也留一条。分割条本身不会消失，往回拖就能复原。
         right.setCollapsible(0, True)
-        right.setCollapsible(1, False)
+        right.setCollapsible(1, True)
+        self._list_panel.setMinimumHeight(0)
         right.setSizes([430, 350])
 
         pictures = QSplitter(Qt.Orientation.Horizontal)
@@ -3639,8 +3641,16 @@ class PicturePage(QWidget):
             )
             use = shares.get(filament_id)
             name = filament.display_name if filament is not None else filament_id
-            chip.setToolTip(f"{name} {use.share:.1%}" if use is not None else name)
+            # 1.6.67（m30363 第 1 条）：色块后面把名字写出来。以前只有一个小方块，
+            # 用户得把鼠标停上去才知道这一套方案用的是哪几卷。
+            caption = QLabel(name)
+            caption.setProperty("role", "hint")
+            caption.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
             line.addWidget(chip)
+            line.addWidget(caption)
+            line.addSpacing(2)
+            chip.setToolTip(f"{name} {use.share:.1%}" if use is not None else name)
+            caption.setToolTip(chip.toolTip())
         return box
 
     # -- 筛选：哪几卷必须用、哪几卷不要用 ---------------------------------
